@@ -38,11 +38,11 @@ pub fn maybe_run_clip_daemon() {
     let _ = args.next();
     if args.next().as_deref() == Some(CLIP_DAEMON_ARG) {
         let mut text = String::new();
-        if std::io::stdin().read_to_string(&mut text).is_ok() {
-            if let Ok(mut cb) = arboard::Clipboard::new() {
-                use arboard::SetExtLinux;
-                let _ = cb.set().wait().text(text);
-            }
+        if std::io::stdin().read_to_string(&mut text).is_ok()
+            && let Ok(mut cb) = arboard::Clipboard::new()
+        {
+            use arboard::SetExtLinux;
+            let _ = cb.set().wait().text(text);
         }
         std::process::exit(0);
     }
