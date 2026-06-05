@@ -1,0 +1,233 @@
+use anyhow::{Result, bail};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use serde_json::json;
+
+use super::{Db, append_audit, now_ms};
+use crate::types::{AuditEvent, Role, WalletRow};
+
+fn row_to_wallet(r: &rusqlite::Row) -> rusqlite::Result<WalletRow> {
+    let role_str: String = r.get(2)?;
+    let archived_i: i64 = r.get(6)?;
+    let has_open: i64 = r.get(8)?;
+    Ok(WalletRow {
+        id: r.get(0)?,
+        account_index: r.get::<_, i64>(1)? as u32,
+        role: Role::from_db_str(&role_str).unwrap_or(Role::Sub),
+        pubkey: r.get(3)?,
+        label: r.get(4)?,
+        note: r.get(5)?,
+        archived: archived_i != 0,
+        created_at: r.get(7)?,
+        balance_lamports: None,
+        has_open_intent: has_open != 0,
+    })
+}
+
+const SELECT_WALLET: &str = "
+SELECT w.id, w.account_index, w.role, w.pubkey, w.label, w.note, w.archived, w.created_at,
+  EXISTS(SELECT 1 FROM tx_intents t
+         WHERE t.from_wallet = w.id AND t.status IN ('created','signed','submitted')) AS has_open
+FROM wallets w";
+
+impl Db {
+    pub fn master_exists(&self) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM wallets WHERE role='master' LIMIT 1",
+                [],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    pub fn next_account_index(&self) -> Result<u32> {
+        let max: Option<i64> = self
+            .conn
+            .query_row("SELECT MAX(account_index) FROM wallets", [], |r| {
+                r.get::<_, Option<i64>>(0)
+            })
+            .optional()?
+            .flatten();
+        Ok(match max {
+            Some(m) => (m as u32) + 1,
+            None => 0,
+        })
+    }
+
+    pub fn insert_wallet(
+        &mut self,
+        account_index: u32,
+        role: Role,
+        pubkey: &str,
+        label: Option<&str>,
+    ) -> Result<WalletRow> {
+        let now = now_ms();
+        let key = self.require_audit_key()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO wallets (account_index, role, pubkey, label, note, archived, created_at)
+             VALUES (?1, ?2, ?3, ?4, NULL, 0, ?5)",
+            params![account_index as i64, role.as_str(), pubkey, label, now],
+        )?;
+        let id = tx.last_insert_rowid();
+        append_audit(
+            &tx,
+            &key,
+            AuditEvent::WalletDerived,
+            &json!({"id": id, "account_index": account_index, "role": role.as_str(), "pubkey": pubkey}),
+        )?;
+        tx.commit()?;
+        Ok(WalletRow {
+            id,
+            account_index,
+            role,
+            pubkey: pubkey.to_string(),
+            label: label.map(String::from),
+            note: None,
+            archived: false,
+            created_at: now,
+            balance_lamports: None,
+            has_open_intent: false,
+        })
+    }
+
+    pub fn list_wallets(&self) -> Result<Vec<WalletRow>> {
+        let sql = format!("{SELECT_WALLET} ORDER BY w.account_index ASC");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], row_to_wallet)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn get_wallet(&self, id: i64) -> Result<Option<WalletRow>> {
+        let sql = format!("{SELECT_WALLET} WHERE w.id = ?1");
+        Ok(self
+            .conn
+            .query_row(&sql, params![id], row_to_wallet)
+            .optional()?)
+    }
+
+    pub fn set_label(&mut self, id: i64, label: Option<&str>) -> Result<()> {
+        let key = self.require_audit_key()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE wallets SET label=?1 WHERE id=?2",
+            params![label, id],
+        )?;
+        append_audit(&tx, &key, AuditEvent::WalletLabeled, &json!({"id": id})).map(|_| ())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn set_note(&mut self, id: i64, note: Option<&str>) -> Result<()> {
+        let key = self.require_audit_key()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("UPDATE wallets SET note=?1 WHERE id=?2", params![note, id])?;
+        append_audit(&tx, &key, AuditEvent::WalletNoted, &json!({"id": id}))?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn set_archived(&mut self, id: i64, archived: bool) -> Result<()> {
+        if archived && self.has_open_intent(id)? {
+            bail!("cannot archive a wallet with a transfer in progress");
+        }
+        let key = self.require_audit_key()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE wallets SET archived=?1 WHERE id=?2",
+            params![archived as i64, id],
+        )?;
+        append_audit(
+            &tx,
+            &key,
+            AuditEvent::WalletArchived,
+            &json!({"id": id, "archived": archived}),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn db() -> Db {
+        Db::open_memory().unwrap()
+    }
+
+    const PK0: &str = "Master11111111111111111111111111111111111111";
+    const PK1: &str = "Sub1111111111111111111111111111111111111111A";
+    const PK2: &str = "Sub2222222222222222222222222222222222222222B";
+
+    #[test]
+    fn insert_and_list() {
+        let mut d = db();
+        assert_eq!(d.next_account_index().unwrap(), 0);
+        assert!(!d.master_exists().unwrap());
+
+        let m = d
+            .insert_wallet(0, Role::Master, PK0, Some("Treasury"))
+            .unwrap();
+        assert_eq!(m.account_index, 0);
+        assert!(d.master_exists().unwrap());
+        assert_eq!(d.next_account_index().unwrap(), 1);
+
+        d.insert_wallet(1, Role::Sub, PK1, None).unwrap();
+        let all = d.list_wallets().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].role, Role::Master);
+        assert_eq!(all[1].account_index, 1);
+    }
+
+    #[test]
+    fn single_master_enforced() {
+        let mut d = db();
+        d.insert_wallet(0, Role::Master, PK0, None).unwrap();
+        assert!(d.insert_wallet(5, Role::Master, PK1, None).is_err());
+    }
+
+    #[test]
+    fn master_must_be_index_zero() {
+        let mut d = db();
+        assert!(d.insert_wallet(3, Role::Master, PK0, None).is_err());
+        assert!(d.insert_wallet(0, Role::Sub, PK1, None).is_err());
+    }
+
+    #[test]
+    fn duplicate_index_or_pubkey_rejected() {
+        let mut d = db();
+        d.insert_wallet(0, Role::Master, PK0, None).unwrap();
+        d.insert_wallet(1, Role::Sub, PK1, None).unwrap();
+        assert!(
+            d.insert_wallet(1, Role::Sub, PK2, None).is_err(),
+            "dup index"
+        );
+        assert!(
+            d.insert_wallet(2, Role::Sub, PK1, None).is_err(),
+            "dup pubkey"
+        );
+    }
+
+    #[test]
+    fn label_and_note_update() {
+        let mut d = db();
+        let m = d.insert_wallet(0, Role::Master, PK0, None).unwrap();
+        d.set_label(m.id, Some("Cold")).unwrap();
+        d.set_note(m.id, Some("hardware-backed")).unwrap();
+        let w = d.get_wallet(m.id).unwrap().unwrap();
+        assert_eq!(w.label.as_deref(), Some("Cold"));
+        assert_eq!(w.note.as_deref(), Some("hardware-backed"));
+        assert!(d.verify_audit_chain().unwrap());
+    }
+}

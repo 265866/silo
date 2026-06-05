@@ -1,0 +1,9 @@
+[workspace]
+git_release_enable = false
+semver_check = false
+
+[[package]]
+name = "silo"
+release = true
+publish = false
+git_tag_name = "v{{ version }}"
