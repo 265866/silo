@@ -1,2 +1,8 @@
 [workspace]
 git_release_enable = false
+
+[[package]]
+name = "silo"
+release = true
+publish = false
+git_tag_name = "v{{ version }}"
