@@ -1,5 +1,9 @@
 # silo
 
+[![CI](https://github.com/265866/silo/actions/workflows/ci.yml/badge.svg)](https://github.com/265866/silo/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/265866/silo)](https://github.com/265866/silo/releases/latest)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
+
 A **SOL-only** Solana wallet manager that runs entirely in your terminal.
 
 `silo` manages many Solana wallets derived from a single BIP39 mnemonic, with a focus on
@@ -66,14 +70,45 @@ The transaction wire format and key derivation are **cross-checked in tests** ag
 official `solana-keypair` / `solana-message` crates, so addresses and signed transactions are
 provably interoperable with Phantom and the rest of the ecosystem.
 
-## Build & run
+## Install
 
-Requires a recent Rust toolchain (edition 2024) and a TTY.
+### Homebrew (macOS & Linux)
 
 ```sh
-cargo run        # build and launch
+brew install 265866/silo/silo
+```
+
+### Install script
+
+```sh
+# macOS / Linux
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/265866/silo/releases/latest/download/silo-installer.sh | sh
+```
+
+```powershell
+# Windows
+irm https://github.com/265866/silo/releases/latest/download/silo-installer.ps1 | iex
+```
+
+### Prebuilt binaries
+
+Download a build for your platform from the [latest release](https://github.com/265866/silo/releases/latest)
+— macOS (Apple Silicon & Intel), Linux x86_64, and Windows x86_64, each with a `.sha256` checksum.
+
+### From source
+
+Requires a Rust toolchain (edition 2024, **MSRV 1.89**).
+
+```sh
+cargo install --git https://github.com/265866/silo
+# or, from a clone:
+cargo run                # build and launch
 cargo build --release
 ```
+
+## Running silo
+
+`silo` needs a TTY — run it in a real terminal.
 
 - **First run** opens a setup wizard that creates your first profile ("Wallet 1") — generate a new
   mnemonic or import an existing one, then confirm the phrase word-by-word.
@@ -105,8 +140,11 @@ Each profile stores its vault and database under `<config>/profiles/<id>/`.
 ```sh
 cargo test                  # 74 unit tests
 cargo test -- --ignored     # 2 live tests (hit the network: price APIs + devnet RPC)
-cargo clippy --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo fmt --all --check
 ```
+
+CI runs `fmt`, `clippy`, and the full test suite on Linux, macOS, and Windows for every pull request.
 
 ## License
 
