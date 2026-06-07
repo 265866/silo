@@ -528,7 +528,10 @@ fn quick_fund(app: &mut App, sub: &WalletRow) {
 
 fn send_keys(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Esc => app.route = Route::WalletList,
+        KeyCode::Esc => {
+            app.preparing_send = false;
+            app.route = Route::WalletList;
+        }
         KeyCode::Tab => app.input.focus ^= 1,
         KeyCode::Enter => prepare_send(app),
         _ if ctrl(&key, 'v') => paste_into_focused_send(app),
@@ -602,6 +605,12 @@ fn paste_into_focused_send(app: &mut App) {
 }
 
 fn prepare_send(app: &mut App) {
+    if app.preparing_send
+        || app.pending_send.is_some()
+        || matches!(app.modal, Some(Modal::ConfirmSend))
+    {
+        return;
+    }
     let Some(from) = app.focused_wallet().cloned() else {
         app.toast_err("No source wallet");
         return;
@@ -638,6 +647,7 @@ fn prepare_send(app: &mut App) {
         lamports,
         priority_micro: app.priority_micro,
     }) {
+        app.preparing_send = true;
         app.toast_info("Preparing transfer…");
     }
 }
@@ -2063,5 +2073,104 @@ mod tests {
             h.app.pending_send.is_some(),
             "a SendPrepared on the Send route must populate pending_send"
         );
+    }
+
+    #[test]
+    fn prepare_send_is_idempotent_while_a_prepare_is_outstanding() {
+        let mut h = harness(true);
+        h.app.route = Route::Send;
+        h.app.modal = None;
+        h.app.reconcile_done = true;
+        h.app.focused_wallet = Some(h.app.wallets[0].id);
+        h.app.input.send_to = crypto::derive_address(
+            &crypto::seed_from_mnemonic(&crypto::parse_mnemonic(TEST_MNEMONIC).unwrap()),
+            1,
+        );
+        h.app.input.send_amount = "0.001".to_string();
+
+        prepare_send(&mut h.app);
+        assert!(
+            h.app.preparing_send,
+            "the first prepare must mark a prepare in flight"
+        );
+        prepare_send(&mut h.app);
+
+        assert!(
+            matches!(h.rx.try_recv(), Ok((_, Command::PrepareSend { .. }))),
+            "the first prepare must enqueue exactly one PrepareSend"
+        );
+        assert!(
+            h.rx.try_recv().is_err(),
+            "a second prepare while one is outstanding must not enqueue another"
+        );
+    }
+
+    #[test]
+    fn prepare_send_blocked_while_confirm_modal_open() {
+        let mut h = harness(true);
+        h.app.route = Route::Send;
+        h.app.reconcile_done = true;
+        h.app.focused_wallet = Some(h.app.wallets[0].id);
+        h.app.input.send_to = crypto::derive_address(
+            &crypto::seed_from_mnemonic(&crypto::parse_mnemonic(TEST_MNEMONIC).unwrap()),
+            1,
+        );
+        h.app.input.send_amount = "0.001".to_string();
+        h.app.modal = Some(Modal::ConfirmSend);
+
+        prepare_send(&mut h.app);
+
+        assert!(
+            h.rx.try_recv().is_err(),
+            "no new prepare may be queued while a confirm modal is already open"
+        );
+    }
+
+    #[test]
+    fn duplicate_send_prepared_does_not_disarm_large_send() {
+        let mut h = harness(true);
+        h.app.route = Route::Send;
+        let from_id = h.app.wallets[0].id;
+        let to = crypto::derive_address(
+            &crypto::seed_from_mnemonic(&crypto::parse_mnemonic(TEST_MNEMONIC).unwrap()),
+            1,
+        );
+        h.app.wallets[0].balance_lamports = Some(1_300_000);
+        h.app.pending_send = Some(crate::app::PendingSend {
+            from_id,
+            to: to.clone(),
+            lamports: 1_234_567,
+            blockhash: bs58::encode([3u8; 32]).into_string(),
+            lvbh: 99_999,
+            fee: 7_500,
+            dest_balance: 0,
+            priority_micro: 0,
+            prepared_at: Instant::now(),
+        });
+        h.app.modal = Some(Modal::ConfirmSend);
+        h.app.send_confirm_armed = true;
+        assert!(
+            h.app.pending_send_is_large(),
+            "test precondition: the pending send must be a large send"
+        );
+        let generation = h.app.generation.load(Ordering::SeqCst);
+
+        h.app.apply_app_event(AppEvent::SendPrepared {
+            from_id,
+            to,
+            lamports: 1_234_567,
+            blockhash: bs58::encode([9u8; 32]).into_string(),
+            lvbh: 100_000,
+            fee: 7_500,
+            dest_balance: 0,
+            priority_micro: 0,
+            generation,
+        });
+
+        assert!(
+            h.app.send_confirm_armed,
+            "a duplicate SendPrepared reply must not disarm an already-armed large send"
+        );
+        assert!(matches!(h.app.modal, Some(Modal::ConfirmSend)));
     }
 }
