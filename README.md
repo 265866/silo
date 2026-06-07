@@ -83,22 +83,62 @@ provably interoperable with Phantom and the rest of the ecosystem.
 brew install 265866/silo/silo
 ```
 
-### Install script
+### Verify release downloads first
+
+The [latest release](https://github.com/265866/silo/releases/latest) publishes these prebuilt archives and checksum files:
+
+- `silo-aarch64-apple-darwin.tar.xz` and `.sha256`
+- `silo-x86_64-apple-darwin.tar.xz` and `.sha256`
+- `silo-x86_64-unknown-linux-gnu.tar.xz` and `.sha256`
+- `silo-x86_64-pc-windows-msvc.zip` and `.sha256`
+- `sha256.sum`
+
+Manual archive installation is the most verification-friendly path: download the archive and its checksum, verify the digest, then extract and place `silo` on your `PATH`.
+
+Linux:
 
 ```sh
-# macOS / Linux
+curl -LO https://github.com/265866/silo/releases/latest/download/silo-x86_64-unknown-linux-gnu.tar.xz
+curl -LO https://github.com/265866/silo/releases/latest/download/silo-x86_64-unknown-linux-gnu.tar.xz.sha256
+sha256sum -c silo-x86_64-unknown-linux-gnu.tar.xz.sha256
+```
+
+macOS:
+
+```sh
+curl -LO https://github.com/265866/silo/releases/latest/download/silo-aarch64-apple-darwin.tar.xz
+curl -LO https://github.com/265866/silo/releases/latest/download/silo-aarch64-apple-darwin.tar.xz.sha256
+shasum -a 256 -c silo-aarch64-apple-darwin.tar.xz.sha256
+```
+
+Windows PowerShell:
+
+```powershell
+Invoke-WebRequest https://github.com/265866/silo/releases/latest/download/silo-x86_64-pc-windows-msvc.zip -OutFile silo-x86_64-pc-windows-msvc.zip
+Invoke-WebRequest https://github.com/265866/silo/releases/latest/download/silo-x86_64-pc-windows-msvc.zip.sha256 -OutFile silo-x86_64-pc-windows-msvc.zip.sha256
+$expected = (Get-Content silo-x86_64-pc-windows-msvc.zip.sha256).Split()[0]
+$actual = (Get-FileHash silo-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw "checksum mismatch" }
+```
+
+Releases are checksum-only today. There are no documented maintainer signatures, cosign signatures, or provenance attestations.
+
+### Install script
+
+The convenience installer scripts are `silo-installer.sh` and `silo-installer.ps1`. `curl | sh` and `irm | iex` rely on HTTPS and GitHub Releases as the trust boundary, and are less verification-friendly than manual archive installation unless you manually verify checksums or script digests first.
+
+```sh
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/265866/silo/releases/latest/download/silo-installer.sh | sh
 ```
 
 ```powershell
-# Windows
 irm https://github.com/265866/silo/releases/latest/download/silo-installer.ps1 | iex
 ```
 
 ### Prebuilt binaries
 
 Download a build for your platform from the [latest release](https://github.com/265866/silo/releases/latest)
-— macOS (Apple Silicon & Intel), Linux x86_64, and Windows x86_64, each with a `.sha256` checksum.
+— macOS (Apple Silicon & Intel), Linux x86_64, and Windows x86_64.
 
 ### From source
 
