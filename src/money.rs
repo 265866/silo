@@ -107,33 +107,73 @@ pub fn parse_sol_to_lamports(s: &str) -> Result<u64, AmountError> {
 }
 
 pub fn fiat_to_lamports(fiat: &str, price_per_sol: f64) -> Result<u64, AmountError> {
-    let amount = parse_fiat(fiat)?;
+    let amount = parse_decimal_scaled(fiat, 9)?;
+    let price = price_to_scaled(price_per_sol)?;
+    let numerator = amount
+        .checked_mul(LAMPORTS_PER_SOL as u128)
+        .ok_or(AmountError::Overflow)?;
+    let rounded = numerator
+        .checked_add(price / 2)
+        .ok_or(AmountError::Overflow)?
+        / price;
+    u64::try_from(rounded).map_err(|_| AmountError::Overflow)
+}
+
+fn price_to_scaled(price_per_sol: f64) -> Result<u128, AmountError> {
     if !(price_per_sol.is_finite() && price_per_sol > 0.0) {
         return Err(AmountError::NotANumber);
     }
-    let sol = amount / price_per_sol;
-    if !sol.is_finite() || sol < 0.0 {
-        return Err(AmountError::Overflow);
+    let price = parse_decimal_scaled(&format!("{price_per_sol:.9}"), 9)?;
+    if price == 0 {
+        return Err(AmountError::NotANumber);
     }
-    parse_sol_to_lamports(&format!("{sol:.9}"))
+    Ok(price)
 }
 
-fn parse_fiat(s: &str) -> Result<f64, AmountError> {
+fn parse_decimal_scaled(s: &str, scale_digits: usize) -> Result<u128, AmountError> {
     let s = s.trim();
     if s.is_empty() {
         return Err(AmountError::Empty);
     }
     let (int_part, frac_part) = match s.split_once('.') {
-        Some((i, f)) => (i, f),
+        Some((i, f)) => {
+            if f.contains('.') {
+                return Err(AmountError::NotANumber);
+            }
+            (i, f)
+        }
         None => (s, ""),
     };
+    if frac_part.len() > scale_digits {
+        return Err(AmountError::TooManyDecimals);
+    }
     if !int_part.chars().all(|c| c.is_ascii_digit())
         || !frac_part.chars().all(|c| c.is_ascii_digit())
         || (int_part.is_empty() && frac_part.is_empty())
     {
         return Err(AmountError::NotANumber);
     }
-    s.parse::<f64>().map_err(|_| AmountError::NotANumber)
+    let int_val: u128 = if int_part.is_empty() {
+        0
+    } else {
+        int_part.parse().map_err(|_| AmountError::Overflow)?
+    };
+    let scale = 10u128
+        .checked_pow(scale_digits as u32)
+        .ok_or(AmountError::Overflow)?;
+    let int_scaled = int_val.checked_mul(scale).ok_or(AmountError::Overflow)?;
+    let mut frac_padded = String::from(frac_part);
+    while frac_padded.len() < scale_digits {
+        frac_padded.push('0');
+    }
+    let frac_scaled: u128 = if frac_padded.is_empty() {
+        0
+    } else {
+        frac_padded.parse().map_err(|_| AmountError::Overflow)?
+    };
+    int_scaled
+        .checked_add(frac_scaled)
+        .ok_or(AmountError::Overflow)
 }
 
 pub fn format_lamports(l: u64) -> String {
@@ -211,6 +251,17 @@ mod tests {
         assert_eq!(fiat_to_lamports("250", 100.0).unwrap(), 2_500_000_000);
         assert_eq!(fiat_to_lamports("100", 100.0).unwrap(), 1_000_000_000);
         assert_eq!(fiat_to_lamports("1", 100.0).unwrap(), 10_000_000);
+        assert_eq!(fiat_to_lamports("0.000000001", 1.0).unwrap(), 1);
+        assert_eq!(
+            fiat_to_lamports("18446744073.709551615", 1.0).unwrap(),
+            u64::MAX
+        );
+        assert_eq!(
+            fiat_to_lamports("0.0000000001", 1.0),
+            Err(AmountError::TooManyDecimals)
+        );
+        assert_eq!(fiat_to_lamports("1", 3.0).unwrap(), 333_333_333);
+        assert_eq!(fiat_to_lamports("2", 3.0).unwrap(), 666_666_667);
         assert!(fiat_to_lamports("abc", 100.0).is_err());
         assert!(fiat_to_lamports("10", 0.0).is_err());
         assert!(fiat_to_lamports("10", f64::NAN).is_err());
