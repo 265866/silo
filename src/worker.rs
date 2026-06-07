@@ -23,6 +23,7 @@ const PRICE_POLL_JITTER_MS: u64 = 10_000;
 
 const CONFIRM_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const CONFIRM_POLL_ATTEMPTS: usize = 45;
+const CONFIRM_MAX_ROUNDS: usize = 3;
 const REBROADCAST_INTERVAL: Duration = Duration::from_secs(12);
 
 fn persist_last_price(db: &Storage, p: &SolPrice) {
@@ -144,24 +145,53 @@ pub fn spawn_workers(
             let generation = generation.clone();
             let mut shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
+                let mut confirm_tasks = tokio::task::JoinSet::new();
                 loop {
                     tokio::select! {
                         _ = shutdown.changed() => break,
+                        joined = confirm_tasks.join_next(), if !confirm_tasks.is_empty() => {
+                            let _ = joined;
+                        }
                         maybe = ordered_rx.recv() => {
                             let Some((cmd_gen, cmd)) = maybe else {
                                 break;
                             };
-                            handle_command(
-                                cmd_gen,
-                                cmd,
-                                db.clone(),
-                                rpc.clone(),
-                                evt.clone(),
-                                price.clone(),
-                                client.clone(),
-                                generation.clone(),
-                            )
-                            .await;
+                            match cmd {
+                                Command::Broadcast { intent_id } => {
+                                    if let Some(ctx) = broadcast_submit(
+                                        intent_id,
+                                        &db,
+                                        &rpc,
+                                        &evt,
+                                        &generation,
+                                        cmd_gen,
+                                    )
+                                    .await
+                                    {
+                                        let db = db.clone();
+                                        let rpc = rpc.clone();
+                                        let evt = evt.clone();
+                                        let generation = generation.clone();
+                                        confirm_tasks.spawn(async move {
+                                            poll_confirmation(ctx, db, rpc, evt, generation, cmd_gen)
+                                                .await;
+                                        });
+                                    }
+                                }
+                                other => {
+                                    handle_command(
+                                        cmd_gen,
+                                        other,
+                                        db.clone(),
+                                        rpc.clone(),
+                                        evt.clone(),
+                                        price.clone(),
+                                        client.clone(),
+                                        generation.clone(),
+                                    )
+                                    .await;
+                                }
+                            }
                         }
                     }
                 }
@@ -180,8 +210,17 @@ pub fn spawn_workers(
                         break;
                     };
                     if cmd.ordered() {
-                        if ordered_tx.send((cmd_gen, cmd)).await.is_err() {
-                            break;
+                        match ordered_tx.try_send((cmd_gen, cmd)) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                send_error(
+                                    &evt_tx,
+                                    cmd_gen,
+                                    "system busy — command dropped, please retry",
+                                )
+                                .await;
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
                         }
                         continue;
                     }
@@ -1131,77 +1170,83 @@ async fn rebroadcast_if_due(
     }
 }
 
-async fn broadcast_and_poll(
+struct PollContext {
     intent_id: i64,
-    db: Storage,
-    rpc_arc: Arc<Mutex<Rpc>>,
-    evt: mpsc::Sender<AppEvent>,
-    generation: Arc<AtomicU64>,
+    sig: String,
+    bytes: Vec<u8>,
+    lvbh: u64,
+    last_rebroadcast: Option<Instant>,
+}
+
+async fn broadcast_submit(
+    intent_id: i64,
+    db: &Storage,
+    rpc_arc: &Arc<Mutex<Rpc>>,
+    evt: &mpsc::Sender<AppEvent>,
+    generation: &Arc<AtomicU64>,
     cmd_gen: u64,
-) {
-    use std::sync::atomic::Ordering;
-    let current = || generation.load(Ordering::SeqCst) == cmd_gen;
-    let intent = match db.with_current(&generation, cmd_gen, |d| {
+) -> Option<PollContext> {
+    let intent = match db.with_current(generation, cmd_gen, |d| {
         d.get_intent(intent_id).ok().flatten()
     }) {
-        None => return,
+        None => return None,
         Some(intent) => intent,
     };
     let Some(intent) = intent else {
-        send_error(&evt, cmd_gen, "transfer record vanished").await;
-        return;
+        send_error(evt, cmd_gen, "transfer record vanished").await;
+        return None;
     };
     let (Some(bytes), Some(sig)) = (intent.signed_tx, intent.signature) else {
-        send_error(&evt, cmd_gen, "transfer was not signed").await;
-        return;
+        send_error(evt, cmd_gen, "transfer was not signed").await;
+        return None;
     };
     let lvbh = intent.last_valid_block_height.unwrap_or(0);
 
-    match db.with_current(&generation, cmd_gen, |d| d.mark_submitted(intent_id)) {
+    match db.with_current(generation, cmd_gen, |d| d.mark_submitted(intent_id)) {
         Some(Ok(IntentTransitionOutcome::Applied)) => {}
         Some(Ok(IntentTransitionOutcome::WrongState(_) | IntentTransitionOutcome::NotFound)) => {
             send_error(
-                &evt,
+                evt,
                 cmd_gen,
                 "transfer was not in signed state; not broadcasting",
             )
             .await;
-            return;
+            return None;
         }
         Some(Err(e)) => {
             send_error(
-                &evt,
+                evt,
                 cmd_gen,
                 format!("could not record submitted transfer: {e}"),
             )
             .await;
-            return;
+            return None;
         }
-        None => return,
+        None => return None,
     }
 
     let mut last_rebroadcast = None;
     let rpc = { rpc_arc.lock_recover().clone() };
     match rpc.send_transaction(&bytes).await {
         Ok(returned) if returned != sig => {
-            let _ = db.with_current(&generation, cmd_gen, |d| {
+            let _ = db.with_current(generation, cmd_gen, |d| {
                 let _ = d.audit(
                     AuditEvent::IntegrityCheckFailed,
                     &json!({"intent": intent_id, "expected": sig, "got": returned}),
                 );
             });
             finalize(
-                &db,
-                &evt,
+                db,
+                evt,
                 intent_id,
                 &sig,
                 IntentStatus::Failed,
                 Some("rpc returned mismatched signature"),
-                &generation,
+                generation,
                 cmd_gen,
             )
             .await;
-            return;
+            return None;
         }
         Ok(_) => {
             last_rebroadcast = Some(Instant::now());
@@ -1218,20 +1263,20 @@ async fn broadcast_and_poll(
         Err(e) => {
             if let Some(reason) = definitive_rejection_reason(&e) {
                 finalize(
-                    &db,
-                    &evt,
+                    db,
+                    evt,
                     intent_id,
                     &sig,
                     IntentStatus::Failed,
                     Some(&reason),
-                    &generation,
+                    generation,
                     cmd_gen,
                 )
                 .await;
-                return;
+                return None;
             }
             send_error(
-                &evt,
+                evt,
                 cmd_gen,
                 format!("broadcast uncertain — polling signed transfer: {e}"),
             )
@@ -1239,8 +1284,35 @@ async fn broadcast_and_poll(
         }
     }
 
+    Some(PollContext {
+        intent_id,
+        sig,
+        bytes,
+        lvbh,
+        last_rebroadcast,
+    })
+}
+
+async fn poll_confirmation(
+    ctx: PollContext,
+    db: Storage,
+    rpc_arc: Arc<Mutex<Rpc>>,
+    evt: mpsc::Sender<AppEvent>,
+    generation: Arc<AtomicU64>,
+    cmd_gen: u64,
+) {
+    let current = || generation.load(Ordering::SeqCst) == cmd_gen;
+    let PollContext {
+        intent_id,
+        sig,
+        bytes,
+        lvbh,
+        mut last_rebroadcast,
+    } = ctx;
+
     let mut reported_pending = false;
-    loop {
+    let mut rounds = 0;
+    while current() && rounds < CONFIRM_MAX_ROUNDS {
         for _ in 0..CONFIRM_POLL_ATTEMPTS {
             tokio::time::sleep(CONFIRM_POLL_INTERVAL).await;
             if !current() {
@@ -1361,6 +1433,7 @@ async fn broadcast_and_poll(
         if !current() {
             return;
         }
+        rounds += 1;
         if !reported_pending {
             let _ = evt
                 .send(AppEvent::TransferResult {
@@ -1373,6 +1446,34 @@ async fn broadcast_and_poll(
                 .await;
             reported_pending = true;
         }
+    }
+
+    if current() {
+        finalize(
+            &db,
+            &evt,
+            intent_id,
+            &sig,
+            IntentStatus::Expired,
+            Some("confirmation timed out before the network confirmed or rejected it"),
+            &generation,
+            cmd_gen,
+        )
+        .await;
+    }
+}
+
+async fn broadcast_and_poll(
+    intent_id: i64,
+    db: Storage,
+    rpc_arc: Arc<Mutex<Rpc>>,
+    evt: mpsc::Sender<AppEvent>,
+    generation: Arc<AtomicU64>,
+    cmd_gen: u64,
+) {
+    if let Some(ctx) = broadcast_submit(intent_id, &db, &rpc_arc, &evt, &generation, cmd_gen).await
+    {
+        poll_confirmation(ctx, db, rpc_arc, evt, generation, cmd_gen).await;
     }
 }
 
@@ -2111,6 +2212,129 @@ mod tests {
             server.methods(),
             vec!["sendTransaction".to_string()],
             "a definitively-rejected transfer must not enter the poll loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_confirmation_poll_does_not_block_later_ordered_commands() {
+        let (db, sub_id) = storage_with_wallets();
+        let to = crate::crypto::derive_address(&test_seed(), 0);
+        let intent = db
+            .with_mut(|d| d.create_intent(sub_id, &to, 1_000, None))
+            .unwrap();
+        let sig = "Sig1111111111111111111111111111111111111111111";
+        db.with_mut(|d| {
+            d.mark_signed(intent.id, sig, "bh", 1000, 5000, b"wire")
+                .unwrap()
+        });
+
+        let server = RawMockServer::new(vec![
+            json!({"jsonrpc":"2.0","id":1,"result": sig}).to_string(),
+        ]);
+        let rpc = Arc::new(Mutex::new(Rpc::new(
+            reqwest::Client::new(),
+            server.url.clone(),
+        )));
+        let (_, price, client) = worker_deps();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<(u64, Command)>(64);
+        let (evt_tx, mut evt_rx) = mpsc::channel(64);
+        let generation = Arc::new(AtomicU64::new(0));
+        let handle = spawn_workers(cmd_rx, evt_tx, db.clone(), rpc, price, client, generation);
+
+        cmd_tx
+            .send((
+                0,
+                Command::Broadcast {
+                    intent_id: intent.id,
+                },
+            ))
+            .await
+            .unwrap();
+        cmd_tx
+            .send((
+                0,
+                Command::PersistSetting {
+                    change: SettingChange::AutoLock(9),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let persisted = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match evt_rx.recv().await {
+                    Some(AppEvent::SettingPersisted { change, result, .. }) => {
+                        break (change, result);
+                    }
+                    Some(_) => continue,
+                    None => panic!("worker event channel closed unexpectedly"),
+                }
+            }
+        })
+        .await
+        .expect(
+            "PersistSetting must be serviced while the broadcast confirmation poll runs concurrently — a poll still on the ordered task would stall every later command for minutes",
+        );
+
+        assert_eq!(persisted.0, SettingChange::AutoLock(9));
+        persisted.1.unwrap();
+
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn broadcast_confirmation_poll_terminates_and_expires_after_bounded_rounds() {
+        let (db, sub_id) = storage_with_wallets();
+        let to = crate::crypto::derive_address(&test_seed(), 0);
+        let intent = db
+            .with_mut(|d| d.create_intent(sub_id, &to, 1_000, None))
+            .unwrap();
+        let sig = "Sig1111111111111111111111111111111111111111111";
+        db.with_mut(|d| {
+            d.mark_signed(intent.id, sig, "bh", 1000, 5000, b"wire")
+                .unwrap()
+        });
+        assert!(db.with(|d| d.has_open_intent(sub_id).unwrap()));
+
+        let server = RawMockServer::new(vec![
+            json!({"jsonrpc":"2.0","id":1,"result": sig}).to_string(),
+        ]);
+        let rpc = Arc::new(Mutex::new(Rpc::new(
+            reqwest::Client::new(),
+            server.url.clone(),
+        )));
+        let (evt_tx, mut evt_rx) = mpsc::channel(64);
+        let generation = Arc::new(AtomicU64::new(0));
+
+        broadcast_and_poll(intent.id, db.clone(), rpc, evt_tx, generation, 0).await;
+
+        let mut outcomes = Vec::new();
+        while let Ok(ev) = evt_rx.try_recv() {
+            if let AppEvent::TransferResult { outcome, .. } = ev {
+                outcomes.push(outcome);
+            }
+        }
+        assert!(
+            matches!(outcomes.first(), Some(TransferOutcome::Submitted { .. })),
+            "the first outcome should be Submitted, got {outcomes:?}"
+        );
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| matches!(o, TransferOutcome::StillPending { .. })),
+            "a StillPending heartbeat should be emitted while polling, got {outcomes:?}"
+        );
+        assert!(
+            matches!(outcomes.last(), Some(TransferOutcome::Expired)),
+            "the poll must finalize Expired once the round bound is hit, got {outcomes:?}"
+        );
+
+        let got = db.with(|d| d.get_intent(intent.id).unwrap().unwrap());
+        assert_eq!(got.status, IntentStatus::Expired);
+        assert!(
+            !db.with(|d| d.has_open_intent(sub_id).unwrap()),
+            "a bounded-out transfer must release the source wallet's open-intent guard"
         );
     }
 
