@@ -133,11 +133,13 @@ impl Db {
         let is_existing = db.has_meta_table()?;
         if is_existing {
             db.integrity_check()?;
+            db.foreign_key_check()?;
         }
         db.migrate()?;
         db.ensure_audit_salt()?;
         if !is_existing {
             db.integrity_check()?;
+            db.foreign_key_check()?;
         }
         Ok(db)
     }
@@ -160,6 +162,20 @@ impl Db {
             .query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
         if ic != "ok" {
             bail!("database integrity check failed: {ic}");
+        }
+        Ok(())
+    }
+
+    fn foreign_key_check(&self) -> Result<()> {
+        let mut stmt = self.conn.prepare("PRAGMA foreign_key_check")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let table: String = row.get(0)?;
+            let rowid: Option<i64> = row.get(1)?;
+            let parent: String = row.get(2)?;
+            bail!(
+                "database foreign-key check failed: {table} row {rowid:?} references a missing row in {parent}"
+            );
         }
         Ok(())
     }
@@ -599,6 +615,45 @@ mod tests {
             before, after,
             "Db::open must check integrity before writing: a corrupt file with a missing \
              audit_key_salt must be left untouched, not have the salt re-inserted first"
+        );
+    }
+
+    #[test]
+    fn dangling_foreign_key_is_rejected_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("silo.db");
+        drop(Db::open(&path).unwrap());
+
+        let wallet_id = {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO wallets (account_index, role, pubkey, archived, created_at)
+                 VALUES (1, 'sub', 'SubPubkey', 0, 0)",
+                [],
+            )
+            .unwrap();
+            let id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO tx_intents (from_wallet, to_address, lamports, status, created_at, updated_at)
+                 VALUES (?1, 'Recipient', 1000, 'created', 0, 0)",
+                params![id],
+            )
+            .unwrap();
+            id
+        };
+
+        Db::open(&path).expect("a consistent wallet+intent database must open cleanly");
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+            conn.execute("DELETE FROM wallets WHERE id=?1", params![wallet_id])
+                .unwrap();
+        }
+
+        assert!(
+            Db::open(&path).is_err(),
+            "a tx_intent referencing a deleted wallet must be rejected at open"
         );
     }
 
