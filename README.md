@@ -156,6 +156,14 @@ cargo fmt --all --check
 
 CI runs `fmt`, `clippy`, dependency policy checks, an MSRV check, and the full test suite on Linux, macOS, and Windows for every pull request.
 
+## Support and bug reports
+
+For ordinary bugs, install failures, and runtime problems, open a public GitHub issue using the bug report or install/runtime support template. Include your OS, `silo` version, install method, terminal, relevant settings such as RPC endpoint type or provider name, reproduction steps, expected behavior, actual behavior, and sanitized logs or screenshots.
+
+Never include recovery phrases, private keys, passphrases, API tokens, RPC tokens, or live wallet secrets in public issues, logs, screenshots, or diagnostics. Maintainers will not ask for secrets, cannot recover lost mnemonics or passphrases, cannot reverse transactions, and cannot guarantee support from third-party RPC/provider services.
+
+For suspected security vulnerabilities, do not open a public issue. Report them privately through [SECURITY.md](SECURITY.md).
+
 ## Security
 
 Please report vulnerabilities privately through GitHub private vulnerability reporting, or email `github@coltons.space` if that is unavailable. See [SECURITY.md](SECURITY.md).

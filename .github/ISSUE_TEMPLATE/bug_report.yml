@@ -1,0 +1,72 @@
+name: Bug report
+description: Report an ordinary non-security bug in silo
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. If this may be a security vulnerability, do not file a public issue; use [SECURITY.md](https://github.com/265866/silo/blob/main/SECURITY.md) for private reporting.
+
+        Never include recovery phrases, private keys, passphrases, API tokens, RPC tokens, or live wallet secrets. Maintainers will not ask for secrets, cannot recover lost mnemonics or passphrases, cannot reverse transactions, and cannot guarantee third-party RPC/provider support.
+  - type: input
+    id: version
+    attributes:
+      label: silo version
+      description: Run `silo --version` if available, or provide the release/commit you installed.
+      placeholder: "silo 0.1.2"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "macOS 15, Ubuntu 24.04, Windows 11"
+    validations:
+      required: true
+  - type: input
+    id: install-method
+    attributes:
+      label: Install method
+      placeholder: "Homebrew, install script, prebuilt binary, cargo install, from source"
+    validations:
+      required: true
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal and shell
+      placeholder: "Terminal.app + zsh, Windows Terminal + PowerShell, GNOME Terminal + bash"
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Describe the smallest sequence that triggers the bug.
+      placeholder: |
+        1. Start silo ...
+        2. Open ...
+        3. Press ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: rpc
+    attributes:
+      label: RPC/provider context
+      description: Provider name or endpoint type is useful. Do not include usernames, passwords, API tokens, RPC tokens, or full tokenized URLs.
+      placeholder: "Default mainnet RPC, local validator, QuickNode without token, Helius without token"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs or screenshots
+      description: Remove recovery phrases, private keys, passphrases, API tokens, RPC tokens, wallet secrets, and any other sensitive data before attaching.
