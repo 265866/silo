@@ -1248,6 +1248,15 @@ fn apply_prompt(app: &mut App) {
         }
         Some(PromptKind::RpcUrl) => {
             if let Some(url) = value {
+                let url = match crate::solana::rpc::validate_rpc_url(&url) {
+                    Ok(url) => url,
+                    Err(e) => {
+                        app.toast_err(format!("Invalid RPC URL: {e}"));
+                        app.modal = None;
+                        app.input.prompt_text.clear();
+                        return;
+                    }
+                };
                 app.rpc_url = url.clone();
                 app.net_status = crate::types::NetStatus::Syncing;
                 app.reconcile_done = false;

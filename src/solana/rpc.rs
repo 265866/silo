@@ -44,6 +44,63 @@ pub struct Rpc {
     commitment: &'static str,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum RpcUrlError {
+    #[error("enter an RPC URL")]
+    Empty,
+    #[error("URL contains control characters")]
+    Control,
+    #[error("URL is not valid")]
+    Invalid,
+    #[error("URL must use http or https")]
+    Scheme,
+    #[error("URL must include a host")]
+    Host,
+    #[error("URL must not include username or password")]
+    UserInfo,
+}
+
+pub fn validate_rpc_url(raw: &str) -> Result<String, RpcUrlError> {
+    if raw.chars().any(char::is_control) {
+        return Err(RpcUrlError::Control);
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(RpcUrlError::Empty);
+    }
+    let url = reqwest::Url::parse(trimmed).map_err(|_| RpcUrlError::Invalid)?;
+    match url.scheme() {
+        "http" | "https" => {}
+        _ => return Err(RpcUrlError::Scheme),
+    }
+    if url.host_str().is_none() {
+        return Err(RpcUrlError::Host);
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(RpcUrlError::UserInfo);
+    }
+    Ok(trimmed.to_string())
+}
+
+pub fn redact_rpc_url(raw: &str) -> String {
+    match reqwest::Url::parse(raw) {
+        Ok(url) => {
+            let mut out = format!("{}://{}", url.scheme(), url.host_str().unwrap_or(""));
+            if let Some(port) = url.port() {
+                out.push_str(&format!(":{port}"));
+            }
+            if url.path() != "/" && !url.path().is_empty() {
+                out.push_str("/…");
+            }
+            if url.query().is_some() {
+                out.push_str("?…");
+            }
+            out
+        }
+        Err(_) => "<invalid rpc url>".to_string(),
+    }
+}
+
 #[derive(Deserialize)]
 struct RpcEnvelope<T> {
     result: Option<T>,
@@ -254,6 +311,44 @@ fn backoff(attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rpc_url_validation_accepts_http_https() {
+        assert_eq!(
+            validate_rpc_url(" https://rpc.example.com/path?key=abc ").unwrap(),
+            "https://rpc.example.com/path?key=abc"
+        );
+        assert!(validate_rpc_url("http://127.0.0.1:8899").is_ok());
+    }
+
+    #[test]
+    fn rpc_url_validation_rejects_unsafe_urls() {
+        assert!(matches!(validate_rpc_url(""), Err(RpcUrlError::Empty)));
+        assert!(matches!(
+            validate_rpc_url("ftp://rpc.example.com"),
+            Err(RpcUrlError::Scheme)
+        ));
+        assert!(matches!(
+            validate_rpc_url("https://user:pw@rpc.example.com"),
+            Err(RpcUrlError::UserInfo)
+        ));
+        assert!(matches!(
+            validate_rpc_url("https://rpc.example.com/\n"),
+            Err(RpcUrlError::Control)
+        ));
+    }
+
+    #[test]
+    fn rpc_url_redaction_hides_path_and_query() {
+        assert_eq!(
+            redact_rpc_url("https://rpc.example.com/v2/secret?api_key=abc"),
+            "https://rpc.example.com/…?…"
+        );
+        assert_eq!(
+            redact_rpc_url("http://127.0.0.1:8899"),
+            "http://127.0.0.1:8899"
+        );
+    }
 
     #[test]
     fn decode_get_multiple_accounts() {

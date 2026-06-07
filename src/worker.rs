@@ -243,13 +243,23 @@ async fn handle_command(
             if generation.load(std::sync::atomic::Ordering::SeqCst) != cmd_gen {
                 return;
             }
+            let url = match crate::solana::rpc::validate_rpc_url(&url) {
+                Ok(url) => url,
+                Err(e) => {
+                    let _ = evt
+                        .send(AppEvent::Error(format!("invalid RPC URL: {e}")))
+                        .await;
+                    return;
+                }
+            };
             {
                 let mut g = rpc.lock_recover();
                 *g = Rpc::new(client.clone(), url.clone());
             }
+            let redacted = crate::solana::rpc::redact_rpc_url(&url);
             let wrote = crate::db::with_current_db(&db, &generation, cmd_gen, |d| {
                 let _ = d.set_meta("rpc_url", &url);
-                let _ = d.audit(AuditEvent::RpcChanged, &json!({ "url": url }));
+                let _ = d.audit(AuditEvent::RpcChanged, &json!({ "url": redacted }));
             });
             if wrote.is_none() {
                 return;

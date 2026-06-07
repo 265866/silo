@@ -778,7 +778,7 @@ pub(super) fn settings(f: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled("  rpc        ", Style::default().fg(theme.text_muted)),
             Span::styled(
-                format::elide_middle(&app.rpc_url, 56),
+                format::elide_middle(&crate::solana::rpc::redact_rpc_url(&app.rpc_url), 56),
                 Style::default().fg(theme.text),
             ),
         ]),
