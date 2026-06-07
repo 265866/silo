@@ -36,8 +36,12 @@ testnet mode for end users.
 - **The mnemonic is the only source of truth.** Private keys are *never* persisted. The seed
   is decrypted into memory only while unlocked, signing keys are derived at sign time and
   dropped immediately, and secrets are zeroized on lock/exit.
-- **Encrypted vault.** The seed is sealed with XChaCha20-Poly1305 under an Argon2-derived key
-  from your passphrase. Auto-lock kicks in after an idle timeout.
+- **Encrypted vault.** The seed is sealed with XChaCha20-Poly1305 under an Argon2id-derived key
+  from your passphrase. New vaults use cold-storage Argon2id parameters (64 MiB memory, 3 passes)
+  rather than the lighter interactive-login minimum, because the vault file is a cold, high-value
+  secret an attacker could exfiltrate and brute-force fully offline — so the KDF, not online rate
+  limiting, is the work factor that matters. Each vault stores the parameters it was created with,
+  so older vaults keep unlocking unchanged. Auto-lock kicks in after an idle timeout.
 - **Crash-safe by construction.** Every money operation is a single `IMMEDIATE` SQLite
   transaction (`WAL` + `synchronous=FULL`) that mutates the row *and* appends its audit row
   atomically. A write-ahead **intent log** records transfers before they are signed/sent, and a
