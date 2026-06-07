@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
-use futures_util::stream::{self, StreamExt};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
@@ -12,7 +11,6 @@ use crate::types::Commitment;
 const MAX_RETRIES: u32 = 4;
 const GMA_CHUNK: usize = 100;
 const SIGSTATUS_CHUNK: usize = 256;
-const FANOUT: usize = 3;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct SignatureStatus {
@@ -42,6 +40,63 @@ pub struct Rpc {
     client: reqwest::Client,
     url: String,
     commitment: &'static str,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RpcUrlError {
+    #[error("enter an RPC URL")]
+    Empty,
+    #[error("URL contains control characters")]
+    Control,
+    #[error("URL is not valid")]
+    Invalid,
+    #[error("URL must use http or https")]
+    Scheme,
+    #[error("URL must include a host")]
+    Host,
+    #[error("URL must not include username or password")]
+    UserInfo,
+}
+
+pub fn validate_rpc_url(raw: &str) -> Result<String, RpcUrlError> {
+    if raw.chars().any(char::is_control) {
+        return Err(RpcUrlError::Control);
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(RpcUrlError::Empty);
+    }
+    let url = reqwest::Url::parse(trimmed).map_err(|_| RpcUrlError::Invalid)?;
+    match url.scheme() {
+        "http" | "https" => {}
+        _ => return Err(RpcUrlError::Scheme),
+    }
+    if url.host_str().is_none() {
+        return Err(RpcUrlError::Host);
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(RpcUrlError::UserInfo);
+    }
+    Ok(trimmed.to_string())
+}
+
+pub fn redact_rpc_url(raw: &str) -> String {
+    match reqwest::Url::parse(raw) {
+        Ok(url) => {
+            let mut out = format!("{}://{}", url.scheme(), url.host_str().unwrap_or(""));
+            if let Some(port) = url.port() {
+                out.push_str(&format!(":{port}"));
+            }
+            if url.path() != "/" && !url.path().is_empty() {
+                out.push_str("/…");
+            }
+            if url.query().is_some() {
+                out.push_str("?…");
+            }
+            out
+        }
+        Err(_) => "<invalid rpc url>".to_string(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -127,47 +182,31 @@ impl Rpc {
         }
     }
 
-    pub async fn get_balances(&self, pubkeys: &[String]) -> Result<Vec<u64>> {
+    pub async fn get_balances(&self, pubkeys: &[&str]) -> Result<Vec<u64>> {
         if pubkeys.is_empty() {
             return Ok(vec![]);
         }
-        let chunks: Vec<(usize, Vec<String>)> = pubkeys
-            .chunks(GMA_CHUNK)
-            .enumerate()
-            .map(|(i, c)| (i, c.to_vec()))
-            .collect();
 
-        let this = self;
-        let mut results: Vec<(usize, Vec<u64>)> = stream::iter(chunks)
-            .map(|(i, chunk)| async move {
-                let params = json!([
-                    chunk,
-                    {"commitment": this.commitment, "encoding": "base64",
-                     "dataSlice": {"offset": 0, "length": 0}}
-                ]);
-                let ctx: Ctx<Vec<Option<AccountInfo>>> =
-                    this.call("getMultipleAccounts", params).await?;
-                let balances = ctx
-                    .value
+        let mut out = Vec::with_capacity(pubkeys.len());
+        for chunk in pubkeys.chunks(GMA_CHUNK) {
+            let params = json!([
+                chunk,
+                {"commitment": self.commitment, "encoding": "base64",
+                 "dataSlice": {"offset": 0, "length": 0}}
+            ]);
+            let ctx: Ctx<Vec<Option<AccountInfo>>> =
+                self.call("getMultipleAccounts", params).await?;
+            out.extend(
+                ctx.value
                     .into_iter()
-                    .map(|o| o.map(|a| a.lamports).unwrap_or(0))
-                    .collect::<Vec<u64>>();
-                Ok::<_, anyhow::Error>((i, balances))
-            })
-            .buffer_unordered(FANOUT)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-
-        results.sort_by_key(|(i, _)| *i);
-        Ok(results.into_iter().flat_map(|(_, v)| v).collect())
+                    .map(|o| o.map(|a| a.lamports).unwrap_or(0)),
+            );
+        }
+        Ok(out)
     }
 
     pub async fn get_balance(&self, pubkey: &str) -> Result<u64> {
-        let v = self
-            .get_balances(std::slice::from_ref(&pubkey.to_string()))
-            .await?;
+        let v = self.get_balances(&[pubkey]).await?;
         Ok(v.first().copied().unwrap_or(0))
     }
 
@@ -188,34 +227,21 @@ impl Rpc {
 
     pub async fn get_signature_statuses(
         &self,
-        signatures: &[String],
+        signatures: &[&str],
         search_history: bool,
     ) -> Result<Vec<Option<SignatureStatus>>> {
         if signatures.is_empty() {
             return Ok(vec![]);
         }
-        let chunks: Vec<(usize, Vec<String>)> = signatures
-            .chunks(SIGSTATUS_CHUNK)
-            .enumerate()
-            .map(|(i, c)| (i, c.to_vec()))
-            .collect();
 
-        let this = self;
-        let mut results: Vec<(usize, Vec<Option<SignatureStatus>>)> = stream::iter(chunks)
-            .map(|(i, chunk)| async move {
-                let params = json!([chunk, {"searchTransactionHistory": search_history}]);
-                let ctx: Ctx<Vec<Option<SignatureStatus>>> =
-                    this.call("getSignatureStatuses", params).await?;
-                Ok::<_, anyhow::Error>((i, ctx.value))
-            })
-            .buffer_unordered(FANOUT)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-
-        results.sort_by_key(|(i, _)| *i);
-        Ok(results.into_iter().flat_map(|(_, v)| v).collect())
+        let mut out = Vec::with_capacity(signatures.len());
+        for chunk in signatures.chunks(SIGSTATUS_CHUNK) {
+            let params = json!([chunk, {"searchTransactionHistory": search_history}]);
+            let ctx: Ctx<Vec<Option<SignatureStatus>>> =
+                self.call("getSignatureStatuses", params).await?;
+            out.extend(ctx.value);
+        }
+        Ok(out)
     }
 
     pub async fn get_block_height(&self) -> Result<u64> {
@@ -254,6 +280,44 @@ fn backoff(attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rpc_url_validation_accepts_http_https() {
+        assert_eq!(
+            validate_rpc_url(" https://rpc.example.com/path?key=abc ").unwrap(),
+            "https://rpc.example.com/path?key=abc"
+        );
+        assert!(validate_rpc_url("http://127.0.0.1:8899").is_ok());
+    }
+
+    #[test]
+    fn rpc_url_validation_rejects_unsafe_urls() {
+        assert!(matches!(validate_rpc_url(""), Err(RpcUrlError::Empty)));
+        assert!(matches!(
+            validate_rpc_url("ftp://rpc.example.com"),
+            Err(RpcUrlError::Scheme)
+        ));
+        assert!(matches!(
+            validate_rpc_url("https://user:pw@rpc.example.com"),
+            Err(RpcUrlError::UserInfo)
+        ));
+        assert!(matches!(
+            validate_rpc_url("https://rpc.example.com/\n"),
+            Err(RpcUrlError::Control)
+        ));
+    }
+
+    #[test]
+    fn rpc_url_redaction_hides_path_and_query() {
+        assert_eq!(
+            redact_rpc_url("https://rpc.example.com/v2/secret?api_key=abc"),
+            "https://rpc.example.com/…?…"
+        );
+        assert_eq!(
+            redact_rpc_url("http://127.0.0.1:8899"),
+            "http://127.0.0.1:8899"
+        );
+    }
 
     #[test]
     fn decode_get_multiple_accounts() {

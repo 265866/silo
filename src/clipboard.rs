@@ -2,6 +2,7 @@
 pub enum CopyOutcome {
     Persistent,
     NonPersistent,
+    PersistenceUnknown,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -104,9 +105,17 @@ impl ClipboardManager {
         {
             Ok(mut child) => {
                 if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(text.as_bytes());
+                    if stdin.write_all(text.as_bytes()).is_err() || stdin.flush().is_err() {
+                        let mut cb = arboard::Clipboard::new()?;
+                        cb.set_text(text.to_owned())?;
+                        return Ok(CopyOutcome::NonPersistent);
+                    }
+                    Ok(CopyOutcome::PersistenceUnknown)
+                } else {
+                    let mut cb = arboard::Clipboard::new()?;
+                    cb.set_text(text.to_owned())?;
+                    Ok(CopyOutcome::NonPersistent)
                 }
-                Ok(CopyOutcome::Persistent)
             }
             Err(_) => {
                 let mut cb = arboard::Clipboard::new()?;
