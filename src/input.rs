@@ -942,8 +942,9 @@ fn modal_keys(app: &mut App, key: KeyEvent) {
             KeyCode::Enter => {
                 if app.pending_send_is_large() && !app.send_confirm_armed {
                     app.send_confirm_armed = true;
+                    app.send_confirm_armed_at = Some(std::time::Instant::now());
                     app.toast_info("Large send (≈90%+ of balance) — press Enter again to confirm");
-                } else {
+                } else if app.large_send_confirm_ready() {
                     execute_send(app);
                 }
             }
@@ -951,6 +952,7 @@ fn modal_keys(app: &mut App, key: KeyEvent) {
                 app.modal = None;
                 app.pending_send = None;
                 app.send_confirm_armed = false;
+                app.send_confirm_armed_at = None;
                 app.toast_info("Send cancelled");
             }
             _ => {}
@@ -2172,5 +2174,122 @@ mod tests {
             "a duplicate SendPrepared reply must not disarm an already-armed large send"
         );
         assert!(matches!(h.app.modal, Some(Modal::ConfirmSend)));
+    }
+
+    fn large_pending_modal(h: &mut Harness) {
+        let from_id = h.app.wallets[0].id;
+        let to = crypto::derive_address(
+            &crypto::seed_from_mnemonic(&crypto::parse_mnemonic(TEST_MNEMONIC).unwrap()),
+            1,
+        );
+        h.app.route = Route::Send;
+        h.app.wallets[0].balance_lamports = Some(1_300_000);
+        h.app.pending_send = Some(crate::app::PendingSend {
+            from_id,
+            to,
+            lamports: 1_234_567,
+            blockhash: bs58::encode([3u8; 32]).into_string(),
+            lvbh: 99_999,
+            fee: 7_500,
+            dest_balance: 0,
+            priority_micro: 0,
+            prepared_at: Instant::now(),
+        });
+        h.app.modal = Some(Modal::ConfirmSend);
+        assert!(
+            h.app.pending_send_is_large(),
+            "test precondition: the pending send must be a large send"
+        );
+    }
+
+    #[test]
+    fn held_enter_does_not_execute_large_send_before_debounce() {
+        let mut h = harness(true);
+        large_pending_modal(&mut h);
+
+        modal_keys(
+            &mut h.app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(
+            h.app.send_confirm_armed,
+            "the first Enter arms the large send"
+        );
+        assert!(
+            h.app.send_confirm_armed_at.is_some(),
+            "arming must record a timestamp"
+        );
+
+        modal_keys(
+            &mut h.app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(
+            h.rx.try_recv().is_err(),
+            "an immediate second Enter (key autorepeat) must not execute the send"
+        );
+        assert!(
+            h.app.pending_send.is_some(),
+            "the send must stay pending and merely armed"
+        );
+        assert!(h.app.send_confirm_armed);
+        assert!(matches!(h.app.modal, Some(Modal::ConfirmSend)));
+    }
+
+    #[test]
+    fn large_send_executes_after_debounce_elapses() {
+        let mut h = harness(true);
+        large_pending_modal(&mut h);
+        h.app.send_confirm_armed = true;
+        h.app.send_confirm_armed_at = Some(Instant::now() - Duration::from_millis(600));
+
+        modal_keys(
+            &mut h.app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        assert!(
+            matches!(h.rx.try_recv(), Ok((_, Command::PersistSignedSend { .. }))),
+            "a deliberate second Enter after the debounce must execute the send"
+        );
+        assert!(h.app.pending_send.is_none());
+    }
+
+    #[test]
+    fn small_send_executes_on_first_enter_without_debounce() {
+        let mut h = harness(true);
+        let from_id = h.app.wallets[0].id;
+        let to = crypto::derive_address(
+            &crypto::seed_from_mnemonic(&crypto::parse_mnemonic(TEST_MNEMONIC).unwrap()),
+            1,
+        );
+        h.app.route = Route::Send;
+        h.app.wallets[0].balance_lamports = Some(1_000_000_000);
+        h.app.pending_send = Some(crate::app::PendingSend {
+            from_id,
+            to,
+            lamports: 1_000,
+            blockhash: bs58::encode([3u8; 32]).into_string(),
+            lvbh: 99_999,
+            fee: 7_500,
+            dest_balance: 0,
+            priority_micro: 0,
+            prepared_at: Instant::now(),
+        });
+        h.app.modal = Some(Modal::ConfirmSend);
+        assert!(
+            !h.app.pending_send_is_large(),
+            "test precondition: this must not be a large send"
+        );
+
+        modal_keys(
+            &mut h.app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        assert!(
+            matches!(h.rx.try_recv(), Ok((_, Command::PersistSignedSend { .. }))),
+            "a normal send must execute on the first Enter with no debounce"
+        );
     }
 }
