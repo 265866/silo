@@ -124,6 +124,16 @@ Configuration lives in your platform config directory, overridable with `SILO_CO
 
 Each profile stores its vault and database under `<config>/profiles/<id>/`.
 
+## Operations and troubleshooting
+
+- **TTY required.** `silo` is an interactive TUI and must be started from a real terminal. It is not designed for cron, pipes, redirected stdio, or non-interactive service runners; if terminal setup fails, run it directly in a local terminal or an attached SSH session with a TTY.
+- **Config directory failures.** On startup, silo creates the config directory and the active profile directory, then sets Unix permissions to `0700`. Errors such as `creating ...` or `setting permissions on ...` mean the configured location is missing permissions, owned by another user, read-only, or on a filesystem that cannot apply those permissions. Fix ownership/permissions or choose another config directory.
+- **Single-instance lock.** The config directory contains `silo.lock`. If startup says `another silo instance is already running`, another silo process is holding that config directory's lock. Exit the other process, or use a separate config directory for an isolated run.
+- **Temporary config directories.** `SILO_CONFIG_DIR` overrides the platform default. For safe testing, use a private throwaway directory, for example `SILO_CONFIG_DIR="$(mktemp -d)" silo`. Do not point `SILO_CONFIG_DIR` at a real config directory unless you intend to use those profiles; each config directory has its own lock, `profiles.json`, and `profiles/` tree.
+- **Network dependencies.** SOL balances, blockhashes, transaction broadcast, and confirmation polling use the configured Solana JSON-RPC endpoint, defaulting to `https://api.mainnet-beta.solana.com`. The Settings screen can save another `http` or `https` RPC URL with a host and no username/password. Fiat pricing uses CoinGecko first; if that fails, silo falls back to Jupiter's SOL price and Frankfurter FX rates for non-USD currencies. If these services are unavailable, rate-limited, or return invalid data, expect refresh/send preparation errors or stale/missing fiat prices; already-created local vault/profile data remains on disk.
+- **Linux clipboard persistence.** Clipboard support depends on the desktop clipboard backend. On Linux, silo tries to keep copied text available after the main process exits by spawning a small clipboard helper. Some sessions cannot persist clipboard contents, notably GNOME Wayland without data-control support, so copied addresses may disappear when silo exits or may only be available while the session keeps them.
+- **Backups and migration.** Back up the whole config directory, especially `profiles.json` and each `<config>/profiles/<id>/vault.json` and `silo.db`. The mnemonic is the ultimate recovery material, but the vault/profile database contain labels, notes, audit history, settings, and cached metadata. To move machines, install the same or newer silo, copy the config directory to the platform default location or set `SILO_CONFIG_DIR` to it, preserve file ownership/private permissions, then start silo. SQLite migrations run automatically.
+
 ## Keyboard shortcuts
 
 | Screen | Keys |
