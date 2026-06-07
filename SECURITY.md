@@ -8,7 +8,7 @@ Security fixes are provided for the latest released version of `silo`. If you ar
 
 Please do not open public GitHub issues for security vulnerabilities.
 
-Use GitHub private vulnerability reporting from the repository's **Security** tab. Include:
+Use GitHub private vulnerability reporting from the repository's **Security** tab. If that is unavailable, email the maintainer at `github@coltons.space`. Include:
 
 - affected version or commit
 - operating system

@@ -59,8 +59,9 @@ A maintainer will review and merge it.
 ## Reporting security issues
 
 Please **don't** open a public issue for security vulnerabilities. Report them privately through the
-repository's **Security** tab (Private vulnerability reporting) so they can be fixed before they're
-disclosed.
+repository's **Security** tab (Private vulnerability reporting), or email `github@coltons.space` if
+GitHub private vulnerability reporting is unavailable. Do not include recovery phrases, private keys,
+API tokens, or live wallet secrets.
 
 ## How releases work
 

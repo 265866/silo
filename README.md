@@ -156,6 +156,10 @@ cargo fmt --all --check
 
 CI runs `fmt`, `clippy`, dependency policy checks, an MSRV check, and the full test suite on Linux, macOS, and Windows for every pull request.
 
+## Security
+
+Please report vulnerabilities privately through GitHub private vulnerability reporting, or email `github@coltons.space` if that is unavailable. See [SECURITY.md](SECURITY.md).
+
 ## License
 
 Copyright (c) 2026 Colton.
