@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/265866/silo/compare/v0.1.1...v0.1.2) - 2026-06-07
+
+### Fixed
+
+- *(db)* harden safety checks and audited metadata ([#53](https://github.com/265866/silo/pull/53))
+- resolve open issue sweep
+
 ## [0.1.1](https://github.com/265866/silo/compare/v0.1.0...v0.1.1) - 2026-06-05
 
 ### Other
