@@ -63,6 +63,26 @@ fn wayland_without_data_control() -> bool {
     desktop.contains("gnome")
 }
 
+#[cfg(target_os = "linux")]
+fn spawn_detached(command: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        command.pre_exec(|| {
+            match unsafe { libc::fork() } {
+                -1 => return Err(std::io::Error::last_os_error()),
+                0 => {
+                    if unsafe { libc::setsid() } == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                _ => unsafe { libc::_exit(0) },
+            }
+            Ok(())
+        });
+    }
+    command.spawn()
+}
+
 #[derive(Clone, Default)]
 pub struct ClipboardManager;
 
@@ -96,20 +116,24 @@ impl ClipboardManager {
         }
 
         let exe = std::env::current_exe().map_err(|e| ClipboardError::Backend(e.to_string()))?;
-        match Command::new(exe)
+        let mut command = Command::new(exe);
+        command
             .arg(CLIP_DAEMON_ARG)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
+            .stderr(Stdio::null());
+        match spawn_detached(&mut command) {
             Ok(mut child) => {
-                if let Some(mut stdin) = child.stdin.take() {
-                    if stdin.write_all(text.as_bytes()).is_err() || stdin.flush().is_err() {
-                        let mut cb = arboard::Clipboard::new()?;
-                        cb.set_text(text.to_owned())?;
-                        return Ok(CopyOutcome::NonPersistent);
+                let wrote = match child.stdin.take() {
+                    Some(mut stdin) => {
+                        let ok = stdin.write_all(text.as_bytes()).is_ok() && stdin.flush().is_ok();
+                        drop(stdin);
+                        ok
                     }
+                    None => false,
+                };
+                let _ = child.wait();
+                if wrote {
                     Ok(CopyOutcome::PersistenceUnknown)
                 } else {
                     let mut cb = arboard::Clipboard::new()?;
@@ -174,5 +198,41 @@ mod tests {
             validate_solana_pubkey("abc"),
             Err(ClipboardError::WrongLength(_))
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_detached_reparents_to_init() {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 0.3; ps -o ppid= -p $$")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let mut child = spawn_detached(&mut command).expect("spawn detached helper");
+        let intermediate_pid = child.id();
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let status = child.wait().expect("reap intermediate fork");
+        assert!(status.success(), "intermediate fork should exit cleanly");
+
+        let mut out = String::new();
+        stdout
+            .read_to_string(&mut out)
+            .expect("read grandchild ppid");
+        let ppid: u32 = out.trim().parse().expect("ppid is numeric");
+        assert_ne!(
+            ppid,
+            std::process::id(),
+            "detached daemon must not remain a child of silo"
+        );
+        assert_ne!(
+            ppid, intermediate_pid,
+            "detached daemon must outlive the intermediate fork"
+        );
     }
 }
