@@ -661,6 +661,11 @@ pub fn classify_route(
     if to == from.pubkey {
         return Err(RouteError::SelfSend);
     }
+    if let Ok(bytes) = tx::address_to_bytes(to)
+        && tx::is_instruction_program_address(&bytes)
+    {
+        return Err(RouteError::ProgramAddress);
+    }
     let dest_role = wallets.iter().find(|w| w.pubkey == to).map(|w| w.role);
     match (from.role, dest_role) {
         (Role::Sub, Some(Role::Sub)) => Err(RouteError::SubToSubForbidden),
@@ -707,8 +712,19 @@ fn execute_send(app: &mut App) {
         unit_limit: crate::money::COMPUTE_UNIT_LIMIT,
         micro_lamports_per_cu: ps.priority_micro,
     });
-    let message =
-        tx::build_transfer_message(&from_bytes, &to_bytes, ps.lamports, &bh_bytes, priority);
+    let message = match tx::build_transfer_message(
+        &from_bytes,
+        &to_bytes,
+        ps.lamports,
+        &bh_bytes,
+        priority,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            app.toast_err(format!("Cannot build transfer: {e}"));
+            return;
+        }
+    };
     let sig = match app.sign_for(from.account_index, &message) {
         Ok(s) => s.to_bytes(),
         Err(e) => {
@@ -2290,6 +2306,31 @@ mod tests {
         assert!(
             matches!(h.rx.try_recv(), Ok((_, Command::PersistSignedSend { .. }))),
             "a normal send must execute on the first Enter with no debounce"
+        );
+    }
+
+    #[test]
+    fn classify_route_rejects_program_addresses() {
+        let seed = crypto::seed_from_mnemonic(&crypto::parse_mnemonic(TEST_MNEMONIC).unwrap());
+        let from = w(1, 0, Role::Master, &crypto::derive_address(&seed, 0));
+        let wallets = vec![from.clone()];
+
+        assert_eq!(
+            classify_route(&wallets, &from, "11111111111111111111111111111111"),
+            Err(RouteError::ProgramAddress),
+            "system program address must be rejected as a recipient"
+        );
+        assert_eq!(
+            classify_route(&wallets, &from, tx::COMPUTE_BUDGET_PROGRAM_ID_B58),
+            Err(RouteError::ProgramAddress),
+            "compute-budget program address must be rejected as a recipient"
+        );
+
+        let recipient = crypto::derive_address(&seed, 1);
+        assert_eq!(
+            classify_route(&wallets, &from, &recipient),
+            Ok(()),
+            "an ordinary wallet recipient must still be accepted"
         );
     }
 }
