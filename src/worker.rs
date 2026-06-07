@@ -163,17 +163,16 @@ async fn handle_command(
         }
 
         Command::RefreshBalances { include_archived } => {
-            let wallets: Vec<(i64, String)> = {
-                let d = db.lock().unwrap();
-                d.list_wallets()
-                    .map(|ws| {
-                        ws.into_iter()
-                            .filter(|w| include_archived || !w.archived)
-                            .map(|w| (w.id, w.pubkey))
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            };
+            let wallets: Vec<(i64, String)> = db
+                .lock_recover()
+                .list_wallets()
+                .map(|ws| {
+                    ws.into_iter()
+                        .filter(|w| include_archived || !w.archived)
+                        .map(|w| (w.id, w.pubkey))
+                        .collect()
+                })
+                .unwrap_or_default();
             if wallets.is_empty() {
                 return;
             }
