@@ -1379,7 +1379,83 @@ fn handle_paste(app: &mut App, text: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use std::time::{Duration, Instant};
+
+    use tokio::sync::mpsc;
+
     use super::*;
+    use crate::app::PendingSend;
+    use crate::db::{Db, Storage};
+    use crate::price::PriceCache;
+    use crate::solana::rpc::Rpc;
+    use crate::types::IntentStatus;
+
+    const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    struct Harness {
+        app: App,
+        rx: mpsc::Receiver<(u64, Command)>,
+    }
+
+    fn harness(seed: bool) -> Harness {
+        let db = Db::open_memory().unwrap();
+        let storage = Storage::new(db);
+        let mnemonic = crypto::parse_mnemonic(TEST_MNEMONIC).unwrap();
+        let seed_value = crypto::seed_from_mnemonic(&mnemonic);
+        let from_pubkey = crypto::derive_address(&seed_value, 0);
+        let wallet = storage
+            .with_mut(|d| d.insert_wallet(0, Role::Master, &from_pubkey, None))
+            .unwrap();
+        let (tx, rx) = mpsc::channel::<(u64, Command)>(8);
+        let config_dir = std::env::temp_dir().join(format!("silo-test-{}", std::process::id()));
+        let mut app = App::new(
+            storage,
+            Arc::new(PriceCache::default()),
+            tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(std::sync::Mutex::new(Rpc::new(
+                reqwest::Client::new(),
+                "http://127.0.0.1:8899".to_string(),
+            ))),
+            reqwest::Client::new(),
+            config_dir.clone(),
+            "http://127.0.0.1:8899".to_string(),
+            config_dir.join("vault"),
+        );
+        app.wallets = vec![wallet];
+        app.route = Route::Send;
+        app.modal = Some(Modal::ConfirmSend);
+        if seed {
+            app.seed = Some(seed_value);
+        }
+        Harness { app, rx }
+    }
+
+    fn pending(from_id: i64, priority_micro: u64, prepared_at: Instant) -> PendingSend {
+        PendingSend {
+            from_id,
+            to: crypto::derive_address(
+                &crypto::seed_from_mnemonic(&crypto::parse_mnemonic(TEST_MNEMONIC).unwrap()),
+                1,
+            ),
+            lamports: 1_234_567,
+            blockhash: bs58::encode([3u8; 32]).into_string(),
+            lvbh: 99_999,
+            fee: 7_500,
+            dest_balance: 0,
+            priority_micro,
+            prepared_at,
+        }
+    }
+
+    fn intents(app: &App) -> Vec<crate::types::Intent> {
+        let wallet_id = app.wallets[0].id;
+        app.db
+            .with(|d| d.list_intents_for_wallet(wallet_id, 10))
+            .unwrap()
+    }
 
     fn w(id: i64, idx: u32, role: Role, pk: &str) -> WalletRow {
         WalletRow {
@@ -1394,6 +1470,122 @@ mod tests {
             balance_lamports: None,
             has_open_intent: false,
         }
+    }
+
+    #[tokio::test]
+    async fn execute_send_persists_signed_intent_and_queues_broadcast() {
+        let mut h = harness(true);
+        let from_id = h.app.wallets[0].id;
+        h.app.pending_send = Some(pending(from_id, 0, Instant::now()));
+
+        execute_send(&mut h.app);
+
+        let (_, cmd) = h.rx.recv().await.unwrap();
+        match cmd {
+            Command::Broadcast { intent_id } => {
+                let list = intents(&h.app);
+                assert_eq!(list.len(), 1);
+                assert_eq!(intent_id, list[0].id);
+                assert_eq!(list[0].status, IntentStatus::Signed);
+                assert!(list[0].signature.as_ref().is_some_and(|s| !s.is_empty()));
+                let blockhash = bs58::encode([3u8; 32]).into_string();
+                assert_eq!(
+                    list[0].recent_blockhash.as_deref(),
+                    Some(blockhash.as_str())
+                );
+                assert_eq!(list[0].last_valid_block_height, Some(99_999));
+                assert_eq!(list[0].fee_lamports, Some(7_500));
+                assert!(list[0].signed_tx.as_ref().is_some_and(|w| w.len() > 64));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(h.rx.try_recv().is_err());
+        assert_eq!(h.app.route, Route::WalletDetail);
+    }
+
+    #[tokio::test]
+    async fn execute_send_stale_pending_send_refreshes_without_intent() {
+        let mut h = harness(true);
+        let from_id = h.app.wallets[0].id;
+        h.app.pending_send = Some(pending(
+            from_id,
+            42,
+            Instant::now() - Duration::from_secs(46),
+        ));
+
+        execute_send(&mut h.app);
+
+        let (_, cmd) = h.rx.recv().await.unwrap();
+        match cmd {
+            Command::PrepareSend {
+                from_id: cmd_from,
+                lamports,
+                priority_micro,
+                ..
+            } => {
+                assert_eq!(cmd_from, from_id);
+                assert_eq!(lamports, 1_234_567);
+                assert_eq!(priority_micro, 42);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(intents(&h.app).is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_send_locked_marks_created_intent_failed_without_broadcast() {
+        let mut h = harness(false);
+        let from_id = h.app.wallets[0].id;
+        h.app.pending_send = Some(pending(from_id, 0, Instant::now()));
+
+        execute_send(&mut h.app);
+
+        let list = intents(&h.app);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].status, IntentStatus::Failed);
+        assert_eq!(list[0].error.as_deref(), Some("signing failed"));
+        assert!(h.rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn execute_send_preserves_priority_fee_in_signed_wire_and_fee() {
+        let mut h = harness(true);
+        let from_id = h.app.wallets[0].id;
+        let priority_micro = 12_345;
+        h.app.pending_send = Some(pending(from_id, priority_micro, Instant::now()));
+
+        execute_send(&mut h.app);
+
+        let _ = h.rx.recv().await.unwrap();
+        let list = intents(&h.app);
+        let wire = list[0].signed_tx.as_ref().unwrap();
+        assert_eq!(list[0].fee_lamports, Some(7_500));
+        assert!(wire.windows(8).any(|w| w == priority_micro.to_le_bytes()));
+        assert!(
+            wire.windows(4)
+                .any(|w| w == crate::money::COMPUTE_UNIT_LIMIT.to_le_bytes())
+        );
+    }
+
+    #[test]
+    fn execute_send_closed_broadcast_channel_reports_error_without_route_advance() {
+        let mut h = harness(true);
+        drop(h.rx);
+        let from_id = h.app.wallets[0].id;
+        h.app.pending_send = Some(pending(from_id, 0, Instant::now()));
+
+        execute_send(&mut h.app);
+
+        let list = intents(&h.app);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].status, IntentStatus::Signed);
+        assert_eq!(h.app.route, Route::Send);
+        assert!(
+            h.app
+                .toasts
+                .iter()
+                .any(|t| t.text == "Background worker stopped")
+        );
     }
 
     #[test]
