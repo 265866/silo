@@ -226,15 +226,22 @@ async fn handle_command(
         }
 
         Command::RefreshBalances { include_archived } => {
-            let wallets: Vec<(i64, String)> = db
-                .with(|d| d.list_wallets())
-                .map(|ws| {
-                    ws.into_iter()
-                        .filter(|w| include_archived || !w.archived)
-                        .map(|w| (w.id, w.pubkey))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let wallets: Vec<(i64, String)> = match db.with(|d| d.list_wallets()) {
+                Ok(ws) => ws
+                    .into_iter()
+                    .filter(|w| include_archived || !w.archived)
+                    .map(|w| (w.id, w.pubkey))
+                    .collect(),
+                Err(e) => {
+                    let _ = evt
+                        .send(AppEvent::BalancesFailed {
+                            reason: format!("could not load wallets: {e}"),
+                            generation: cmd_gen,
+                        })
+                        .await;
+                    return;
+                }
+            };
             if wallets.is_empty() {
                 let _ = evt
                     .send(AppEvent::Balances {
@@ -329,10 +336,13 @@ async fn handle_command(
                 }
             };
             let redacted = crate::solana::rpc::redact_rpc_url(&url);
-            let wrote = db.with_current(&generation, cmd_gen, |d| -> anyhow::Result<()> {
-                d.set_meta("rpc_url", &url)?;
-                d.audit(AuditEvent::RpcChanged, &json!({ "url": redacted }))?;
-                Ok(())
+            let wrote = db.with_current(&generation, cmd_gen, |d| {
+                d.set_meta_audited(
+                    "rpc_url",
+                    &url,
+                    AuditEvent::RpcChanged,
+                    &json!({ "url": redacted }),
+                )
             });
             match wrote {
                 Some(Ok(())) => {}

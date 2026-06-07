@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use rusqlite::types::Type;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::json;
 
@@ -9,10 +10,20 @@ fn row_to_wallet(r: &rusqlite::Row) -> rusqlite::Result<WalletRow> {
     let role_str: String = r.get(2)?;
     let archived_i: i64 = r.get(6)?;
     let has_open: i64 = r.get(8)?;
+    let role = Role::from_db_str(&role_str).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown wallet role '{role_str}'"),
+            )),
+        )
+    })?;
     Ok(WalletRow {
         id: r.get(0)?,
         account_index: r.get::<_, i64>(1)? as u32,
-        role: Role::from_db_str(&role_str).unwrap_or(Role::Sub),
+        role,
         pubkey: r.get(3)?,
         label: r.get(4)?,
         note: r.get(5)?,
@@ -188,6 +199,22 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].role, Role::Master);
         assert_eq!(all[1].account_index, 1);
+    }
+
+    #[test]
+    fn invalid_role_is_a_read_error() {
+        let d = db();
+        d.conn
+            .execute_batch("PRAGMA ignore_check_constraints=ON;")
+            .unwrap();
+        d.conn
+            .execute(
+                "INSERT INTO wallets (account_index, role, pubkey, label, note, archived, created_at)
+                 VALUES (1, 'mystery', ?1, NULL, NULL, 0, 1)",
+                params![PK1],
+            )
+            .unwrap();
+        assert!(d.list_wallets().is_err());
     }
 
     #[test]

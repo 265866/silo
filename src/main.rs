@@ -47,7 +47,8 @@ async fn main() -> Result<()> {
         .unwrap_or(silo::money::DEFAULT_PRIORITY_FEE_MICRO);
     let last_price = db
         .get_meta("last_price")?
-        .and_then(|s| SolPrice::from_meta_json(&s))
+        .map(|s| SolPrice::from_meta_json(&s))
+        .transpose()?
         .filter(|p| p.currency == currency);
     let auto_lock_mins = db
         .get_meta("auto_lock_minutes")?

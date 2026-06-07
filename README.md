@@ -100,10 +100,10 @@ Download a build for your platform from the [latest release](https://github.com/
 Requires a Rust toolchain (edition 2024, **MSRV 1.89**).
 
 ```sh
-cargo install --git https://github.com/265866/silo
+cargo install --locked --git https://github.com/265866/silo
 # or, from a clone:
-cargo run                # build and launch
-cargo build --release
+cargo run --locked       # build and launch
+cargo build --release --locked
 ```
 
 ## Running silo

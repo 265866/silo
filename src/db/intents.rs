@@ -1,4 +1,5 @@
 use anyhow::Result;
+use rusqlite::types::Type;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::json;
 
@@ -18,13 +19,23 @@ const INTENT_COLS: &str = "id, from_wallet, to_address, lamports, fee_lamports, 
 
 fn row_to_intent(r: &rusqlite::Row) -> rusqlite::Result<Intent> {
     let status_str: String = r.get(5)?;
+    let status = IntentStatus::from_db_str(&status_str).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            5,
+            Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown intent status '{status_str}'"),
+            )),
+        )
+    })?;
     Ok(Intent {
         id: r.get(0)?,
         from_wallet: r.get(1)?,
         to_address: r.get(2)?,
         lamports: r.get::<_, i64>(3)? as u64,
         fee_lamports: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
-        status: IntentStatus::from_db_str(&status_str).unwrap_or(IntentStatus::Failed),
+        status,
         signature: r.get(6)?,
         recent_blockhash: r.get(7)?,
         last_valid_block_height: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
@@ -307,6 +318,24 @@ mod tests {
         assert!(d.verify_audit_chain().unwrap());
         d.set_intent_note(i.id, None).unwrap();
         assert!(d.get_intent(i.id).unwrap().unwrap().note.is_none());
+    }
+
+    #[test]
+    fn invalid_status_is_a_read_error() {
+        let (d, m, _s) = db_with_two_wallets();
+        d.conn
+            .execute_batch("PRAGMA ignore_check_constraints=ON;")
+            .unwrap();
+        d.conn
+            .execute(
+                "INSERT INTO tx_intents
+                 (from_wallet, to_address, lamports, status, created_at, updated_at)
+                 VALUES (?1, 'Dest11111111111111111111111111111111111111A', 1000, 'mystery', 1, 1)",
+                params![m],
+            )
+            .unwrap();
+        let id = d.conn.last_insert_rowid();
+        assert!(d.get_intent(id).is_err());
     }
 
     #[test]
