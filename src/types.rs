@@ -291,6 +291,7 @@ pub enum RouteError {
     SubToSubForbidden,
     SelfSend,
     UnknownDestination,
+    ProgramAddress,
 }
 impl std::fmt::Display for RouteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -298,6 +299,7 @@ impl std::fmt::Display for RouteError {
             RouteError::SubToSubForbidden => "subwallet → subwallet is blocked",
             RouteError::SelfSend => "cannot send to the same wallet",
             RouteError::UnknownDestination => "not a valid Solana address",
+            RouteError::ProgramAddress => "cannot send to a program address",
         };
         f.write_str(s)
     }

@@ -29,17 +29,27 @@ fn compute_budget_program_id() -> [u8; 32] {
     address_to_bytes(COMPUTE_BUDGET_PROGRAM_ID_B58).expect("valid compute-budget program id")
 }
 
+pub fn is_instruction_program_address(addr: &[u8; 32]) -> bool {
+    addr == &SYSTEM_PROGRAM_ID || addr == &compute_budget_program_id()
+}
+
 pub fn build_transfer_message(
     from: &[u8; 32],
     to: &[u8; 32],
     lamports: u64,
     recent_blockhash: &[u8; 32],
     priority: Option<PriorityFee>,
-) -> Vec<u8> {
-    match priority {
+) -> Result<Vec<u8>> {
+    if to == from {
+        return Err(anyhow!("recipient address is the same as the sender"));
+    }
+    if is_instruction_program_address(to) {
+        return Err(anyhow!("recipient is a program address, not a wallet"));
+    }
+    Ok(match priority {
         None => build_bare_transfer(from, to, lamports, recent_blockhash),
         Some(p) => build_priority_transfer(from, to, lamports, recent_blockhash, p),
-    }
+    })
 }
 
 fn build_bare_transfer(
@@ -213,7 +223,7 @@ mod tests {
     fn signature_is_deterministic() {
         let seed = seed_from_mnemonic(&parse_mnemonic(TEST_MNEMONIC).unwrap());
         let key = derive_signing_key(&seed, 0);
-        let msg = build_transfer_message(&[1u8; 32], &[2u8; 32], 1000, &[3u8; 32], None);
+        let msg = build_transfer_message(&[1u8; 32], &[2u8; 32], 1000, &[3u8; 32], None).unwrap();
         let (tx1, sig1) = sign_and_serialize(&msg, &key);
         let (tx2, sig2) = sign_and_serialize(&msg, &key);
         assert_eq!(sig1, sig2, "ed25519 signatures must be deterministic");
@@ -245,7 +255,7 @@ mod tests {
         let bh = [42u8; 32];
 
         for lamports in [1u64, 5_000, 1_000_000_000, 9_223_372_036_854_775_807] {
-            let ours = build_transfer_message(&from, &to, lamports, &bh, None);
+            let ours = build_transfer_message(&from, &to, lamports, &bh, None).unwrap();
 
             let ix = transfer(
                 &Address::new_from_array(from),
@@ -287,7 +297,8 @@ mod tests {
                     unit_limit: limit,
                     micro_lamports_per_cu: price,
                 }),
-            );
+            )
+            .unwrap();
 
             let ixs = [
                 ComputeBudgetInstruction::set_compute_unit_limit(limit),
@@ -323,7 +334,7 @@ mod tests {
         let from = our_key.verifying_key().to_bytes();
         let to = derive_signing_key(&seed, 5).verifying_key().to_bytes();
         let bh = [11u8; 32];
-        let msg = build_transfer_message(&from, &to, 7_000_000, &bh, None);
+        let msg = build_transfer_message(&from, &to, 7_000_000, &bh, None).unwrap();
 
         let (_tx, our_sig) = sign_and_serialize(&msg, &our_key);
 
@@ -338,6 +349,43 @@ mod tests {
         let solana_sig = solana_secret.sign(&msg).to_bytes();
 
         assert_eq!(our_sig, solana_sig, "signature must match Solana's keypair");
+    }
+
+    #[test]
+    fn rejects_self_send_recipient() {
+        let from = [7u8; 32];
+        let built = build_transfer_message(&from, &from, 1000, &[9u8; 32], None);
+        assert!(built.is_err(), "self-send must be rejected by the builder");
+    }
+
+    #[test]
+    fn rejects_system_program_recipient() {
+        let from = [7u8; 32];
+        let built = build_transfer_message(&from, &SYSTEM_PROGRAM_ID, 1000, &[9u8; 32], None);
+        assert!(
+            built.is_err(),
+            "system-program recipient must be rejected (bare path)"
+        );
+    }
+
+    #[test]
+    fn rejects_compute_budget_recipient_priority() {
+        let from = [7u8; 32];
+        let cb = compute_budget_program_id();
+        let built = build_transfer_message(
+            &from,
+            &cb,
+            1000,
+            &[9u8; 32],
+            Some(PriorityFee {
+                unit_limit: 300,
+                micro_lamports_per_cu: 1000,
+            }),
+        );
+        assert!(
+            built.is_err(),
+            "compute-budget recipient must be rejected (priority path)"
+        );
     }
 
     proptest! {
@@ -367,25 +415,65 @@ mod tests {
         }
 
         #[test]
-        fn transfer_message_matches_official_solana(from in any::<[u8; 32]>(), to in any::<[u8; 32]>(), bh in any::<[u8; 32]>(), lamports in any::<u64>()) {
+        fn transfer_message_matches_official_solana(
+            from in any::<[u8; 32]>(),
+            rand_to in any::<[u8; 32]>(),
+            bh in any::<[u8; 32]>(),
+            lamports in any::<u64>(),
+            sel in 0u8..4,
+            fee in proptest::option::of((any::<u32>(), any::<u64>())),
+        ) {
             use solana_address::Address;
+            use solana_compute_budget_interface::ComputeBudgetInstruction;
             use solana_hash::Hash;
             use solana_message::legacy::Message;
             use solana_system_interface::instruction::transfer;
 
-            let ours = build_transfer_message(&from, &to, lamports, &bh, None);
-            let ix = transfer(
-                &Address::new_from_array(from),
-                &Address::new_from_array(to),
-                lamports,
-            );
-            let theirs = Message::new_with_blockhash(
-                &[ix],
-                Some(&Address::new_from_array(from)),
-                &Hash::new_from_array(bh),
-            )
-            .serialize();
-            prop_assert_eq!(ours, theirs);
+            let to = match sel {
+                1 => from,
+                2 => SYSTEM_PROGRAM_ID,
+                3 => compute_budget_program_id(),
+                _ => rand_to,
+            };
+            let priority = fee.map(|(unit_limit, micro_lamports_per_cu)| PriorityFee {
+                unit_limit,
+                micro_lamports_per_cu,
+            });
+
+            let ours = build_transfer_message(&from, &to, lamports, &bh, priority);
+            let collides = to == from || is_instruction_program_address(&to);
+
+            match ours {
+                Err(_) => prop_assert!(collides, "rejected a non-colliding recipient"),
+                Ok(bytes) => {
+                    prop_assert!(!collides, "accepted a colliding recipient");
+                    let transfer_ix = transfer(
+                        &Address::new_from_array(from),
+                        &Address::new_from_array(to),
+                        lamports,
+                    );
+                    let theirs = match priority {
+                        None => Message::new_with_blockhash(
+                            &[transfer_ix],
+                            Some(&Address::new_from_array(from)),
+                            &Hash::new_from_array(bh),
+                        ),
+                        Some(p) => Message::new_with_blockhash(
+                            &[
+                                ComputeBudgetInstruction::set_compute_unit_limit(p.unit_limit),
+                                ComputeBudgetInstruction::set_compute_unit_price(
+                                    p.micro_lamports_per_cu,
+                                ),
+                                transfer_ix,
+                            ],
+                            Some(&Address::new_from_array(from)),
+                            &Hash::new_from_array(bh),
+                        ),
+                    }
+                    .serialize();
+                    prop_assert_eq!(bytes, theirs);
+                }
+            }
         }
     }
 }
