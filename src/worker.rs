@@ -177,7 +177,7 @@ async fn handle_command(
             if wallets.is_empty() {
                 return;
             }
-            let pubkeys: Vec<String> = wallets.iter().map(|(_, p)| p.clone()).collect();
+            let pubkeys: Vec<&str> = wallets.iter().map(|(_, p)| p.as_str()).collect();
             match rpc_now.get_balances(&pubkeys).await {
                 Ok(bals) => {
                     let list: Vec<(i64, u64)> =
@@ -320,7 +320,7 @@ async fn finalize(
 }
 
 async fn sig_status(rpc: &Rpc, sig: &str) -> Option<crate::solana::rpc::SignatureStatus> {
-    rpc.get_signature_statuses(std::slice::from_ref(&sig.to_string()), true)
+    rpc.get_signature_statuses(&[sig], true)
         .await
         .ok()
         .and_then(|v| v.into_iter().next().flatten())
@@ -349,13 +349,15 @@ async fn broadcast_and_poll(
             .await;
         return;
     };
-    let (Some(bytes), Some(sig)) = (intent.signed_tx.clone(), intent.signature.clone()) else {
+    let signed_tx = intent.signed_tx;
+    let signature = intent.signature;
+    let lvbh = intent.last_valid_block_height.unwrap_or(0);
+    let (Some(bytes), Some(sig)) = (signed_tx, signature) else {
         let _ = evt
             .send(AppEvent::Error("transfer was not signed".into()))
             .await;
         return;
     };
-    let lvbh = intent.last_valid_block_height.unwrap_or(0);
 
     if with_current_db(&db, &generation, cmd_gen, |d| {
         let _ = d.mark_submitted(intent_id);

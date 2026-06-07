@@ -80,7 +80,7 @@ pub async fn reconcile_boot(
             continue;
         }
 
-        let Some(sig) = intent.signature.clone() else {
+        let Some(sig) = intent.signature else {
             guarded!(|d| d.mark_terminal(
                 intent.id,
                 IntentStatus::Failed,
@@ -92,7 +92,7 @@ pub async fn reconcile_boot(
         let lvbh = intent.last_valid_block_height.unwrap_or(0);
 
         let status = rpc
-            .get_signature_statuses(std::slice::from_ref(&sig), true)
+            .get_signature_statuses(&[sig.as_str()], true)
             .await?
             .into_iter()
             .next()
@@ -110,7 +110,7 @@ pub async fn reconcile_boot(
             }
             Decision::Expire => {
                 let recheck = rpc
-                    .get_signature_statuses(std::slice::from_ref(&sig), true)
+                    .get_signature_statuses(&[sig.as_str()], true)
                     .await?
                     .into_iter()
                     .next()
@@ -139,7 +139,7 @@ pub async fn reconcile_boot(
                 resolved += 1;
             }
             Decision::Rebroadcast => {
-                let Some(bytes) = intent.signed_tx.clone() else {
+                let Some(bytes) = intent.signed_tx else {
                     guarded!(|d| d.mark_terminal(
                         intent.id,
                         IntentStatus::Failed,

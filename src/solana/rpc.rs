@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
-use futures_util::stream::{self, StreamExt};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
@@ -12,7 +11,6 @@ use crate::types::Commitment;
 const MAX_RETRIES: u32 = 4;
 const GMA_CHUNK: usize = 100;
 const SIGSTATUS_CHUNK: usize = 256;
-const FANOUT: usize = 3;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct SignatureStatus {
@@ -127,47 +125,31 @@ impl Rpc {
         }
     }
 
-    pub async fn get_balances(&self, pubkeys: &[String]) -> Result<Vec<u64>> {
+    pub async fn get_balances(&self, pubkeys: &[&str]) -> Result<Vec<u64>> {
         if pubkeys.is_empty() {
             return Ok(vec![]);
         }
-        let chunks: Vec<(usize, Vec<String>)> = pubkeys
-            .chunks(GMA_CHUNK)
-            .enumerate()
-            .map(|(i, c)| (i, c.to_vec()))
-            .collect();
 
-        let this = self;
-        let mut results: Vec<(usize, Vec<u64>)> = stream::iter(chunks)
-            .map(|(i, chunk)| async move {
-                let params = json!([
-                    chunk,
-                    {"commitment": this.commitment, "encoding": "base64",
-                     "dataSlice": {"offset": 0, "length": 0}}
-                ]);
-                let ctx: Ctx<Vec<Option<AccountInfo>>> =
-                    this.call("getMultipleAccounts", params).await?;
-                let balances = ctx
-                    .value
+        let mut out = Vec::with_capacity(pubkeys.len());
+        for chunk in pubkeys.chunks(GMA_CHUNK) {
+            let params = json!([
+                chunk,
+                {"commitment": self.commitment, "encoding": "base64",
+                 "dataSlice": {"offset": 0, "length": 0}}
+            ]);
+            let ctx: Ctx<Vec<Option<AccountInfo>>> =
+                self.call("getMultipleAccounts", params).await?;
+            out.extend(
+                ctx.value
                     .into_iter()
-                    .map(|o| o.map(|a| a.lamports).unwrap_or(0))
-                    .collect::<Vec<u64>>();
-                Ok::<_, anyhow::Error>((i, balances))
-            })
-            .buffer_unordered(FANOUT)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-
-        results.sort_by_key(|(i, _)| *i);
-        Ok(results.into_iter().flat_map(|(_, v)| v).collect())
+                    .map(|o| o.map(|a| a.lamports).unwrap_or(0)),
+            );
+        }
+        Ok(out)
     }
 
     pub async fn get_balance(&self, pubkey: &str) -> Result<u64> {
-        let v = self
-            .get_balances(std::slice::from_ref(&pubkey.to_string()))
-            .await?;
+        let v = self.get_balances(&[pubkey]).await?;
         Ok(v.first().copied().unwrap_or(0))
     }
 
@@ -188,34 +170,21 @@ impl Rpc {
 
     pub async fn get_signature_statuses(
         &self,
-        signatures: &[String],
+        signatures: &[&str],
         search_history: bool,
     ) -> Result<Vec<Option<SignatureStatus>>> {
         if signatures.is_empty() {
             return Ok(vec![]);
         }
-        let chunks: Vec<(usize, Vec<String>)> = signatures
-            .chunks(SIGSTATUS_CHUNK)
-            .enumerate()
-            .map(|(i, c)| (i, c.to_vec()))
-            .collect();
 
-        let this = self;
-        let mut results: Vec<(usize, Vec<Option<SignatureStatus>>)> = stream::iter(chunks)
-            .map(|(i, chunk)| async move {
-                let params = json!([chunk, {"searchTransactionHistory": search_history}]);
-                let ctx: Ctx<Vec<Option<SignatureStatus>>> =
-                    this.call("getSignatureStatuses", params).await?;
-                Ok::<_, anyhow::Error>((i, ctx.value))
-            })
-            .buffer_unordered(FANOUT)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-
-        results.sort_by_key(|(i, _)| *i);
-        Ok(results.into_iter().flat_map(|(_, v)| v).collect())
+        let mut out = Vec::with_capacity(signatures.len());
+        for chunk in signatures.chunks(SIGSTATUS_CHUNK) {
+            let params = json!([chunk, {"searchTransactionHistory": search_history}]);
+            let ctx: Ctx<Vec<Option<SignatureStatus>>> =
+                self.call("getSignatureStatuses", params).await?;
+            out.extend(ctx.value);
+        }
+        Ok(out)
     }
 
     pub async fn get_block_height(&self) -> Result<u64> {
