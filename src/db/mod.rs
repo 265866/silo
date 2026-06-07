@@ -129,16 +129,39 @@ impl Db {
             conn,
             audit_key: None,
         };
+
+        let is_existing = db.has_meta_table()?;
+        if is_existing {
+            db.integrity_check()?;
+        }
         db.migrate()?;
         db.ensure_audit_salt()?;
+        if !is_existing {
+            db.integrity_check()?;
+        }
+        Ok(db)
+    }
 
-        let ic: String = db
+    fn has_meta_table(&self) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    fn integrity_check(&self) -> Result<()> {
+        let ic: String = self
             .conn
             .query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
         if ic != "ok" {
             bail!("database integrity check failed: {ic}");
         }
-        Ok(db)
+        Ok(())
     }
 
     #[cfg(test)]
@@ -156,15 +179,7 @@ impl Db {
     }
 
     fn migrate(&mut self) -> Result<()> {
-        let has_meta: bool = self
-            .conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'",
-                [],
-                |_| Ok(true),
-            )
-            .optional()?
-            .unwrap_or(false);
+        let has_meta = self.has_meta_table()?;
 
         if !has_meta {
             let tx = self
@@ -529,6 +544,62 @@ mod tests {
         conn.execute("DROP INDEX ix_audit_ts", []).unwrap();
         drop(conn);
         assert!(Db::open(&path).is_err());
+    }
+
+    #[test]
+    fn corrupt_existing_db_is_rejected_before_any_write() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("silo.db");
+        drop(Db::open(&path).unwrap());
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "INSERT INTO wallets (account_index, role, pubkey, label, note, archived, created_at)
+                     VALUES (?1, 'sub', ?2, NULL, NULL, 0, 0)",
+                )
+                .unwrap();
+            for i in 1..400i64 {
+                stmt.execute(params![i, format!("SubPubkey{i:0>40}")])
+                    .unwrap();
+            }
+            drop(stmt);
+            conn.execute("DELETE FROM meta WHERE key='audit_key_salt'", [])
+                .unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            len > 8192,
+            "expected a multi-page database so the corrupted page is not the header"
+        );
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            f.seek(SeekFrom::Start(len - 1024)).unwrap();
+            f.write_all(&[0x55u8; 512]).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        let before = std::fs::read(&path).unwrap();
+        assert!(
+            Db::open(&path).is_err(),
+            "a corrupt existing database must be rejected"
+        );
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            before, after,
+            "Db::open must check integrity before writing: a corrupt file with a missing \
+             audit_key_salt must be left untouched, not have the salt re-inserted first"
+        );
     }
 
     #[test]
