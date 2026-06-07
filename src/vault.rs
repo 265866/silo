@@ -1,4 +1,4 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -117,7 +117,7 @@ pub fn create_vault(path: &Path, mnemonic: &Mnemonic, passphrase: &str) -> Resul
     };
 
     let json = serde_json::to_vec_pretty(&vault).context("serializing vault")?;
-    write_atomic(path, &json).context("writing vault file")?;
+    write_atomic_exclusive(path, &json).context("writing vault file")?;
     Ok(VaultKey(key))
 }
 
@@ -175,6 +175,14 @@ pub fn unlock_vault_keyed(path: &Path, passphrase: &str) -> Result<(Mnemonic, Va
 }
 
 pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    write_atomic_inner(path, data, false)
+}
+
+fn write_atomic_exclusive(path: &Path, data: &[u8]) -> Result<()> {
+    write_atomic_inner(path, data, true)
+}
+
+fn write_atomic_inner(path: &Path, data: &[u8], exclusive: bool) -> Result<()> {
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -185,22 +193,59 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
         .file_name()
         .ok_or_else(|| anyhow!("vault path has no file name"))?
         .to_string_lossy();
-    let tmp_path = dir.join(format!(".{file_name}.tmp"));
+    let tmp_path = unique_tmp_path(&dir, &file_name)?;
 
-    {
-        let mut tmp = File::create(&tmp_path)
-            .with_context(|| format!("creating temp file {}", tmp_path.display()))?;
-        tmp.write_all(data)?;
-        tmp.sync_all()?;
+    let result = (|| -> Result<()> {
+        {
+            let mut tmp = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+                .with_context(|| format!("creating temp file {}", tmp_path.display()))?;
+            tmp.write_all(data)?;
+            tmp.sync_all()?;
+        }
+
+        if exclusive {
+            fs::hard_link(&tmp_path, path).with_context(|| {
+                format!(
+                    "publishing {} -> {} without overwrite",
+                    tmp_path.display(),
+                    path.display()
+                )
+            })?;
+            fs::remove_file(&tmp_path).ok();
+        } else {
+            fs::rename(&tmp_path, path).with_context(|| {
+                format!("renaming {} -> {}", tmp_path.display(), path.display())
+            })?;
+        }
+
+        if let Ok(dir_file) = OpenOptions::new().read(true).open(&dir) {
+            let _ = dir_file.sync_all();
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        fs::remove_file(&tmp_path).ok();
     }
+    result
+}
 
-    fs::rename(&tmp_path, path)
-        .with_context(|| format!("renaming {} -> {}", tmp_path.display(), path.display()))?;
-
-    if let Ok(dir_file) = OpenOptions::new().read(true).open(&dir) {
-        let _ = dir_file.sync_all();
+fn unique_tmp_path(dir: &Path, file_name: &str) -> Result<PathBuf> {
+    for _ in 0..16 {
+        let mut b = [0u8; 8];
+        crate::crypto::random_bytes(&mut b);
+        let suffix: String = b.iter().map(|x| format!("{x:02x}")).collect();
+        let tmp = dir.join(format!(".{file_name}.{suffix}.tmp"));
+        if !tmp.exists() {
+            return Ok(tmp);
+        }
     }
-    Ok(())
+    Err(anyhow!(
+        "could not choose a unique temp file for {file_name}"
+    ))
 }
 
 #[cfg(test)]
@@ -245,6 +290,17 @@ mod tests {
             unlock_vault(&path, "pw").unwrap().to_string(),
             m1.to_string()
         );
+    }
+
+    #[test]
+    fn exclusive_write_does_not_replace_existing_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.json");
+        fs::write(&path, b"keep").unwrap();
+
+        let err = write_atomic_exclusive(&path, b"replace").unwrap_err();
+        assert!(err.to_string().contains("without overwrite"));
+        assert_eq!(fs::read(&path).unwrap(), b"keep");
     }
 
     #[test]
