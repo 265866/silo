@@ -741,6 +741,9 @@ fn delete_profile(app: &mut App, id: &str) {
 }
 
 fn profile_select_keys(app: &mut App, key: KeyEvent) {
+    if app.blocking_input {
+        return;
+    }
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.running = false,
         KeyCode::Down | KeyCode::Char('j') => {
@@ -759,13 +762,7 @@ fn profile_select_keys(app: &mut App, key: KeyEvent) {
                 let id = p.id.clone();
                 if let Err(e) = app.switch_to_profile(&id) {
                     app.toast_err(format!("Could not open profile: {e}"));
-                    return;
                 }
-                app.route = if crate::vault::vault_exists(&app.vault_path) {
-                    Route::Unlock
-                } else {
-                    Route::Setup
-                };
             }
         }
         KeyCode::Char('n') => app.begin_new_profile(),
@@ -1077,15 +1074,16 @@ fn handle_paste(app: &mut App, text: &str) {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::app::PendingSend;
+    use crate::app::{AppEvent, PendingSend, ProfileDeleteResult, ProfileOpenedPayload};
     use crate::db::{Db, Storage};
     use crate::price::{PriceCache, PriceSource, SolPrice};
+    use crate::profiles::ProfileMeta;
     use crate::solana::rpc::Rpc;
     use crate::types::IntentStatus;
 
@@ -1383,6 +1381,295 @@ mod tests {
         let mut h = harness(false);
         derive_subwallet(&mut h.app);
         assert!(h.rx.try_recv().is_err());
+    }
+
+    fn meta(id: &str) -> ProfileMeta {
+        ProfileMeta {
+            id: id.to_string(),
+            name: id.to_string(),
+            created_at: 0,
+        }
+    }
+
+    fn fresh_db(wallet_count: usize) -> Db {
+        let mut db = Db::open_memory().unwrap();
+        let seed = crypto::seed_from_mnemonic(&crypto::parse_mnemonic(TEST_MNEMONIC).unwrap());
+        for i in 0..wallet_count {
+            let role = if i == 0 { Role::Master } else { Role::Sub };
+            db.insert_wallet(
+                i as u32,
+                role,
+                &crypto::derive_address(&seed, i as u32),
+                None,
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    #[tokio::test]
+    async fn switch_to_profile_enqueues_open_without_inline_db_swap() {
+        let mut h = harness(true);
+        let before = h.app.db.with(|d| d.list_wallets()).unwrap().len();
+        h.app.switch_to_profile("00000000000000a1").unwrap();
+        let (g, cmd) = h.rx.try_recv().unwrap();
+        assert_eq!(g, 1);
+        assert!(matches!(cmd, Command::OpenProfile { id, .. } if id == "00000000000000a1"));
+        assert_eq!(h.app.db.with(|d| d.list_wallets()).unwrap().len(), before);
+        assert!(h.app.blocking_input);
+    }
+
+    #[tokio::test]
+    async fn switch_to_profile_rejects_bad_id_synchronously() {
+        let mut h = harness(true);
+        assert!(h.app.switch_to_profile("../etc/passwd").is_err());
+        assert!(h.rx.try_recv().is_err());
+        assert_eq!(h.app.generation.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn begin_new_profile_enqueues_create_and_scrubs_secrets() {
+        let mut h = harness(true);
+        h.app.input.passphrase = Zeroizing::new("secret".to_string());
+        h.app.setup.mnemonic_words = vec!["abandon".to_string(), "ability".to_string()];
+        h.app.begin_new_profile();
+        assert!(h.app.input.passphrase.is_empty());
+        assert!(h.app.setup.mnemonic_words.iter().all(|w| w.is_empty()));
+        assert!(matches!(
+            h.rx.try_recv().unwrap().1,
+            Command::CreateProfile { .. }
+        ));
+        assert!(h.app.blocking_input);
+    }
+
+    #[tokio::test]
+    async fn profile_opened_switch_installs_db_and_reloads() {
+        let mut h = harness(true);
+        h.app.generation.store(1, Ordering::SeqCst);
+        h.app.blocking_input = true;
+        let payload = ProfileOpenedPayload {
+            db: fresh_db(2),
+            id: "00000000000000ab".to_string(),
+            created: false,
+        };
+        h.app.apply_app_event(AppEvent::ProfileOpened {
+            result: Ok(payload),
+            generation: 1,
+        });
+        assert_eq!(h.app.current_profile.as_deref(), Some("00000000000000ab"));
+        assert_eq!(h.app.db.with(|d| d.list_wallets()).unwrap().len(), 2);
+        assert_eq!(h.app.wallets.len(), 2);
+        assert!(!h.app.blocking_input);
+        assert_eq!(h.app.route, Route::Setup);
+    }
+
+    #[tokio::test]
+    async fn profile_opened_created_routes_to_setup() {
+        let mut h = harness(true);
+        h.app.generation.store(1, Ordering::SeqCst);
+        h.app.blocking_input = true;
+        h.app.route = Route::ProfileSelect;
+        let payload = ProfileOpenedPayload {
+            db: fresh_db(0),
+            id: "00000000000000cd".to_string(),
+            created: true,
+        };
+        h.app.apply_app_event(AppEvent::ProfileOpened {
+            result: Ok(payload),
+            generation: 1,
+        });
+        assert_eq!(h.app.route, Route::Setup);
+        assert_eq!(h.app.current_profile.as_deref(), Some("00000000000000cd"));
+        assert!(h.app.wallets.is_empty());
+        assert!(!h.app.blocking_input);
+    }
+
+    #[tokio::test]
+    async fn profile_opened_stale_generation_is_ignored() {
+        let mut h = harness(true);
+        h.app.generation.store(2, Ordering::SeqCst);
+        h.app.blocking_input = true;
+        let before_profile = h.app.current_profile.clone();
+        let before_wallets = h.app.db.with(|d| d.list_wallets()).unwrap().len();
+        let payload = ProfileOpenedPayload {
+            db: fresh_db(2),
+            id: "00000000000000ef".to_string(),
+            created: false,
+        };
+        h.app.apply_app_event(AppEvent::ProfileOpened {
+            result: Ok(payload),
+            generation: 1,
+        });
+        assert_eq!(h.app.current_profile, before_profile);
+        assert_eq!(
+            h.app.db.with(|d| d.list_wallets()).unwrap().len(),
+            before_wallets
+        );
+        assert!(h.app.blocking_input);
+    }
+
+    #[tokio::test]
+    async fn profile_opened_error_toasts_without_swap() {
+        let mut h = harness(true);
+        h.app.generation.store(1, Ordering::SeqCst);
+        h.app.blocking_input = true;
+        h.app.pending_profile_open = None;
+        let before_profile = h.app.current_profile.clone();
+        h.app.apply_app_event(AppEvent::ProfileOpened {
+            result: Err("boom".to_string()),
+            generation: 1,
+        });
+        assert_eq!(h.app.current_profile, before_profile);
+        assert!(!h.app.blocking_input);
+        assert!(h.app.toasts.iter().any(|t| t.text.contains("boom")));
+    }
+
+    #[tokio::test]
+    async fn profile_deleted_nonempty_enqueues_first_open() {
+        let mut h = harness(true);
+        h.app.pending_profile_open = None;
+        let cur_gen = h.app.generation.load(Ordering::SeqCst);
+        h.app.apply_app_event(AppEvent::ProfileDeleted {
+            result: ProfileDeleteResult::Deleted {
+                profiles: vec![meta("00000000000000a1"), meta("00000000000000a2")],
+            },
+            generation: cur_gen,
+        });
+        assert_eq!(h.app.pending_profile_open, Some(0));
+        assert!(matches!(
+            h.rx.try_recv().unwrap().1,
+            Command::OpenProfile { id, .. } if id == "00000000000000a1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn profile_deleted_empty_enqueues_create() {
+        let mut h = harness(true);
+        let cur_gen = h.app.generation.load(Ordering::SeqCst);
+        h.app.apply_app_event(AppEvent::ProfileDeleted {
+            result: ProfileDeleteResult::Deleted { profiles: vec![] },
+            generation: cur_gen,
+        });
+        assert!(matches!(
+            h.rx.try_recv().unwrap().1,
+            Command::CreateProfile { .. }
+        ));
+        assert_eq!(h.app.pending_profile_open, None);
+    }
+
+    #[tokio::test]
+    async fn delete_fallback_advances_on_open_error() {
+        let mut h = harness(true);
+        h.app.profiles = vec![meta("00000000000000b1"), meta("00000000000000b2")];
+        h.app.pending_profile_open = Some(0);
+        h.app.generation.store(5, Ordering::SeqCst);
+        h.app.apply_app_event(AppEvent::ProfileOpened {
+            result: Err("io".to_string()),
+            generation: 5,
+        });
+        assert_eq!(h.app.pending_profile_open, Some(1));
+        assert!(matches!(
+            h.rx.try_recv().unwrap().1,
+            Command::OpenProfile { id, .. } if id == "00000000000000b2"
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_fallback_exhausted_creates_new() {
+        let mut h = harness(true);
+        h.app.profiles = vec![meta("00000000000000c1")];
+        h.app.pending_profile_open = Some(0);
+        h.app.generation.store(3, Ordering::SeqCst);
+        h.app.apply_app_event(AppEvent::ProfileOpened {
+            result: Err("io".to_string()),
+            generation: 3,
+        });
+        assert_eq!(h.app.pending_profile_open, None);
+        assert!(matches!(
+            h.rx.try_recv().unwrap().1,
+            Command::CreateProfile { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn switch_to_profile_rolls_back_generation_when_enqueue_fails() {
+        let mut h = harness(true);
+        drop(h.rx);
+        assert!(h.app.switch_to_profile("00000000000000a1").is_err());
+        assert_eq!(h.app.generation.load(Ordering::SeqCst), 0);
+        assert!(!h.app.blocking_input);
+    }
+
+    #[tokio::test]
+    async fn begin_new_profile_rolls_back_generation_when_enqueue_fails() {
+        let mut h = harness(true);
+        drop(h.rx);
+        h.app.begin_new_profile();
+        assert_eq!(h.app.generation.load(Ordering::SeqCst), 0);
+        assert!(!h.app.blocking_input);
+    }
+
+    #[tokio::test]
+    async fn profile_opened_switch_routes_to_unlock_when_vault_exists() {
+        let mut h = harness(true);
+        let dir = std::env::temp_dir().join(format!("silo-unlock-test-{}", std::process::id()));
+        h.app.config_dir = dir.clone();
+        let id = "00000000000000d1";
+        let vault_path = crate::profiles::vault_path(&dir, id).unwrap();
+        std::fs::create_dir_all(vault_path.parent().unwrap()).unwrap();
+        std::fs::write(&vault_path, b"{}").unwrap();
+        h.app.generation.store(1, Ordering::SeqCst);
+        h.app.blocking_input = true;
+        h.app.pending_profile_open = None;
+        h.app.apply_app_event(AppEvent::ProfileOpened {
+            result: Ok(ProfileOpenedPayload {
+                db: fresh_db(1),
+                id: id.to_string(),
+                created: false,
+            }),
+            generation: 1,
+        });
+        assert_eq!(h.app.route, Route::Unlock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn profile_opened_switch_from_delete_returns_to_profile_select() {
+        let mut h = harness(true);
+        h.app.generation.store(1, Ordering::SeqCst);
+        h.app.blocking_input = true;
+        h.app.pending_profile_open = Some(1);
+        h.app.apply_app_event(AppEvent::ProfileOpened {
+            result: Ok(ProfileOpenedPayload {
+                db: fresh_db(1),
+                id: "00000000000000a3".to_string(),
+                created: false,
+            }),
+            generation: 1,
+        });
+        assert_eq!(h.app.route, Route::ProfileSelect);
+        assert_eq!(h.app.profile_sel, 1);
+        assert_eq!(h.app.pending_profile_open, None);
+        assert!(
+            h.app
+                .toasts
+                .iter()
+                .any(|t| t.text.contains("Profile deleted"))
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_select_keys_ignored_while_blocking_input() {
+        let mut h = harness(true);
+        h.app.route = Route::ProfileSelect;
+        h.app.profiles = vec![meta("00000000000000e1")];
+        h.app.blocking_input = true;
+        profile_select_keys(
+            &mut h.app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(h.rx.try_recv().is_err());
+        assert_eq!(h.app.generation.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
