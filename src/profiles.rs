@@ -58,12 +58,10 @@ pub fn new_id() -> String {
 
 pub fn load(config_dir: &Path) -> Result<Vec<ProfileMeta>> {
     match std::fs::read(registry_path(config_dir)) {
-        Ok(bytes) => {
-            let list: Vec<ProfileMeta> =
-                serde_json::from_slice(&bytes).context("profiles registry is not valid JSON")?;
-            validate_list(&list)?;
-            Ok(list)
-        }
+        Ok(bytes) => match parse_registry(&bytes) {
+            Ok(list) => Ok(list),
+            Err(_) => recover_corrupt_registry(config_dir),
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let recovered = recoverable(config_dir);
             if !recovered.is_empty() {
@@ -73,6 +71,30 @@ pub fn load(config_dir: &Path) -> Result<Vec<ProfileMeta>> {
         }
         Err(e) => Err(e).context("reading profiles registry"),
     }
+}
+
+fn parse_registry(bytes: &[u8]) -> Result<Vec<ProfileMeta>> {
+    let list: Vec<ProfileMeta> =
+        serde_json::from_slice(bytes).context("profiles registry is not valid JSON")?;
+    validate_list(&list)?;
+    Ok(list)
+}
+
+fn recover_corrupt_registry(config_dir: &Path) -> Result<Vec<ProfileMeta>> {
+    let path = registry_path(config_dir);
+    let backup = config_dir.join(format!("profiles.json.corrupt-{}", crate::db::now_ms()));
+    std::fs::rename(&path, &backup).with_context(|| {
+        format!(
+            "backing up corrupt profiles registry {} -> {}",
+            path.display(),
+            backup.display()
+        )
+    })?;
+    let recovered = recoverable(config_dir);
+    if !recovered.is_empty() {
+        save(config_dir, &recovered)?;
+    }
+    Ok(recovered)
 }
 
 fn validate_list(list: &[ProfileMeta]) -> Result<()> {
@@ -235,11 +257,78 @@ mod tests {
         assert!(load(dir.path()).unwrap().is_empty());
     }
 
+    fn corrupt_backup_exists(config_dir: &Path) -> bool {
+        std::fs::read_dir(config_dir)
+            .map(|entries| {
+                entries.flatten().any(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("profiles.json.corrupt-")
+                })
+            })
+            .unwrap_or(false)
+    }
+
     #[test]
-    fn invalid_registry_is_an_error() {
+    fn corrupt_registry_recovers_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "0000000000000010";
+        let profile = dir_for(dir.path(), id).unwrap();
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join("vault.json"), b"{}").unwrap();
+        std::fs::write(registry_path(dir.path()), b"not json").unwrap();
+
+        let loaded = load(dir.path()).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, id);
+        assert!(corrupt_backup_exists(dir.path()));
+        assert!(registry_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn duplicate_id_registry_recovers_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "0000000000000011";
+        let profile = dir_for(dir.path(), id).unwrap();
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join("vault.json"), b"{}").unwrap();
+        let dup = format!(
+            r#"[{{"id":"{id}","name":"a","created_at":1}},{{"id":"{id}","name":"b","created_at":2}}]"#
+        );
+        std::fs::write(registry_path(dir.path()), dup.as_bytes()).unwrap();
+
+        let loaded = load(dir.path()).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, id);
+        assert!(corrupt_backup_exists(dir.path()));
+    }
+
+    #[test]
+    fn corrupt_registry_with_no_profiles_loads_empty() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(registry_path(dir.path()), b"not json").unwrap();
-        assert!(load(dir.path()).is_err());
+        let loaded = load(dir.path()).unwrap();
+        assert!(loaded.is_empty());
+        assert!(corrupt_backup_exists(dir.path()));
+    }
+
+    #[test]
+    fn valid_registry_loads_without_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "0000000000000012";
+        register(
+            dir.path(),
+            ProfileMeta {
+                id: id.into(),
+                name: "Wallet".into(),
+                created_at: 1,
+            },
+        )
+        .unwrap();
+        let loaded = load(dir.path()).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, id);
+        assert!(!corrupt_backup_exists(dir.path()));
     }
 
     #[cfg(unix)]
