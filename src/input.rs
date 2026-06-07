@@ -515,6 +515,10 @@ fn copy_text(app: &mut App, text: &str, ok_label: &str) -> bool {
             app.toast_info("Copied (won't persist after exit on this compositor)");
             true
         }
+        Ok(crate::clipboard::CopyOutcome::PersistenceUnknown) => {
+            app.toast_info("Copied (persistence not confirmed)");
+            true
+        }
         Err(e) => {
             app.toast_err(format!("Copy failed: {e}"));
             false
