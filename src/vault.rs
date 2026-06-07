@@ -171,7 +171,9 @@ pub fn unlock_vault_keyed(path: &Path, passphrase: &str) -> Result<(Mnemonic, Va
     );
 
     let phrase = Zeroizing::new(
-        String::from_utf8(plaintext.to_vec()).context("decrypted data is not valid UTF-8")?,
+        std::str::from_utf8(&plaintext)
+            .context("decrypted data is not valid UTF-8")?
+            .to_owned(),
     );
     let mnemonic = Mnemonic::parse(phrase.as_str()).context("decrypted mnemonic is invalid")?;
     Ok((mnemonic, VaultKey(key)))
@@ -441,6 +443,40 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&vault).unwrap()).unwrap();
 
         assert!(unlock_vault(&path, "pw").is_err());
+    }
+
+    #[test]
+    fn non_utf8_plaintext_errors_not_panics() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.json");
+
+        let salt = [7u8; SALT_LEN];
+        let m_cost = 8;
+        let t_cost = 1;
+        let p_cost = 1;
+        let key = derive_key("pw", &salt, m_cost, t_cost, p_cost).unwrap();
+        let cipher = XChaCha20Poly1305::new_from_slice(&*key).unwrap();
+        let nonce_bytes = [3u8; NONCE_LEN];
+        let nonce = XNonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher
+            .encrypt(nonce, [0xff, 0xfe, 0x80, 0x00].as_ref())
+            .unwrap();
+
+        let vault = VaultFile {
+            magic: MAGIC.to_string(),
+            version: VERSION,
+            kdf: "argon2id".to_string(),
+            m_cost,
+            t_cost,
+            p_cost,
+            salt_b58: bs58::encode(salt).into_string(),
+            nonce_b58: bs58::encode(nonce_bytes).into_string(),
+            ciphertext_b58: bs58::encode(&ciphertext).into_string(),
+        };
+        fs::write(&path, serde_json::to_vec(&vault).unwrap()).unwrap();
+
+        let err = unlock_vault(&path, "pw").unwrap_err().to_string();
+        assert!(err.contains("not valid UTF-8"), "unexpected error: {err}");
     }
 
     proptest! {
