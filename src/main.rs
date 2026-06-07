@@ -120,12 +120,22 @@ async fn main() -> Result<()> {
         first_run,
     );
 
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        disable_bracketed_paste(&mut std::io::stdout());
+        prev_hook(info);
+    }));
+
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let result = run(&mut terminal, app, evt_rx, workers).await;
-    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    disable_bracketed_paste(&mut std::io::stdout());
     ratatui::restore();
     result
+}
+
+fn disable_bracketed_paste(w: &mut impl std::io::Write) {
+    let _ = execute!(w, DisableBracketedPaste);
 }
 
 async fn run(
@@ -178,4 +188,16 @@ async fn run(
         return Err(anyhow::anyhow!("background worker task failed: {e}"));
     }
     loop_result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::disable_bracketed_paste;
+
+    #[test]
+    fn teardown_emits_disable_bracketed_paste() {
+        let mut buf: Vec<u8> = Vec::new();
+        disable_bracketed_paste(&mut buf);
+        assert_eq!(buf, b"\x1b[?2004l");
+    }
 }
