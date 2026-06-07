@@ -149,6 +149,15 @@ impl Db {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn clear_signed_tx_for_test(&mut self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tx_intents SET signed_tx=NULL WHERE id=?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
     pub fn mark_submitted(&mut self, id: i64) -> Result<bool> {
         let now = now_ms();
         let key = self.require_audit_key()?;

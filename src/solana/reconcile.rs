@@ -188,34 +188,299 @@ pub async fn reconcile_boot(
 mod tests {
     use super::*;
     use crate::db::Db;
+    use crate::types::Role;
+    use serde_json::Value;
+    use std::collections::VecDeque;
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, Mutex};
 
-    #[tokio::test]
-    async fn reconcile_skips_when_generation_changed() {
+    struct MockServer {
+        url: String,
+        requests: Arc<Mutex<Vec<Value>>>,
+        _worker: std::thread::JoinHandle<()>,
+    }
+
+    impl MockServer {
+        fn new(results: Vec<Value>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let requests_for_thread = requests.clone();
+            let responses = Arc::new(Mutex::new(VecDeque::from(results)));
+            let responses_for_thread = responses.clone();
+            let worker = std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let mut stream = stream.unwrap();
+                    let request = read_request(&mut stream);
+                    let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+                    requests_for_thread
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_str(body).unwrap());
+                    let result = responses_for_thread
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or_else(|| json!({"unexpected": true}));
+                    let done = responses_for_thread.lock().unwrap().is_empty();
+                    write_response(
+                        &mut stream,
+                        &json!({"jsonrpc":"2.0","id":1,"result":result}).to_string(),
+                    );
+                    if done {
+                        break;
+                    }
+                }
+            });
+            MockServer {
+                url,
+                requests,
+                _worker: worker,
+            }
+        }
+
+        fn rpc(&self) -> Rpc {
+            Rpc::new(reqwest::Client::new(), self.url.clone())
+        }
+
+        fn methods(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|v| v["method"].as_str().unwrap().to_string())
+                .collect()
+        }
+    }
+
+    fn read_request(stream: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut tmp).unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&buf[..end]);
+                let len = content_length(&headers);
+                if buf.len().saturating_sub(end + 4) >= len {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn content_length(headers: &str) -> usize {
+        headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0)
+    }
+
+    fn write_response(stream: &mut TcpStream, body: &str) {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(body.as_bytes()).unwrap();
+    }
+
+    fn db_with_intent() -> (Storage, i64) {
         let db = Storage::new(Db::open_memory().unwrap());
-        db.with_mut(|d| {
-            d.insert_wallet(
-                0,
-                crate::types::Role::Master,
-                "M1111111111111111111111111111111111111111111",
-                None,
-            )
-            .unwrap();
-            let i = d
-                .create_intent(
-                    1,
-                    "Dest1111111111111111111111111111111111111111",
-                    1000,
+        let id = db.with_mut(|d| {
+            let w = d
+                .insert_wallet(
+                    0,
+                    Role::Master,
+                    "M1111111111111111111111111111111111111111111",
                     None,
                 )
                 .unwrap();
-            d.mark_signed(i.id, "Sig", "bh", 100, 5000, b"x").unwrap();
+            d.create_intent(
+                w.id,
+                "Dest1111111111111111111111111111111111111111",
+                1000,
+                None,
+            )
+            .unwrap()
+            .id
         });
+        (db, id)
+    }
+
+    fn signed(db: &Storage, id: i64, sig: &str, lvbh: u64) {
+        db.with_mut(|d| d.mark_signed(id, sig, "bh", lvbh, 5000, b"wire").unwrap());
+    }
+
+    async fn run(db: &Storage, rpc: &Rpc) -> usize {
+        let generation = AtomicU64::new(1);
+        reconcile_boot(db, rpc, &generation, 1).await.unwrap()
+    }
+
+    fn intent(db: &Storage, id: i64) -> crate::types::Intent {
+        db.with(|d| d.get_intent(id).unwrap().unwrap())
+    }
+
+    fn audit_events(db: &Storage) -> Vec<String> {
+        db.with(|d| {
+            assert!(d.verify_audit_chain().unwrap());
+            d.list_audit(50)
+                .unwrap()
+                .into_iter()
+                .rev()
+                .map(|a| a.event_type)
+                .collect()
+        })
+    }
+
+    fn status_value(err: Value, confirmation_status: &str) -> Value {
+        json!({"slot":1,"confirmations":null,"err":err,"confirmationStatus":confirmation_status})
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_when_generation_changed() {
+        let (db, id) = db_with_intent();
+        signed(&db, id, "Sig", 100);
         let rpc = Rpc::new(reqwest::Client::new(), "http://127.0.0.1:0");
         let generation = AtomicU64::new(7);
         let resolved = reconcile_boot(&db, &rpc, &generation, 6).await.unwrap();
         assert_eq!(resolved, 0);
         assert_eq!(db.with(|d| d.get_open_intents().unwrap().len()), 1);
+    }
+
+    #[tokio::test]
+    async fn created_intent_is_abandoned_without_rpc_calls() {
+        let (db, id) = db_with_intent();
+        let rpc = Rpc::new(reqwest::Client::new(), "http://127.0.0.1:0");
+        assert_eq!(run(&db, &rpc).await, 1);
+        let got = intent(&db, id);
+        assert_eq!(got.status, IntentStatus::Failed);
+        assert_eq!(got.error.as_deref(), Some("abandoned before signing"));
+        assert!(audit_events(&db).contains(&"reconcile_resolved".to_string()));
+    }
+
+    #[tokio::test]
+    async fn signed_intent_missing_wire_bytes_fails_after_status_probe() {
+        let (db, id) = db_with_intent();
+        signed(&db, id, "Sig", 1000);
+        db.with_mut(|d| d.clear_signed_tx_for_test(id).unwrap());
+        let server = MockServer::new(vec![
+            json!({"context":{"slot":1},"value":[null]}),
+            json!(1000),
+        ]);
+        assert_eq!(run(&db, &server.rpc()).await, 1);
+        let got = intent(&db, id);
+        assert_eq!(got.status, IntentStatus::Failed);
+        assert_eq!(
+            got.error.as_deref(),
+            Some("signed intent missing wire bytes")
+        );
+        assert_eq!(
+            server.methods(),
+            vec!["getSignatureStatuses", "getBlockHeight"]
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_unknown_unexpired_rebroadcast_success_marks_submitted() {
+        let (db, id) = db_with_intent();
+        signed(&db, id, "Sig", 1000);
+        let server = MockServer::new(vec![
+            json!({"context":{"slot":1},"value":[null]}),
+            json!(1000),
+            json!("Sig"),
+        ]);
+        assert_eq!(run(&db, &server.rpc()).await, 1);
+        assert_eq!(intent(&db, id).status, IntentStatus::Submitted);
+        assert_eq!(
+            server.methods(),
+            vec!["getSignatureStatuses", "getBlockHeight", "sendTransaction"]
+        );
+    }
+
+    #[tokio::test]
+    async fn submitted_confirmed_marks_confirmed() {
+        let (db, id) = db_with_intent();
+        signed(&db, id, "Sig", 1000);
+        db.with_mut(|d| d.mark_submitted(id).unwrap());
+        let server = MockServer::new(vec![
+            json!({"context":{"slot":1},"value":[status_value(Value::Null, "confirmed")]}),
+            json!(1000),
+        ]);
+        assert_eq!(run(&db, &server.rpc()).await, 1);
+        assert_eq!(intent(&db, id).status, IntentStatus::Confirmed);
+    }
+
+    #[tokio::test]
+    async fn unknown_expired_after_recheck_marks_expired() {
+        let (db, id) = db_with_intent();
+        signed(&db, id, "Sig", 1000);
+        let server = MockServer::new(vec![
+            json!({"context":{"slot":1},"value":[null]}),
+            json!(1151),
+            json!({"context":{"slot":1},"value":[null]}),
+        ]);
+        assert_eq!(run(&db, &server.rpc()).await, 1);
+        let got = intent(&db, id);
+        assert_eq!(got.status, IntentStatus::Expired);
+        assert_eq!(
+            got.error.as_deref(),
+            Some("blockhash expired before confirmation")
+        );
+        assert_eq!(
+            server.methods(),
+            vec![
+                "getSignatureStatuses",
+                "getBlockHeight",
+                "getSignatureStatuses"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn on_chain_error_fails_intent() {
+        let (db, id) = db_with_intent();
+        signed(&db, id, "Sig", 1000);
+        let server = MockServer::new(vec![
+            json!({"context":{"slot":1},"value":[status_value(json!({"InstructionError":[0,"Custom"]}), "confirmed")]}),
+            json!(1000),
+        ]);
+        assert_eq!(run(&db, &server.rpc()).await, 1);
+        let got = intent(&db, id);
+        assert_eq!(got.status, IntentStatus::Failed);
+        assert_eq!(got.error.as_deref(), Some("on-chain error"));
+    }
+
+    #[tokio::test]
+    async fn rebroadcast_signature_mismatch_fails_and_audits_integrity_check() {
+        let (db, id) = db_with_intent();
+        signed(&db, id, "Sig", 1000);
+        let server = MockServer::new(vec![
+            json!({"context":{"slot":1},"value":[null]}),
+            json!(1000),
+            json!("OtherSig"),
+        ]);
+        assert_eq!(run(&db, &server.rpc()).await, 1);
+        let got = intent(&db, id);
+        assert_eq!(got.status, IntentStatus::Failed);
+        assert_eq!(
+            got.error.as_deref(),
+            Some("rpc returned mismatched signature")
+        );
+        let events = audit_events(&db);
+        assert!(events.contains(&"integrity_check_failed".to_string()));
+        assert!(events.contains(&"intent_failed".to_string()));
     }
 
     fn status(err: bool, conf: Option<&str>) -> SignatureStatus {
@@ -240,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn on_chain_error_fails() {
+    fn on_chain_error_decision_fails() {
         match decide(Some(&status(true, Some("confirmed"))), 0, 0) {
             Decision::Fail(_) => {}
             d => panic!("expected Fail, got {d:?}"),
