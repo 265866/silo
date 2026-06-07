@@ -68,14 +68,14 @@ fn spawn_detached(command: &mut std::process::Command) -> std::io::Result<std::p
     use std::os::unix::process::CommandExt;
     unsafe {
         command.pre_exec(|| {
-            match unsafe { libc::fork() } {
+            match libc::fork() {
                 -1 => return Err(std::io::Error::last_os_error()),
                 0 => {
-                    if unsafe { libc::setsid() } == -1 {
+                    if libc::setsid() == -1 {
                         return Err(std::io::Error::last_os_error());
                     }
                 }
-                _ => unsafe { libc::_exit(0) },
+                _ => libc::_exit(0),
             }
             Ok(())
         });
