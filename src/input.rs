@@ -1918,4 +1918,84 @@ mod tests {
             std::time::Duration::from_secs(7 * 60)
         );
     }
+
+    #[test]
+    fn rpc_change_resets_inflight_counter() {
+        let mut h = harness(true);
+        h.app.request_balance_refresh();
+        assert_eq!(
+            h.app.inflight, 1,
+            "the queued refresh must be counted in flight"
+        );
+        let _ = h.rx.try_recv();
+
+        assert!(
+            h.app
+                .send_rpc_change_cmd("http://127.0.0.1:9999".to_string())
+        );
+        assert_eq!(
+            h.app.inflight, 0,
+            "bumping the generation on RPC change must clear the in-flight counter"
+        );
+    }
+
+    #[test]
+    fn stale_balances_after_rpc_change_are_dropped_and_keep_inflight_clear() {
+        let mut h = harness(true);
+        let wallet_id = h.app.wallets[0].id;
+        h.app.request_balance_refresh();
+        let _ = h.rx.try_recv();
+        assert!(
+            h.app
+                .send_rpc_change_cmd("http://127.0.0.1:9999".to_string())
+        );
+        assert_eq!(h.app.inflight, 0);
+
+        h.app.apply_app_event(AppEvent::Balances {
+            list: vec![(wallet_id, 5_000)],
+            generation: 0,
+        });
+        assert_eq!(
+            h.app.wallets[0].balance_lamports, None,
+            "a balances reply from before the RPC change must be ignored"
+        );
+        assert_eq!(
+            h.app.inflight, 0,
+            "a stale balances reply must not strand the counter"
+        );
+
+        h.app.apply_app_event(AppEvent::BalancesFailed {
+            reason: "old generation".to_string(),
+            generation: 0,
+        });
+        assert_eq!(
+            h.app.inflight, 0,
+            "a stale balances failure must not strand the counter"
+        );
+    }
+
+    #[test]
+    fn auto_refresh_queues_again_after_rpc_change() {
+        let mut h = harness(true);
+        h.app.route = Route::WalletList;
+        h.app.request_balance_refresh();
+        let _ = h.rx.try_recv();
+        assert!(
+            h.app
+                .send_rpc_change_cmd("http://127.0.0.1:9999".to_string())
+        );
+        let _ = h.rx.try_recv();
+        assert_eq!(h.app.inflight, 0);
+
+        h.app.last_balance_refresh = Instant::now() - Duration::from_secs(120);
+        h.app.maybe_auto_refresh();
+        assert_eq!(
+            h.app.inflight, 1,
+            "with the gate cleared, auto-refresh must queue a fresh balances request"
+        );
+        assert!(
+            matches!(h.rx.try_recv(), Ok((_, Command::RefreshBalances { .. }))),
+            "auto-refresh must enqueue a RefreshBalances command"
+        );
+    }
 }

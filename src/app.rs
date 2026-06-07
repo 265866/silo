@@ -716,7 +716,10 @@ impl App {
         let new = old + 1;
         self.generation.store(new, Ordering::SeqCst);
         match self.cmd_tx.try_send((new, Command::ChangeRpc { url })) {
-            Ok(()) => true,
+            Ok(()) => {
+                self.inflight = 0;
+                true
+            }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 let _ =
                     self.generation
