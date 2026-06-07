@@ -1,14 +1,13 @@
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use futures_util::StreamExt;
 use ratatui::crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, EventStream};
 use ratatui::crossterm::execute;
 use tokio::sync::mpsc;
 
 use silo::app::{App, AppEvent, Command};
-use silo::db::Db;
+use silo::db::{Db, Storage};
 use silo::price::{PriceCache, SolPrice};
 use silo::solana::rpc::Rpc;
 use silo::types::{Currency, Network};
@@ -18,12 +17,12 @@ use silo::{clipboard, input, ui, worker};
 async fn main() -> Result<()> {
     clipboard::maybe_run_clip_daemon();
 
-    let dir = config_dir();
-    std::fs::create_dir_all(&dir)?;
+    let dir = silo::platform::config_dir();
+    silo::profiles::ensure_private_dir(&dir)?;
 
-    let _instance_lock = acquire_single_instance(&dir)?;
+    let _instance_lock = silo::platform::acquire_single_instance(&dir)?;
 
-    let profiles = silo::profiles::load(&dir);
+    let profiles = silo::profiles::load(&dir)?;
     silo::profiles::cleanup_orphans(&dir, &profiles);
     let first_run = profiles.is_empty();
     let active_id = if first_run {
@@ -32,7 +31,7 @@ async fn main() -> Result<()> {
         profiles[0].id.clone()
     };
     let profile_dir = silo::profiles::dir_for(&dir, &active_id);
-    std::fs::create_dir_all(&profile_dir)?;
+    silo::profiles::ensure_private_dir(&profile_dir)?;
 
     let db = Db::open(&profile_dir.join("silo.db"))?;
     let rpc_url = db
@@ -61,7 +60,7 @@ async fn main() -> Result<()> {
         });
     let vault_path = profile_dir.join("vault.json");
 
-    let db = Arc::new(Mutex::new(db));
+    let db = Storage::new(db);
     let client = worker::build_client()?;
     let rpc = Arc::new(Mutex::new(Rpc::new(client.clone(), rpc_url.clone())));
     let price = Arc::new(PriceCache::new());
@@ -93,21 +92,14 @@ async fn main() -> Result<()> {
         rpc_url,
         vault_path,
     );
-    app.currency = currency;
-    app.priority_micro = priority_micro;
-    if let Some(m) = auto_lock_mins {
-        app.auto_lock_after = std::time::Duration::from_secs(m * 60);
-    }
-    app.profiles = profiles;
-    app.current_profile = Some(active_id);
-    app.reload_wallets();
-
-    if first_run {
-        app.route = silo::app::Route::Setup;
-        app.setup = silo::app::SetupState::default();
-    } else {
-        app.route = silo::app::Route::ProfileSelect;
-    }
+    app.restore_startup_state(
+        currency,
+        priority_micro,
+        auto_lock_mins,
+        profiles,
+        active_id,
+        first_run,
+    );
 
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
@@ -126,7 +118,7 @@ async fn run(
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
 
-    while app.running {
+    while app.is_running() {
         terminal.draw(|f| ui::render(f, &mut app))?;
         tokio::select! {
             maybe_ev = events.next() => match maybe_ev {
@@ -134,13 +126,13 @@ async fn run(
                     app.note_activity();
                     input::handle_event(&mut app, ev);
                 }
-                _ => app.running = false,
+                _ => app.stop(),
             },
             maybe_app_ev = evt_rx.recv() => match maybe_app_ev {
                 Some(app_ev) => app.apply_app_event(app_ev),
-                None => app.running = false,
+                None => app.stop(),
             },
-            _ = &mut workers => app.running = false,
+            _ = &mut workers => app.stop(),
             _ = ticker.tick() => {
                 app.tick();
                 app.maybe_auto_lock();
@@ -149,54 +141,6 @@ async fn run(
         }
     }
 
-    use zeroize::Zeroize;
-    if app.seed.is_some() {
-        app.lock();
-    }
-    app.input.zeroize_secrets();
-    app.setup.mnemonic_words.zeroize();
+    app.scrub_for_exit();
     Ok(())
-}
-
-fn acquire_single_instance(dir: &Path) -> Result<std::fs::File> {
-    let path = dir.join("silo.lock");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => {
-            bail!("another silo instance is already running")
-        }
-        Err(std::fs::TryLockError::Error(e)) => {
-            Err(e).with_context(|| format!("acquiring single-instance lock at {}", path.display()))
-        }
-    }
-}
-
-fn config_dir() -> PathBuf {
-    if let Ok(x) = std::env::var("SILO_CONFIG_DIR") {
-        return PathBuf::from(x);
-    }
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(h) = std::env::var("HOME") {
-            return PathBuf::from(h).join("Library/Application Support/silo");
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(a) = std::env::var("APPDATA") {
-            return PathBuf::from(a).join("silo");
-        }
-    }
-    if let Ok(x) = std::env::var("XDG_CONFIG_HOME") {
-        return PathBuf::from(x).join("silo");
-    }
-    if let Ok(h) = std::env::var("HOME") {
-        return PathBuf::from(h).join(".config/silo");
-    }
-    PathBuf::from(".silo")
 }

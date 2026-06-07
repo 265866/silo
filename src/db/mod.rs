@@ -4,11 +4,14 @@ mod wallets;
 pub use intents::CreateIntentError;
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
+use crate::sync::MutexExt;
 use crate::types::{AuditEntry, AuditEvent, Network};
 
 const SCHEMA_SQL: &str = r#"
@@ -189,7 +192,7 @@ impl Db {
             .context("missing audit_key_salt")?;
         let salt = from_hex32(&salt_hex).context("corrupt audit_key_salt")?;
         let mut k = [0u8; 32];
-        crate::crypto::hkdf_sha256(vault_key, &salt, b"silo-audit-key-v1", &mut k);
+        crate::crypto::hkdf_sha256(vault_key, &salt, b"silo-audit-key-v1", &mut k)?;
         self.audit_key = Some(k);
         Ok(())
     }
@@ -291,19 +294,44 @@ impl Db {
     }
 }
 
-pub fn with_current_db<R>(
-    db: &std::sync::Mutex<Db>,
-    generation: &std::sync::atomic::AtomicU64,
-    cmd_gen: u64,
-    f: impl FnOnce(&mut Db) -> R,
-) -> Option<R> {
-    use crate::sync::MutexExt;
-    use std::sync::atomic::Ordering;
-    let mut guard = db.lock_recover();
-    if generation.load(Ordering::SeqCst) != cmd_gen {
-        return None;
+#[derive(Clone)]
+pub struct Storage {
+    inner: Arc<Mutex<Db>>,
+}
+
+impl Storage {
+    pub fn new(db: Db) -> Self {
+        Storage {
+            inner: Arc::new(Mutex::new(db)),
+        }
     }
-    Some(f(&mut guard))
+
+    pub fn with<R>(&self, f: impl FnOnce(&Db) -> R) -> R {
+        let guard = self.inner.lock_recover();
+        f(&guard)
+    }
+
+    pub fn with_mut<R>(&self, f: impl FnOnce(&mut Db) -> R) -> R {
+        let mut guard = self.inner.lock_recover();
+        f(&mut guard)
+    }
+
+    pub fn replace(&self, db: Db) {
+        *self.inner.lock_recover() = db;
+    }
+
+    pub fn with_current<R>(
+        &self,
+        generation: &AtomicU64,
+        cmd_gen: u64,
+        f: impl FnOnce(&mut Db) -> R,
+    ) -> Option<R> {
+        let mut guard = self.inner.lock_recover();
+        if generation.load(Ordering::SeqCst) != cmd_gen {
+            return None;
+        }
+        Some(f(&mut guard))
+    }
 }
 
 pub fn now_ms() -> i64 {

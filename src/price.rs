@@ -76,6 +76,11 @@ pub enum PriceError {
     Parse,
     #[error("price value out of range")]
     BadValue,
+    #[error("primary price provider failed ({primary}); fallback failed ({fallback})")]
+    Fallback {
+        primary: Box<PriceError>,
+        fallback: Box<PriceError>,
+    },
 }
 
 fn now_secs() -> u64 {
@@ -108,7 +113,10 @@ pub async fn fetch_price(
     };
     fetch_price_fallback_only(client, currency)
         .await
-        .map_err(|_| primary)
+        .map_err(|fallback| PriceError::Fallback {
+            primary: Box::new(primary),
+            fallback: Box::new(fallback),
+        })
 }
 
 pub async fn fetch_price_fallback_only(
@@ -295,6 +303,17 @@ mod tests {
         assert!(validate(-5.0, c, PriceSource::CoinGecko).is_err());
         assert!(validate(f64::INFINITY, c, PriceSource::CoinGecko).is_err());
         assert!(validate(146.2, c, PriceSource::CoinGecko).is_ok());
+    }
+
+    #[test]
+    fn fallback_error_reports_both_providers() {
+        let e = PriceError::Fallback {
+            primary: Box::new(PriceError::RateLimited),
+            fallback: Box::new(PriceError::Http("offline".into())),
+        };
+        let text = e.to_string();
+        assert!(text.contains("rate limited"));
+        assert!(text.contains("offline"));
     }
 
     #[test]

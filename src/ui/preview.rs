@@ -7,7 +7,7 @@ use ratatui::buffer::Buffer;
 use tokio::sync::mpsc;
 
 use crate::app::{App, AppEvent, Command, Modal, PendingSend, PromptKind, Route, SetupStage};
-use crate::db::Db;
+use crate::db::{Db, Storage};
 use crate::price::{PriceCache, PriceSource, SolPrice};
 use crate::profiles::ProfileMeta;
 use crate::types::{Currency, NetStatus, Role, TransferOutcome};
@@ -60,7 +60,7 @@ fn test_app() -> App {
     )
     .unwrap();
 
-    let db = Arc::new(Mutex::new(db));
+    let db = Storage::new(db);
     let price = Arc::new(PriceCache::new());
     price.set(SolPrice {
         value: 146.20,
@@ -101,14 +101,16 @@ fn test_app() -> App {
         .iter()
         .find(|w| w.account_index == 2)
         .map(|w| w.id);
-    if let (Some(id), Ok(mut d)) = (trading_id, app.db.lock()) {
-        let _ = d.set_note(
-            id,
-            Some(
-                "Day-trading hot wallet — keep under 20 SOL.\nSweep profits to cold storage \
-                 weekly; never route sub→sub.",
-            ),
-        );
+    if let Some(id) = trading_id {
+        app.db.with_mut(|d| {
+            let _ = d.set_note(
+                id,
+                Some(
+                    "Day-trading hot wallet — keep under 20 SOL.\nSweep profits to cold storage \
+                     weekly; never route sub→sub.",
+                ),
+            );
+        });
     }
     app.reload_wallets();
     app.profiles = vec![
@@ -161,7 +163,7 @@ fn preview_all_screens() {
     {
         let from = app.wallets[2].id;
         let to = app.wallets[0].pubkey.clone();
-        if let Ok(mut d) = app.db.lock() {
+        app.db.with_mut(|d| {
             let i = d.create_intent(from, &to, 1_500_000_000, None).unwrap();
             d.mark_signed(
                 i.id,
@@ -174,7 +176,7 @@ fn preview_all_screens() {
             .unwrap();
             d.mark_terminal(i.id, crate::types::IntentStatus::Confirmed, None)
                 .unwrap();
-        }
+        });
     }
     app.refresh_detail_intents();
     app.route = Route::History;
@@ -318,10 +320,9 @@ fn optimistic_balance_bump_on_confirm() {
     let to_before = app.wallets[1].balance_lamports.unwrap();
 
     let amount = 5_000_000_000u64;
-    let intent_id = {
-        let mut d = app.db.lock().unwrap();
-        d.create_intent(from_id, &to_addr, amount, None).unwrap().id
-    };
+    let intent_id = app
+        .db
+        .with_mut(|d| d.create_intent(from_id, &to_addr, amount, None).unwrap().id);
 
     app.apply_app_event(AppEvent::TransferResult {
         intent_id,

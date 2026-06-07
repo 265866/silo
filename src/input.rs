@@ -78,10 +78,9 @@ fn try_unlock(app: &mut App) {
         Ok((mnemonic, vault_key)) => {
             let seed = crypto::seed_from_mnemonic(&mnemonic);
             drop(mnemonic);
-            let key_ok = match app.db.lock() {
-                Ok(mut d) => d.unlock_audit_key(vault_key.as_bytes()).is_ok(),
-                Err(_) => false,
-            };
+            let key_ok = app
+                .db
+                .with_mut(|d| d.unlock_audit_key(vault_key.as_bytes()).is_ok());
             drop(vault_key);
             if !key_ok {
                 app.modal = Some(Modal::Error {
@@ -93,9 +92,9 @@ fn try_unlock(app: &mut App) {
                 return;
             }
             if !consistency_ok(app, &seed) {
-                if let Ok(mut d) = app.db.lock() {
+                app.db.with_mut(|d| {
                     let _ = d.audit(AuditEvent::IntegrityCheckFailed, &serde_json::json!({}));
-                }
+                });
                 app.modal = Some(Modal::Error {
                     title: "Database / vault mismatch".into(),
                     body: "A stored wallet address does not match this recovery phrase. \
@@ -104,17 +103,16 @@ fn try_unlock(app: &mut App) {
                 });
                 return;
             }
-            let audit_tampered = match app.db.lock() {
-                Ok(d) => d.verify_audit_chain().map(|ok| !ok).unwrap_or(false),
-                Err(_) => false,
-            };
+            let audit_tampered = app
+                .db
+                .with(|d| d.verify_audit_chain().map(|ok| !ok).unwrap_or(false));
             if audit_tampered {
                 app.toast_err("⚠ audit log integrity check failed — history may be tampered");
             }
             app.seed = Some(seed);
-            if let Ok(mut d) = app.db.lock() {
+            app.db.with_mut(|d| {
                 let _ = d.audit(AuditEvent::VaultUnlocked, &serde_json::json!({}));
-            }
+            });
             app.route = Route::WalletList;
             app.note_activity();
             app.reload_wallets();
@@ -123,21 +121,16 @@ fn try_unlock(app: &mut App) {
             app.toast_ok("Unlocked");
         }
         Err(_) => {
-            if let Ok(mut d) = app.db.lock() {
+            app.db.with_mut(|d| {
                 let _ = d.audit(AuditEvent::VaultUnlockFailed, &serde_json::json!({}));
-            }
+            });
             app.toast_err("Wrong passphrase");
         }
     }
 }
 
 fn consistency_ok(app: &App, seed: &crypto::Seed) -> bool {
-    let wallets = {
-        match app.db.lock() {
-            Ok(d) => d.list_wallets().unwrap_or_default(),
-            Err(_) => return false,
-        }
-    };
+    let wallets = app.db.with(|d| d.list_wallets().unwrap_or_default());
     wallets
         .iter()
         .all(|w| crypto::derive_address(seed, w.account_index) == w.pubkey)
@@ -322,9 +315,9 @@ fn create_vault_and_finish(app: &mut App) {
 
     let seed = crypto::seed_from_mnemonic(&mnemonic);
     if !consistency_ok(app, &seed) {
-        if let Ok(mut d) = app.db.lock() {
+        app.db.with_mut(|d| {
             let _ = d.audit(AuditEvent::IntegrityCheckFailed, &serde_json::json!({}));
-        }
+        });
         app.modal = Some(Modal::Error {
             title: "Database / phrase mismatch".into(),
             body: "Existing wallet records don't match this recovery phrase. Refusing to proceed."
@@ -333,36 +326,62 @@ fn create_vault_and_finish(app: &mut App) {
         return;
     }
 
-    let vault_key =
+    let vault_key = if crate::vault::vault_exists(&app.vault_path) {
+        match crate::vault::unlock_vault_keyed(&app.vault_path, &app.input.passphrase) {
+            Ok((existing, key)) if existing.to_string() == mnemonic.to_string() => key,
+            Ok(_) => {
+                app.toast_err("Existing vault does not match this recovery phrase");
+                return;
+            }
+            Err(e) => {
+                app.toast_err(format!("could not reopen existing vault: {e}"));
+                return;
+            }
+        }
+    } else {
         match crate::vault::create_vault(&app.vault_path, &mnemonic, &app.input.passphrase) {
             Ok(k) => k,
             Err(e) => {
                 app.toast_err(format!("could not create vault: {e}"));
                 return;
             }
-        };
+        }
+    };
     drop(mnemonic);
 
     let master_ok = {
         let master_addr = crypto::derive_address(&seed, 0);
-        match app.db.lock() {
-            Ok(mut d) => {
-                let key_ok = d.unlock_audit_key(vault_key.as_bytes()).is_ok();
-                let _ = d.audit(AuditEvent::VaultCreated, &serde_json::json!({}));
-                key_ok
-                    && match d.master_exists() {
-                        Ok(true) => true,
-                        Ok(false) => d.insert_wallet(0, Role::Master, &master_addr, None).is_ok(),
-                        Err(_) => false,
-                    }
-            }
-            Err(_) => false,
-        }
+        app.db.with_mut(|d| {
+            let key_ok = d.unlock_audit_key(vault_key.as_bytes()).is_ok();
+            let _ = d.audit(AuditEvent::VaultCreated, &serde_json::json!({}));
+            key_ok
+                && match d.master_exists() {
+                    Ok(true) => true,
+                    Ok(false) => d.insert_wallet(0, Role::Master, &master_addr, None).is_ok(),
+                    Err(_) => false,
+                }
+        })
     };
     drop(vault_key);
     if !master_ok {
         app.toast_err("Could not initialize the master wallet — please retry");
         return;
+    }
+
+    if let Some(id) = app.current_profile.clone() {
+        let name = next_wallet_name(&app.profiles);
+        if let Err(e) = crate::profiles::register(
+            &app.config_dir,
+            crate::profiles::ProfileMeta {
+                id,
+                name,
+                created_at: crate::db::now_ms(),
+            },
+        ) {
+            app.toast_err(format!("could not register profile: {e}"));
+            return;
+        }
+        app.reload_profiles();
     }
 
     app.seed = Some(seed);
@@ -373,19 +392,6 @@ fn create_vault_and_finish(app: &mut App) {
     app.setup.mnemonic_words.clear();
     app.setup.scrub_confirm();
     app.input.zeroize_secrets();
-
-    if let Some(id) = app.current_profile.clone() {
-        let name = next_wallet_name(&app.profiles);
-        let _ = crate::profiles::register(
-            &app.config_dir,
-            crate::profiles::ProfileMeta {
-                id,
-                name,
-                created_at: crate::db::now_ms(),
-            },
-        );
-        app.reload_profiles();
-    }
 
     app.route = Route::WalletList;
     app.note_activity();
@@ -461,7 +467,7 @@ fn wallet_list_keys(app: &mut App, key: KeyEvent) {
 }
 
 fn move_selection(app: &mut App, delta: i32) {
-    let n = app.wallet_list_rows().len() as i32;
+    let n = app.wallet_list_len() as i32;
     if n == 0 {
         return;
     }
@@ -475,21 +481,13 @@ fn derive_subwallet(app: &mut App) {
         app.toast_err("Wallet is locked");
         return;
     };
-    let idx = {
-        match app.db.lock() {
-            Ok(d) => d.next_account_index().unwrap_or(1).max(1),
-            Err(_) => return,
-        }
-    };
+    let idx = app.db.with(|d| d.next_account_index().unwrap_or(1).max(1));
     let addr = crypto::derive_address(seed, idx);
-    let res = {
-        app.db
-            .lock()
-            .ok()
-            .map(|mut d| d.insert_wallet(idx, Role::Sub, &addr, None))
-    };
+    let res = app
+        .db
+        .with_mut(|d| d.insert_wallet(idx, Role::Sub, &addr, None));
     match res {
-        Some(Ok(_)) => {
+        Ok(_) => {
             app.reload_wallets();
             app.request_balance_refresh();
             app.toast_ok(format!("Derived subwallet #{idx}"));
@@ -513,6 +511,10 @@ fn copy_text(app: &mut App, text: &str, ok_label: &str) -> bool {
         }
         Ok(crate::clipboard::CopyOutcome::NonPersistent) => {
             app.toast_info("Copied (won't persist after exit on this compositor)");
+            true
+        }
+        Ok(crate::clipboard::CopyOutcome::PersistenceUnknown) => {
+            app.toast_info("Copied (persistence not confirmed)");
             true
         }
         Err(e) => {
@@ -554,14 +556,9 @@ fn archive_selected(app: &mut App) {
     }
     let (id, want) = (w.id, !w.archived);
     let sel = app.list_state.selected().unwrap_or(0);
-    let res = {
-        match app.db.lock() {
-            Ok(mut d) => Some(d.set_archived(id, want)),
-            Err(_) => None,
-        }
-    };
+    let res = app.db.with_mut(|d| d.set_archived(id, want));
     match res {
-        Some(Ok(())) => {
+        Ok(()) => {
             app.reload_wallets();
             if want {
                 app.list_state.select(Some(sel.saturating_sub(1)));
@@ -571,8 +568,7 @@ fn archive_selected(app: &mut App) {
             }
             app.toast_ok(if want { "Archived" } else { "Unarchived" });
         }
-        Some(Err(e)) => app.toast_err(e.to_string()),
-        None => app.toast_err("Database busy"),
+        Err(e) => app.toast_err(e.to_string()),
     }
 }
 
@@ -794,13 +790,14 @@ fn prepare_send(app: &mut App) {
         app.toast_err("Still reconciling — sends are disabled");
         return;
     }
-    app.toast_info("Preparing transfer…");
-    app.send_cmd(Command::PrepareSend {
+    if app.send_cmd(Command::PrepareSend {
         from_id: from.id,
         to,
         lamports,
         priority_micro: app.priority_micro,
-    });
+    }) {
+        app.toast_info("Preparing transfer…");
+    }
 }
 
 pub fn classify_route(
@@ -826,13 +823,14 @@ fn execute_send(app: &mut App) {
     app.modal = None;
 
     if ps.prepared_at.elapsed() > BLOCKHASH_REFRESH_AFTER {
-        app.send_cmd(Command::PrepareSend {
+        if app.send_cmd(Command::PrepareSend {
             from_id: ps.from_id,
             to: ps.to.clone(),
             lamports: ps.lamports,
             priority_micro: ps.priority_micro,
-        });
-        app.toast_info("Blockhash expired — refreshing…");
+        }) {
+            app.toast_info("Blockhash expired — refreshing…");
+        }
         return;
     }
 
@@ -853,22 +851,17 @@ fn execute_send(app: &mut App) {
         }
     };
 
-    let created = match app.db.lock() {
-        Ok(mut d) => Some(d.create_intent(from.id, &ps.to, ps.lamports, None)),
-        Err(_) => None,
-    };
+    let created = app
+        .db
+        .with_mut(|d| d.create_intent(from.id, &ps.to, ps.lamports, None));
     let intent = match created {
-        Some(Ok(i)) => i,
-        Some(Err(crate::db::CreateIntentError::WalletHasOpenIntent)) => {
+        Ok(i) => i,
+        Err(crate::db::CreateIntentError::WalletHasOpenIntent) => {
             app.toast_err("This wallet already has a transfer in progress");
             return;
         }
-        Some(Err(crate::db::CreateIntentError::Db(e))) => {
+        Err(crate::db::CreateIntentError::Db(e)) => {
             app.toast_err(format!("Could not record transfer: {e}"));
-            return;
-        }
-        None => {
-            app.toast_err("Database busy");
             return;
         }
     };
@@ -890,37 +883,31 @@ fn execute_send(app: &mut App) {
     let wire = tx::assemble_tx(&message, &sig);
     let sig_b58 = tx::signature_to_base58(&sig);
 
-    let signed = match app.db.lock() {
-        Ok(mut d) => {
-            Some(d.mark_signed(intent.id, &sig_b58, &ps.blockhash, ps.lvbh, ps.fee, &wire))
-        }
-        Err(_) => None,
-    };
+    let signed = app
+        .db
+        .with_mut(|d| d.mark_signed(intent.id, &sig_b58, &ps.blockhash, ps.lvbh, ps.fee, &wire));
     match signed {
-        Some(Ok(())) => {}
-        other => {
+        Ok(()) => {}
+        Err(e) => {
             fail_intent(app, intent.id, "could not persist signed transfer");
-            let msg = match other {
-                Some(Err(e)) => format!("Could not persist signed transfer: {e}"),
-                _ => "Database busy".to_string(),
-            };
-            app.toast_err(msg);
+            app.toast_err(format!("Could not persist signed transfer: {e}"));
             return;
         }
     }
 
-    app.send_cmd(Command::Broadcast {
+    if app.send_cmd(Command::Broadcast {
         intent_id: intent.id,
-    });
-    app.route = Route::WalletDetail;
-    app.refresh_detail_intents();
-    app.toast_info("Signing & broadcasting…");
+    }) {
+        app.route = Route::WalletDetail;
+        app.refresh_detail_intents();
+        app.toast_info("Signing & broadcasting…");
+    }
 }
 
 fn fail_intent(app: &App, intent_id: i64, reason: &str) {
-    if let Ok(mut d) = app.db.lock() {
+    app.db.with_mut(|d| {
         let _ = d.mark_terminal(intent_id, crate::types::IntentStatus::Failed, Some(reason));
-    }
+    });
 }
 
 fn run_confirm_action(app: &mut App, action: ConfirmAction) {
@@ -1014,67 +1001,87 @@ fn settings_keys(app: &mut App, key: KeyEvent) {
             });
         }
         KeyCode::Char('u') => {
-            app.currency = app.currency.next();
-            if let Ok(mut d) = app.db.lock() {
-                let _ = d.set_meta("currency", app.currency.code());
-                let _ = d.audit(
-                    AuditEvent::SettingsChanged,
-                    &serde_json::json!({"currency": app.currency.code()}),
-                );
+            let currency = app.currency.next();
+            let persisted = app.db.with_mut(|d| {
+                d.set_meta("currency", currency.code()).and_then(|_| {
+                    d.audit(
+                        AuditEvent::SettingsChanged,
+                        &serde_json::json!({"currency": currency.code()}),
+                    )
+                })
+            });
+            match persisted {
+                Ok(()) => {
+                    app.currency = currency;
+                    app.price.clear();
+                    app.reset_price_baseline();
+                    app.send_cmd(Command::FetchPrice);
+                    app.toast_info(format!("Currency: {}", app.currency.label()));
+                }
+                Err(e) => app.toast_err(format!("Could not save currency: {e}")),
             }
-            app.price.clear();
-            app.reset_price_baseline();
-            app.send_cmd(Command::FetchPrice);
-            app.toast_info(format!("Currency: {}", app.currency.label()));
         }
         KeyCode::Char('L') => {
             app.lock();
             app.toast_info("Locked");
         }
         KeyCode::Char('p') => {
-            app.priority_micro = crate::money::next_priority_preset(app.priority_micro);
-            if let Ok(mut d) = app.db.lock() {
-                let _ = d.set_meta("priority_fee_micro", &app.priority_micro.to_string());
-                let _ = d.audit(
-                    AuditEvent::SettingsChanged,
-                    &serde_json::json!({"priority_fee_micro": app.priority_micro}),
-                );
+            let priority = crate::money::next_priority_preset(app.priority_micro);
+            let persisted = app.db.with_mut(|d| {
+                d.set_meta("priority_fee_micro", &priority.to_string())
+                    .and_then(|_| {
+                        d.audit(
+                            AuditEvent::SettingsChanged,
+                            &serde_json::json!({"priority_fee_micro": priority}),
+                        )
+                    })
+            });
+            match persisted {
+                Ok(()) => {
+                    app.priority_micro = priority;
+                    app.toast_info(format!(
+                        "Priority fee: {} (≈ {} SOL)",
+                        crate::money::priority_label(app.priority_micro),
+                        crate::money::format_lamports(crate::money::priority_fee_lamports(
+                            app.priority_micro
+                        ))
+                    ));
+                }
+                Err(e) => app.toast_err(format!("Could not save priority fee: {e}")),
             }
-            app.toast_info(format!(
-                "Priority fee: {} (≈ {} SOL)",
-                crate::money::priority_label(app.priority_micro),
-                crate::money::format_lamports(crate::money::priority_fee_lamports(
-                    app.priority_micro
-                ))
-            ));
         }
         KeyCode::Char('+') | KeyCode::Char('=') => {
             let m = app.auto_lock_after.as_secs() / 60;
-            app.auto_lock_after =
-                std::time::Duration::from_secs((m + 1).min(crate::app::AUTO_LOCK_MAX_MINUTES) * 60);
-            persist_auto_lock(app);
+            set_auto_lock_minutes(app, (m + 1).min(crate::app::AUTO_LOCK_MAX_MINUTES));
         }
         KeyCode::Char('-') => {
             let m = app.auto_lock_after.as_secs() / 60;
-            app.auto_lock_after = std::time::Duration::from_secs(
-                m.saturating_sub(1).max(crate::app::AUTO_LOCK_MIN_MINUTES) * 60,
+            set_auto_lock_minutes(
+                app,
+                m.saturating_sub(1).max(crate::app::AUTO_LOCK_MIN_MINUTES),
             );
-            persist_auto_lock(app);
         }
         _ => {}
     }
 }
 
-fn persist_auto_lock(app: &mut App) {
-    let mins = app.auto_lock_after.as_secs() / 60;
-    if let Ok(mut d) = app.db.lock() {
-        let _ = d.set_meta("auto_lock_minutes", &mins.to_string());
-        let _ = d.audit(
-            AuditEvent::SettingsChanged,
-            &serde_json::json!({"auto_lock_minutes": mins}),
-        );
+fn set_auto_lock_minutes(app: &mut App, mins: u64) {
+    let persisted = app.db.with_mut(|d| {
+        d.set_meta("auto_lock_minutes", &mins.to_string())
+            .and_then(|_| {
+                d.audit(
+                    AuditEvent::SettingsChanged,
+                    &serde_json::json!({"auto_lock_minutes": mins}),
+                )
+            })
+    });
+    match persisted {
+        Ok(()) => {
+            app.auto_lock_after = std::time::Duration::from_secs(mins * 60);
+            app.toast_info(format!("Auto-lock after {mins} min"));
+        }
+        Err(e) => app.toast_err(format!("Could not save auto-lock: {e}")),
     }
-    app.toast_info(format!("Auto-lock after {mins} min"));
 }
 
 fn back_or_scroll(app: &mut App, key: KeyEvent) {
@@ -1226,40 +1233,74 @@ fn apply_prompt(app: &mut App) {
     };
     match kind {
         Some(PromptKind::Label(id)) => {
-            if let Ok(mut d) = app.db.lock() {
-                let _ = d.set_label(id, value.as_deref());
+            let res = app.db.with_mut(|d| d.set_label(id, value.as_deref()));
+            match res {
+                Ok(()) => {
+                    app.reload_wallets();
+                    app.toast_ok("Label updated");
+                }
+                Err(e) => {
+                    app.toast_err(format!("Could not save label: {e}"));
+                    return;
+                }
             }
-            app.reload_wallets();
-            app.toast_ok("Label updated");
         }
         Some(PromptKind::Note(id)) => {
-            if let Ok(mut d) = app.db.lock() {
-                let _ = d.set_note(id, value.as_deref());
+            let res = app.db.with_mut(|d| d.set_note(id, value.as_deref()));
+            match res {
+                Ok(()) => {
+                    app.reload_wallets();
+                    app.toast_ok("Note updated");
+                }
+                Err(e) => {
+                    app.toast_err(format!("Could not save note: {e}"));
+                    return;
+                }
             }
-            app.reload_wallets();
-            app.toast_ok("Note updated");
         }
         Some(PromptKind::TxNote(id)) => {
-            if let Ok(mut d) = app.db.lock() {
-                let _ = d.set_intent_note(id, value.as_deref());
+            let res = app.db.with_mut(|d| d.set_intent_note(id, value.as_deref()));
+            match res {
+                Ok(()) => {
+                    app.refresh_detail_intents();
+                    app.toast_ok("Transfer note updated");
+                }
+                Err(e) => {
+                    app.toast_err(format!("Could not save transfer note: {e}"));
+                    return;
+                }
             }
-            app.refresh_detail_intents();
-            app.toast_ok("Transfer note updated");
         }
         Some(PromptKind::RpcUrl) => {
             if let Some(url) = value {
-                app.rpc_url = url.clone();
-                app.net_status = crate::types::NetStatus::Syncing;
-                app.reconcile_done = false;
-                app.send_cmd(Command::ChangeRpc { url });
-                app.toast_info("RPC updated — reconciling");
+                let url = match crate::solana::rpc::validate_rpc_url(&url) {
+                    Ok(url) => url,
+                    Err(e) => {
+                        app.toast_err(format!("Invalid RPC URL: {e}"));
+                        return;
+                    }
+                };
+                app.bump_generation_for_rpc_change();
+                if app.send_cmd(Command::ChangeRpc { url: url.clone() }) {
+                    app.rpc_url = url;
+                    app.net_status = crate::types::NetStatus::Syncing;
+                    app.reconcile_done = false;
+                    app.toast_info("RPC updated — reconciling");
+                }
             }
         }
         Some(PromptKind::ProfileName(id)) => {
             let name = value.unwrap_or_else(|| "Wallet".to_string());
-            let _ = crate::profiles::rename(&app.config_dir, &id, &name);
-            app.reload_profiles();
-            app.toast_ok("Renamed");
+            match crate::profiles::rename(&app.config_dir, &id, &name) {
+                Ok(()) => {
+                    app.reload_profiles();
+                    app.toast_ok("Renamed");
+                }
+                Err(e) => {
+                    app.toast_err(format!("Could not rename profile: {e}"));
+                    return;
+                }
+            }
         }
         None => {}
     }

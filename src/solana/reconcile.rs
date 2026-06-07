@@ -1,10 +1,8 @@
-use std::sync::Mutex;
-
 use anyhow::Result;
 use serde_json::json;
 
 use super::rpc::{Rpc, SignatureStatus};
-use crate::db::Db;
+use crate::db::Storage;
 use crate::types::{AuditEvent, IntentStatus};
 
 pub const EXPIRY_SLACK: u64 = 150;
@@ -35,18 +33,17 @@ fn decide(status: Option<&SignatureStatus>, current_height: u64, lvbh: u64) -> D
 }
 
 pub async fn reconcile_boot(
-    db: &Mutex<Db>,
+    db: &Storage,
     rpc: &Rpc,
     generation: &std::sync::atomic::AtomicU64,
     cmd_gen: u64,
 ) -> Result<usize> {
-    use crate::db::with_current_db;
     use std::sync::atomic::Ordering;
     if generation.load(Ordering::SeqCst) != cmd_gen {
         return Ok(0);
     }
 
-    let open = match with_current_db(db, generation, cmd_gen, |d| -> Result<_> {
+    let open = match db.with_current(generation, cmd_gen, |d| -> Result<_> {
         let open = d.get_open_intents()?;
         d.audit(
             AuditEvent::ReconcileStarted,
@@ -62,7 +59,7 @@ pub async fn reconcile_boot(
 
     macro_rules! guarded {
         ($f:expr) => {
-            match with_current_db(db, generation, cmd_gen, $f) {
+            match db.with_current(generation, cmd_gen, $f) {
                 Some(r) => r,
                 None => return Ok(resolved),
             }
@@ -80,7 +77,7 @@ pub async fn reconcile_boot(
             continue;
         }
 
-        let Some(sig) = intent.signature.clone() else {
+        let Some(sig) = intent.signature else {
             guarded!(|d| d.mark_terminal(
                 intent.id,
                 IntentStatus::Failed,
@@ -92,7 +89,7 @@ pub async fn reconcile_boot(
         let lvbh = intent.last_valid_block_height.unwrap_or(0);
 
         let status = rpc
-            .get_signature_statuses(std::slice::from_ref(&sig), true)
+            .get_signature_statuses(&[sig.as_str()], true)
             .await?
             .into_iter()
             .next()
@@ -110,7 +107,7 @@ pub async fn reconcile_boot(
             }
             Decision::Expire => {
                 let recheck = rpc
-                    .get_signature_statuses(std::slice::from_ref(&sig), true)
+                    .get_signature_statuses(&[sig.as_str()], true)
                     .await?
                     .into_iter()
                     .next()
@@ -139,7 +136,7 @@ pub async fn reconcile_boot(
                 resolved += 1;
             }
             Decision::Rebroadcast => {
-                let Some(bytes) = intent.signed_tx.clone() else {
+                let Some(bytes) = intent.signed_tx else {
                     guarded!(|d| d.mark_terminal(
                         intent.id,
                         IntentStatus::Failed,
@@ -176,7 +173,7 @@ pub async fn reconcile_boot(
         }
     }
 
-    if let Some(r) = with_current_db(db, generation, cmd_gen, |d| {
+    if let Some(r) = db.with_current(generation, cmd_gen, |d| {
         d.audit(
             AuditEvent::ReconcileResolved,
             &json!({"resolved": resolved}),
@@ -190,13 +187,13 @@ pub async fn reconcile_boot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Db;
     use std::sync::atomic::AtomicU64;
 
     #[tokio::test]
     async fn reconcile_skips_when_generation_changed() {
-        let db = Mutex::new(Db::open_memory().unwrap());
-        {
-            let mut d = db.lock().unwrap();
+        let db = Storage::new(Db::open_memory().unwrap());
+        db.with_mut(|d| {
             d.insert_wallet(
                 0,
                 crate::types::Role::Master,
@@ -213,12 +210,12 @@ mod tests {
                 )
                 .unwrap();
             d.mark_signed(i.id, "Sig", "bh", 100, 5000, b"x").unwrap();
-        }
+        });
         let rpc = Rpc::new(reqwest::Client::new(), "http://127.0.0.1:0");
         let generation = AtomicU64::new(7);
         let resolved = reconcile_boot(&db, &rpc, &generation, 6).await.unwrap();
         assert_eq!(resolved, 0);
-        assert_eq!(db.lock().unwrap().get_open_intents().unwrap().len(), 1);
+        assert_eq!(db.with(|d| d.get_open_intents().unwrap().len()), 1);
     }
 
     fn status(err: bool, conf: Option<&str>) -> SignatureStatus {

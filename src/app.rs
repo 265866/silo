@@ -8,7 +8,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::clipboard::ClipboardManager;
 use crate::crypto::Seed;
-use crate::db::Db;
+use crate::db::{Db, Storage};
 use crate::price::{PriceCache, SolPrice};
 use crate::sync::MutexExt;
 use crate::types::{Intent, NetStatus, TransferOutcome, WalletRow};
@@ -74,19 +74,43 @@ pub enum Command {
     },
 }
 
+impl Command {
+    pub(crate) fn ordered(&self) -> bool {
+        matches!(
+            self,
+            Command::Reconcile
+                | Command::PrepareSend { .. }
+                | Command::Broadcast { .. }
+                | Command::ChangeRpc { .. }
+        )
+    }
+}
+
 #[derive(Debug)]
 pub enum AppEvent {
     ReconcileComplete {
         resolved: usize,
         generation: u64,
     },
-    ReconcileFailedOffline,
-    Balances(Vec<(i64, u64)>),
+    ReconcileFailedOffline {
+        generation: u64,
+    },
+    Balances {
+        list: Vec<(i64, u64)>,
+        generation: u64,
+    },
     BalancesFailed {
         reason: String,
+        generation: u64,
     },
-    Price(SolPrice),
-    RentExempt(u64),
+    Price {
+        price: SolPrice,
+        generation: u64,
+    },
+    RentExempt {
+        lamports: u64,
+        generation: u64,
+    },
     SendPrepared {
         from_id: i64,
         to: String,
@@ -96,14 +120,21 @@ pub enum AppEvent {
         fee: u64,
         dest_balance: u64,
         priority_micro: u64,
+        generation: u64,
     },
     TransferResult {
         intent_id: i64,
         outcome: TransferOutcome,
         generation: u64,
     },
-    NetStatus(NetStatus),
-    Error(String),
+    NetStatus {
+        status: NetStatus,
+        generation: u64,
+    },
+    Error {
+        message: String,
+        generation: u64,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -270,73 +301,73 @@ pub enum WalletListRow {
 }
 
 pub struct App {
-    pub running: bool,
-    pub route: Route,
-    pub db: Arc<Mutex<Db>>,
-    pub price: Arc<PriceCache>,
-    pub cmd_tx: mpsc::Sender<(u64, Command)>,
-    pub generation: Arc<AtomicU64>,
-    pub clip: ClipboardManager,
-    pub theme: Theme,
+    pub(crate) running: bool,
+    pub(crate) route: Route,
+    pub(crate) db: Storage,
+    pub(crate) price: Arc<PriceCache>,
+    pub(crate) cmd_tx: mpsc::Sender<(u64, Command)>,
+    pub(crate) generation: Arc<AtomicU64>,
+    pub(crate) clip: ClipboardManager,
+    pub(crate) theme: Theme,
 
-    pub seed: Option<Seed>,
-    pub reconcile_done: bool,
-    pub net_status: NetStatus,
-    pub rent_exempt_min: u64,
-    pub priority_micro: u64,
+    pub(crate) seed: Option<Seed>,
+    pub(crate) reconcile_done: bool,
+    pub(crate) net_status: NetStatus,
+    pub(crate) rent_exempt_min: u64,
+    pub(crate) priority_micro: u64,
 
-    pub wallets: Vec<WalletRow>,
-    pub list_state: TableState,
-    pub archived_expanded: bool,
-    pub history_state: TableState,
-    pub audit_state: TableState,
-    pub focused_wallet: Option<i64>,
+    pub(crate) wallets: Vec<WalletRow>,
+    pub(crate) list_state: TableState,
+    pub(crate) archived_expanded: bool,
+    pub(crate) history_state: TableState,
+    pub(crate) audit_state: TableState,
+    pub(crate) focused_wallet: Option<i64>,
 
-    pub setup: SetupState,
-    pub input: InputState,
+    pub(crate) setup: SetupState,
+    pub(crate) input: InputState,
 
-    pub modal: Option<Modal>,
-    pub toasts: Vec<Toast>,
-    pub spinner_frame: usize,
-    pub inflight: u32,
+    pub(crate) modal: Option<Modal>,
+    pub(crate) toasts: Vec<Toast>,
+    pub(crate) spinner_frame: usize,
+    pub(crate) inflight: u32,
 
-    pub detail_intents: Vec<Intent>,
-    pub audit: Vec<crate::types::AuditEntry>,
-    pub pending_send: Option<PendingSend>,
-    pub send_confirm_armed: bool,
+    pub(crate) detail_intents: Vec<Intent>,
+    pub(crate) audit: Vec<crate::types::AuditEntry>,
+    pub(crate) pending_send: Option<PendingSend>,
+    pub(crate) send_confirm_armed: bool,
 
-    pub last_activity: Instant,
-    pub last_wall: SystemTime,
+    pub(crate) last_activity: Instant,
+    pub(crate) last_wall: SystemTime,
     #[cfg(target_os = "linux")]
-    pub last_boottime: Option<Duration>,
-    pub auto_lock_after: Duration,
-    pub last_balance_refresh: Instant,
-    pub hot_until: Option<Instant>,
-    pub hot_interval: Duration,
-    pub rpc_url: String,
-    pub vault_path: std::path::PathBuf,
-    pub currency: crate::types::Currency,
-    pub anim_balance: HashMap<i64, f64>,
-    pub config_dir: std::path::PathBuf,
-    pub rpc: Arc<Mutex<crate::solana::rpc::Rpc>>,
-    pub client: reqwest::Client,
-    pub profiles: Vec<crate::profiles::ProfileMeta>,
-    pub profile_sel: usize,
-    pub current_profile: Option<String>,
+    pub(crate) last_boottime: Option<Duration>,
+    pub(crate) auto_lock_after: Duration,
+    pub(crate) last_balance_refresh: Instant,
+    pub(crate) hot_until: Option<Instant>,
+    pub(crate) hot_interval: Duration,
+    pub(crate) rpc_url: String,
+    pub(crate) vault_path: std::path::PathBuf,
+    pub(crate) currency: crate::types::Currency,
+    pub(crate) anim_balance: HashMap<i64, f64>,
+    pub(crate) config_dir: std::path::PathBuf,
+    pub(crate) rpc: Arc<Mutex<crate::solana::rpc::Rpc>>,
+    pub(crate) client: reqwest::Client,
+    pub(crate) profiles: Vec<crate::profiles::ProfileMeta>,
+    pub(crate) profile_sel: usize,
+    pub(crate) current_profile: Option<String>,
 
-    pub frame: u64,
-    pub confetti: Vec<Confetto>,
+    pub(crate) frame: u64,
+    pub(crate) confetti: Vec<Confetto>,
     confetti_rng: u64,
-    pub last_area: ratatui::layout::Rect,
-    pub price_flash: f32,
-    pub price_up: bool,
+    pub(crate) last_area: ratatui::layout::Rect,
+    pub(crate) price_flash: f32,
+    pub(crate) price_up: bool,
     last_price: Option<f64>,
 }
 
 impl App {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        db: Arc<Mutex<Db>>,
+        db: Storage,
         price: Arc<PriceCache>,
         cmd_tx: mpsc::Sender<(u64, Command)>,
         generation: Arc<AtomicU64>,
@@ -406,57 +437,99 @@ impl App {
         }
     }
 
-    pub fn send_cmd(&self, cmd: Command) {
+    pub fn restore_startup_state(
+        &mut self,
+        currency: crate::types::Currency,
+        priority_micro: u64,
+        auto_lock_mins: Option<u64>,
+        profiles: Vec<crate::profiles::ProfileMeta>,
+        active_id: String,
+        first_run: bool,
+    ) {
+        self.currency = currency;
+        self.priority_micro = priority_micro;
+        if let Some(m) = auto_lock_mins {
+            self.auto_lock_after = Duration::from_secs(m * 60);
+        }
+        self.profiles = profiles;
+        self.current_profile = Some(active_id);
+        self.reload_wallets();
+        if first_run {
+            self.route = Route::Setup;
+            self.setup = SetupState::default();
+        } else {
+            self.route = Route::ProfileSelect;
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running
+    }
+
+    pub fn stop(&mut self) {
+        self.running = false;
+    }
+
+    pub fn scrub_for_exit(&mut self) {
+        if self.seed.is_some() {
+            self.lock();
+        }
+        self.input.zeroize_secrets();
+        self.setup.mnemonic_words.zeroize();
+    }
+
+    pub fn send_cmd(&mut self, cmd: Command) -> bool {
         let g = self.generation.load(Ordering::SeqCst);
-        let _ = self.cmd_tx.try_send((g, cmd));
+        match self.cmd_tx.try_send((g, cmd)) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.toast_err("Command queue is full — try again");
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.toast_err("Background worker stopped");
+                false
+            }
+        }
     }
 
     fn bump_generation(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
+    pub fn bump_generation_for_rpc_change(&self) {
+        self.bump_generation();
+    }
+
     pub fn switch_to_profile(&mut self, id: &str) -> anyhow::Result<()> {
         self.bump_generation();
         let db_path = crate::profiles::db_path(&self.config_dir, id);
         let new_db = Db::open(&db_path)?;
-        *self.db.lock_recover() = new_db;
+        self.db.replace(new_db);
         self.price.clear();
 
-        let url = self
-            .db
-            .lock_recover()
-            .get_meta("rpc_url")
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| {
+        let url = self.db.with(|d| {
+            d.get_meta("rpc_url").ok().flatten().unwrap_or_else(|| {
                 crate::types::Network::MainnetBeta
                     .default_rpc_url()
                     .to_string()
-            });
+            })
+        });
         *self.rpc.lock_recover() = crate::solana::rpc::Rpc::new(self.client.clone(), url.clone());
         self.rpc_url = url;
         self.currency = self
             .db
-            .lock_recover()
-            .get_meta("currency")
-            .ok()
-            .flatten()
+            .with(|d| d.get_meta("currency").ok().flatten())
             .and_then(|s| crate::types::Currency::from_code(&s))
             .unwrap_or(crate::types::Currency::Usd);
         self.priority_micro = self
             .db
-            .lock_recover()
-            .get_meta("priority_fee_micro")
-            .ok()
-            .flatten()
+            .with(|d| d.get_meta("priority_fee_micro").ok().flatten())
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(crate::money::DEFAULT_PRIORITY_FEE_MICRO);
         if let Some(m) = self
             .db
-            .lock_recover()
-            .get_meta("auto_lock_minutes")
-            .ok()
-            .flatten()
+            .with(|d| d.get_meta("auto_lock_minutes").ok().flatten())
             .and_then(|s| s.parse::<u64>().ok())
         {
             self.auto_lock_after =
@@ -464,10 +537,7 @@ impl App {
         }
         if let Some(p) = self
             .db
-            .lock_recover()
-            .get_meta("last_price")
-            .ok()
-            .flatten()
+            .with(|d| d.get_meta("last_price").ok().flatten())
             .and_then(|s| crate::price::SolPrice::from_meta_json(&s))
             .filter(|p| p.currency == self.currency)
         {
@@ -484,6 +554,7 @@ impl App {
         self.reconcile_done = false;
         self.net_status = NetStatus::Syncing;
         self.hot_until = None;
+        self.inflight = 0;
         self.reload_wallets();
 
         self.send_cmd(Command::FetchRentExempt);
@@ -503,12 +574,12 @@ impl App {
 
         let id = crate::profiles::new_id();
         let dir = crate::profiles::dir_for(&self.config_dir, &id);
-        if let Err(e) = std::fs::create_dir_all(&dir) {
+        if let Err(e) = crate::profiles::ensure_private_dir(&dir) {
             self.toast_err(format!("could not create profile dir: {e}"));
             return;
         }
         match Db::open(&dir.join("silo.db")) {
-            Ok(d) => *self.db.lock_recover() = d,
+            Ok(d) => self.db.replace(d),
             Err(e) => {
                 self.toast_err(format!("could not open profile DB: {e}"));
                 return;
@@ -521,12 +592,19 @@ impl App {
         self.wallets.clear();
         self.anim_balance.clear();
         self.focused_wallet = None;
+        self.inflight = 0;
         self.setup = SetupState::default();
         self.route = Route::Setup;
     }
 
     pub fn reload_profiles(&mut self) {
-        self.profiles = crate::profiles::load(&self.config_dir);
+        match crate::profiles::load(&self.config_dir) {
+            Ok(profiles) => self.profiles = profiles,
+            Err(e) => {
+                self.toast_err(format!("Could not load profiles: {e}"));
+                return;
+            }
+        }
         if self.profile_sel >= self.profiles.len() {
             self.profile_sel = self.profiles.len().saturating_sub(1);
         }
@@ -564,10 +642,11 @@ impl App {
 
     pub fn request_balance_refresh(&mut self) {
         self.last_balance_refresh = Instant::now();
-        self.inflight += 1;
-        self.send_cmd(Command::RefreshBalances {
+        if self.send_cmd(Command::RefreshBalances {
             include_archived: self.archived_expanded,
-        });
+        }) {
+            self.inflight += 1;
+        }
     }
 
     pub fn arm_hot_refresh(&mut self) {
@@ -621,10 +700,10 @@ impl App {
         self.anim_balance.clear();
         self.hot_until = None;
         self.route = Route::Unlock;
-        if let Ok(mut d) = self.db.lock() {
+        self.db.with_mut(|d| {
             let _ = d.audit(crate::types::AuditEvent::Locked, &serde_json::json!({}));
             d.lock_audit_key();
-        }
+        });
     }
 
     pub fn toast(&mut self, text: impl Into<String>, kind: ToastKind) {
@@ -776,10 +855,48 @@ impl App {
         rows
     }
 
+    pub fn wallet_list_len(&self) -> usize {
+        self.wallets.iter().filter(|w| !w.archived).count()
+            + usize::from(self.wallets.iter().any(|w| w.archived))
+            + if self.archived_expanded {
+                self.wallets.iter().filter(|w| w.archived).count()
+            } else {
+                0
+            }
+    }
+
+    fn wallet_list_row_at(&self, mut pos: usize) -> Option<WalletListRow> {
+        for (i, w) in self.wallets.iter().enumerate() {
+            if !w.archived {
+                if pos == 0 {
+                    return Some(WalletListRow::Wallet(i));
+                }
+                pos -= 1;
+            }
+        }
+        if self.wallets.iter().any(|w| w.archived) {
+            if pos == 0 {
+                return Some(WalletListRow::ArchivedHeader);
+            }
+            pos -= 1;
+            if self.archived_expanded {
+                for (i, w) in self.wallets.iter().enumerate() {
+                    if w.archived {
+                        if pos == 0 {
+                            return Some(WalletListRow::Wallet(i));
+                        }
+                        pos -= 1;
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn selected_wallet(&self) -> Option<&WalletRow> {
         let sel = self.list_state.selected()?;
-        match self.wallet_list_rows().get(sel)? {
-            WalletListRow::Wallet(i) => self.wallets.get(*i),
+        match self.wallet_list_row_at(sel)? {
+            WalletListRow::Wallet(i) => self.wallets.get(i),
             WalletListRow::ArchivedHeader => None,
         }
     }
@@ -787,7 +904,7 @@ impl App {
     pub fn selected_is_archived_header(&self) -> bool {
         self.list_state
             .selected()
-            .and_then(|s| self.wallet_list_rows().get(s).copied())
+            .and_then(|s| self.wallet_list_row_at(s))
             == Some(WalletListRow::ArchivedHeader)
     }
 
@@ -800,7 +917,7 @@ impl App {
     }
 
     pub fn clamp_list_selection(&mut self) {
-        let n = self.wallet_list_rows().len();
+        let n = self.wallet_list_len();
         if n == 0 {
             self.list_state.select(None);
         } else {
@@ -810,12 +927,13 @@ impl App {
     }
 
     pub fn select_wallet_by_id(&mut self, id: i64) {
-        let pos = self.wallet_list_rows().iter().position(|r| match r {
-            WalletListRow::Wallet(i) => self.wallets[*i].id == id,
-            WalletListRow::ArchivedHeader => false,
-        });
-        if let Some(p) = pos {
-            self.list_state.select(Some(p));
+        for pos in 0..self.wallet_list_len() {
+            if let Some(WalletListRow::Wallet(i)) = self.wallet_list_row_at(pos)
+                && self.wallets[i].id == id
+            {
+                self.list_state.select(Some(pos));
+                return;
+            }
         }
     }
 
@@ -825,9 +943,7 @@ impl App {
     }
 
     pub fn reload_wallets(&mut self) {
-        if let Ok(d) = self.db.lock()
-            && let Ok(mut rows) = d.list_wallets()
-        {
+        if let Ok(mut rows) = self.db.with(|d| d.list_wallets()) {
             for r in &mut rows {
                 if let Some(old) = self.wallets.iter().find(|w| w.id == r.id) {
                     r.balance_lamports = old.balance_lamports;
@@ -891,11 +1007,17 @@ impl App {
                 }
                 self.request_balance_refresh();
             }
-            AppEvent::ReconcileFailedOffline => {
+            AppEvent::ReconcileFailedOffline { generation } => {
+                if generation != self.generation.load(Ordering::SeqCst) {
+                    return;
+                }
                 self.net_status = NetStatus::Offline;
                 self.toast_err("Offline — reconcile pending, sends disabled");
             }
-            AppEvent::Balances(list) => {
+            AppEvent::Balances { list, generation } => {
+                if generation != self.generation.load(Ordering::SeqCst) {
+                    return;
+                }
                 if self.inflight > 0 {
                     self.inflight -= 1;
                 }
@@ -918,7 +1040,10 @@ impl App {
                     self.arm_hot_refresh();
                 }
             }
-            AppEvent::BalancesFailed { reason } => {
+            AppEvent::BalancesFailed { reason, generation } => {
+                if generation != self.generation.load(Ordering::SeqCst) {
+                    return;
+                }
                 if self.inflight > 0 {
                     self.inflight -= 1;
                 }
@@ -927,7 +1052,13 @@ impl App {
                 }
                 self.net_status = NetStatus::Offline;
             }
-            AppEvent::Price(p) => {
+            AppEvent::Price {
+                price: p,
+                generation,
+            } => {
+                if generation != self.generation.load(Ordering::SeqCst) {
+                    return;
+                }
                 if let Some(prev) = self.last_price
                     && (p.value - prev).abs() > f64::EPSILON
                 {
@@ -936,7 +1067,15 @@ impl App {
                 }
                 self.last_price = Some(p.value);
             }
-            AppEvent::RentExempt(v) => self.rent_exempt_min = v,
+            AppEvent::RentExempt {
+                lamports,
+                generation,
+            } => {
+                if generation != self.generation.load(Ordering::SeqCst) {
+                    return;
+                }
+                self.rent_exempt_min = lamports;
+            }
             AppEvent::SendPrepared {
                 from_id,
                 to,
@@ -946,7 +1085,11 @@ impl App {
                 fee,
                 dest_balance,
                 priority_micro,
+                generation,
             } => {
+                if generation != self.generation.load(Ordering::SeqCst) {
+                    return;
+                }
                 self.pending_send = Some(PendingSend {
                     from_id,
                     to,
@@ -989,16 +1132,27 @@ impl App {
                     }
                     TransferOutcome::StillPending { signature } => {
                         self.toast_info(format!(
-                            "Still pending {} — will reconcile on next unlock",
+                            "Still pending {} — continuing to poll",
                             crate::ui::format::elide_addr(signature)
                         ));
                     }
                 }
                 self.refresh_detail_intents();
             }
-            AppEvent::NetStatus(s) => self.net_status = s,
-            AppEvent::Error(e) => {
-                self.toast_err(e);
+            AppEvent::NetStatus { status, generation } => {
+                if generation != self.generation.load(Ordering::SeqCst) {
+                    return;
+                }
+                self.net_status = status;
+            }
+            AppEvent::Error {
+                message,
+                generation,
+            } => {
+                if generation != self.generation.load(Ordering::SeqCst) {
+                    return;
+                }
+                self.toast_err(message);
             }
         }
     }
@@ -1071,11 +1225,7 @@ impl App {
     }
 
     fn apply_optimistic_transfer(&mut self, intent_id: i64) {
-        let intent = self
-            .db
-            .lock()
-            .ok()
-            .and_then(|d| d.get_intent(intent_id).ok().flatten());
+        let intent = self.db.with(|d| d.get_intent(intent_id).ok().flatten());
         let Some(i) = intent else {
             return;
         };
@@ -1096,8 +1246,7 @@ impl App {
 
     pub fn refresh_detail_intents(&mut self) {
         if let Some(id) = self.focused_wallet
-            && let Ok(d) = self.db.lock()
-            && let Ok(v) = d.list_intents_for_wallet(id, 50)
+            && let Ok(v) = self.db.with(|d| d.list_intents_for_wallet(id, 50))
         {
             self.detail_intents = v;
         }
@@ -1106,9 +1255,7 @@ impl App {
     }
 
     pub fn refresh_audit(&mut self) {
-        if let Ok(d) = self.db.lock()
-            && let Ok(v) = d.list_audit(200)
-        {
+        if let Ok(v) = self.db.with(|d| d.list_audit(200)) {
             self.audit = v;
         }
         self.audit_state.select(None);

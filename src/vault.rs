@@ -117,7 +117,7 @@ pub fn create_vault(path: &Path, mnemonic: &Mnemonic, passphrase: &str) -> Resul
     };
 
     let json = serde_json::to_vec_pretty(&vault).context("serializing vault")?;
-    write_atomic(path, &json).context("writing vault file")?;
+    write_atomic_exclusive(path, &json).context("writing vault file")?;
     Ok(VaultKey(key))
 }
 
@@ -146,6 +146,9 @@ pub fn unlock_vault_keyed(path: &Path, passphrase: &str) -> Result<(Mnemonic, Va
     let salt = bs58::decode(&vault.salt_b58)
         .into_vec()
         .context("corrupt salt")?;
+    if salt.len() != SALT_LEN {
+        return Err(anyhow!("corrupt salt: expected {SALT_LEN} bytes"));
+    }
     let nonce_bytes = bs58::decode(&vault.nonce_b58)
         .into_vec()
         .context("corrupt nonce")?;
@@ -175,6 +178,14 @@ pub fn unlock_vault_keyed(path: &Path, passphrase: &str) -> Result<(Mnemonic, Va
 }
 
 pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    write_atomic_inner(path, data, false)
+}
+
+fn write_atomic_exclusive(path: &Path, data: &[u8]) -> Result<()> {
+    write_atomic_inner(path, data, true)
+}
+
+fn write_atomic_inner(path: &Path, data: &[u8], exclusive: bool) -> Result<()> {
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -185,20 +196,101 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
         .file_name()
         .ok_or_else(|| anyhow!("vault path has no file name"))?
         .to_string_lossy();
-    let tmp_path = dir.join(format!(".{file_name}.tmp"));
+    let tmp_path = unique_tmp_path(&dir, &file_name)?;
 
+    let result = (|| -> Result<()> {
+        {
+            let mut tmp = private_create_new(&tmp_path)
+                .with_context(|| format!("creating temp file {}", tmp_path.display()))?;
+            tmp.write_all(data)?;
+            tmp.sync_all()?;
+        }
+
+        if exclusive {
+            fs::hard_link(&tmp_path, path).with_context(|| {
+                format!(
+                    "publishing {} -> {} without overwrite",
+                    tmp_path.display(),
+                    path.display()
+                )
+            })?;
+            fs::remove_file(&tmp_path).ok();
+        } else {
+            replace_atomic(&tmp_path, path).with_context(|| {
+                format!("renaming {} -> {}", tmp_path.display(), path.display())
+            })?;
+        }
+
+        if let Ok(dir_file) = OpenOptions::new().read(true).open(&dir) {
+            let _ = dir_file.sync_all();
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        fs::remove_file(&tmp_path).ok();
+    }
+    result
+}
+
+fn unique_tmp_path(dir: &Path, file_name: &str) -> Result<PathBuf> {
+    for _ in 0..16 {
+        let mut b = [0u8; 8];
+        crate::crypto::random_bytes(&mut b);
+        let suffix: String = b.iter().map(|x| format!("{x:02x}")).collect();
+        let tmp = dir.join(format!(".{file_name}.{suffix}.tmp"));
+        if !tmp.exists() {
+            return Ok(tmp);
+        }
+    }
+    Err(anyhow!(
+        "could not choose a unique temp file for {file_name}"
+    ))
+}
+
+fn private_create_new(path: &Path) -> Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
     {
-        let mut tmp = File::create(&tmp_path)
-            .with_context(|| format!("creating temp file {}", tmp_path.display()))?;
-        tmp.write_all(data)?;
-        tmp.sync_all()?;
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    Ok(opts.open(path)?)
+}
+
+#[cfg(not(windows))]
+fn replace_atomic(tmp_path: &Path, path: &Path) -> Result<()> {
+    Ok(fs::rename(tmp_path, path)?)
+}
+
+#[cfg(windows)]
+fn replace_atomic(tmp_path: &Path, path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(fs::rename(tmp_path, path)?);
+    }
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+    fn wide(s: &OsStr) -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
     }
 
-    fs::rename(&tmp_path, path)
-        .with_context(|| format!("renaming {} -> {}", tmp_path.display(), path.display()))?;
-
-    if let Ok(dir_file) = OpenOptions::new().read(true).open(&dir) {
-        let _ = dir_file.sync_all();
+    let replaced = wide(path.as_os_str());
+    let replacement = wide(tmp_path.as_os_str());
+    let ok = unsafe {
+        ReplaceFileW(
+            replaced.as_ptr(),
+            replacement.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error()).context("replacing destination file");
     }
     Ok(())
 }
@@ -245,6 +337,54 @@ mod tests {
             unlock_vault(&path, "pw").unwrap().to_string(),
             m1.to_string()
         );
+    }
+
+    #[test]
+    fn corrupt_salt_length_errors_not_panics() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.json");
+        let mnemonic = generate_mnemonic(WordCount::Twelve).unwrap();
+        create_vault(&path, &mnemonic, "pw").unwrap();
+
+        let mut vault: VaultFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut salt = bs58::decode(&vault.salt_b58).into_vec().unwrap();
+        salt.truncate(8);
+        vault.salt_b58 = bs58::encode(salt).into_string();
+        fs::write(&path, serde_json::to_vec(&vault).unwrap()).unwrap();
+
+        let err = unlock_vault(&path, "pw").unwrap_err().to_string();
+        assert!(err.contains("corrupt salt"));
+    }
+
+    #[test]
+    fn oversized_salt_errors_not_panics() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.json");
+        let mnemonic = generate_mnemonic(WordCount::Twelve).unwrap();
+        create_vault(&path, &mnemonic, "pw").unwrap();
+
+        let mut vault: VaultFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut salt = bs58::decode(&vault.salt_b58).into_vec().unwrap();
+        salt.push(1);
+        vault.salt_b58 = bs58::encode(salt).into_string();
+        fs::write(&path, serde_json::to_vec(&vault).unwrap()).unwrap();
+
+        let err = unlock_vault(&path, "pw").unwrap_err().to_string();
+        assert!(err.contains("corrupt salt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_file_mode_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.json");
+        let mnemonic = generate_mnemonic(WordCount::Twelve).unwrap();
+        create_vault(&path, &mnemonic, "pw").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

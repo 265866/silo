@@ -5,9 +5,13 @@ edition = "2024"
 rust-version = "1.89"
 license = "GPL-3.0-or-later"
 description = "SOL-only Solana wallet manager TUI"
+authors = ["265866 <github@coltons.space>"]
 repository = "https://github.com/265866/silo"
 homepage = "https://github.com/265866/silo"
+documentation = "https://github.com/265866/silo#readme"
 readme = "README.md"
+keywords = ["solana", "wallet", "tui", "terminal", "crypto"]
+categories = ["command-line-utilities", "cryptography::cryptocurrencies"]
 
 [package.metadata.dist]
 dist = true
@@ -26,7 +30,7 @@ hmac = "0.12"
 rand = "0.10.1"
 ratatui = "0.30.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "http2", "json", "charset", "gzip"] }
-rusqlite = { version = "0.40.0", features = ["bundled"] }
+rusqlite = { version = "0.39.0", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.10"
@@ -40,6 +44,9 @@ zeroize = { version = "1.8.2", features = ["derive"] }
 # suspended, so without this a machine slept past the timeout wouldn't auto-lock.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 solana-address = "2.6"

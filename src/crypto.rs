@@ -55,10 +55,14 @@ pub fn random_bytes(buf: &mut [u8]) {
     rng.fill_bytes(buf);
 }
 
-pub fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8], okm: &mut [u8]) {
+pub fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8], okm: &mut [u8]) -> Result<()> {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     type H = Hmac<Sha256>;
+
+    if okm.len() > 255 * 32 {
+        anyhow::bail!("HKDF-SHA256 output is too long");
+    }
 
     let mut ext = H::new_from_slice(salt).expect("HMAC accepts any key length");
     ext.update(ikm);
@@ -77,9 +81,10 @@ pub fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8], okm: &mut [u8]) {
         okm[filled..filled + take].copy_from_slice(&block[..take]);
         prev = block.to_vec();
         filled += take;
-        counter = counter.wrapping_add(1);
+        counter = counter.saturating_add(1);
     }
     prev.zeroize();
+    Ok(())
 }
 
 pub fn word_suggestions(prefix: &str) -> Vec<&'static str> {
@@ -122,11 +127,19 @@ mod tests {
         let salt: Vec<u8> = (0u8..=12).collect();
         let info: Vec<u8> = (0xf0u8..=0xf9).collect();
         let mut okm = [0u8; 42];
-        hkdf_sha256(&ikm, &salt, &info, &mut okm);
+        hkdf_sha256(&ikm, &salt, &info, &mut okm).unwrap();
         let expected =
             "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865";
         let got: String = okm.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn hkdf_rejects_overlong_output() {
+        let mut okm = vec![0u8; 255 * 32];
+        hkdf_sha256(b"ikm", b"salt", b"info", &mut okm).unwrap();
+        let mut too_long = vec![0u8; 255 * 32 + 1];
+        assert!(hkdf_sha256(b"ikm", b"salt", b"info", &mut too_long).is_err());
     }
 
     #[test]
