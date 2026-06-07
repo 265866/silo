@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -10,6 +10,7 @@ use crate::types::Commitment;
 const MAX_RETRIES: u32 = 4;
 const GMA_CHUNK: usize = 100;
 const SIGSTATUS_CHUNK: usize = 256;
+const RETRY_AFTER_CAP_SECS: u64 = 60;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct SignatureStatus {
@@ -349,8 +350,68 @@ fn retry_after(r: &reqwest::Response) -> Option<Duration> {
         .get(reqwest::header::RETRY_AFTER)?
         .to_str()
         .ok()?;
-    let secs = raw.trim().parse::<u64>().ok()?;
-    Some(Duration::from_secs(secs.min(60)))
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    retry_after_delay(raw, now)
+}
+
+fn retry_after_delay(raw: &str, now_unix: u64) -> Option<Duration> {
+    let raw = raw.trim();
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(Duration::from_secs(secs.min(RETRY_AFTER_CAP_SECS)));
+    }
+    let target = parse_http_date(raw)?;
+    let delay = target.saturating_sub(now_unix);
+    Some(Duration::from_secs(delay.min(RETRY_AFTER_CAP_SECS)))
+}
+
+fn parse_http_date(s: &str) -> Option<u64> {
+    let (_weekday, rest) = s.trim().split_once(", ")?;
+    let mut fields = rest.split(' ');
+    let day: u32 = fields.next()?.parse().ok()?;
+    let month = match fields.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: i64 = fields.next()?.parse().ok()?;
+    let mut time = fields.next()?.split(':');
+    let hour: u64 = time.next()?.parse().ok()?;
+    let minute: u64 = time.next()?.parse().ok()?;
+    let second: u64 = time.next()?.parse().ok()?;
+    if time.next().is_some() {
+        return None;
+    }
+    if fields.next()? != "GMT" || fields.next().is_some() {
+        return None;
+    }
+    if !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    if days < 0 {
+        return None;
+    }
+    Some(days as u64 * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month = month as i64;
+    let doy = (153 * if month > 2 { month - 3 } else { month + 9 } + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 fn jitter_ms() -> u64 {
@@ -596,6 +657,60 @@ mod tests {
         assert!((250..350).contains(&b0));
         assert!(b3 > b0);
         assert!(backoff(20).as_millis() <= 8_100);
+    }
+
+    #[test]
+    fn parse_http_date_matches_known_imf_fixdate() {
+        assert_eq!(
+            parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784_111_777)
+        );
+        assert_eq!(parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+    }
+
+    #[test]
+    fn parse_http_date_rejects_malformed() {
+        assert_eq!(parse_http_date("not-a-date"), None);
+        assert_eq!(parse_http_date("Sun, 06 Foo 1994 08:49:37 GMT"), None);
+        assert_eq!(parse_http_date("Sun, 06 Nov 1994 08:49:37 PST"), None);
+        assert_eq!(parse_http_date("Sun, 06 Nov 1994 25:49:37 GMT"), None);
+        assert_eq!(parse_http_date("Sun, 06 Nov 1994 08:49 GMT"), None);
+    }
+
+    #[test]
+    fn retry_after_delay_honors_integer_form() {
+        assert_eq!(retry_after_delay("3", 1_000), Some(Duration::from_secs(3)));
+        assert_eq!(retry_after_delay("0", 1_000), Some(Duration::ZERO));
+        assert_eq!(
+            retry_after_delay("9000", 1_000),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn retry_after_delay_honors_future_http_date() {
+        let now = 784_111_777;
+        let wait = retry_after_delay("Sun, 06 Nov 1994 08:49:47 GMT", now).unwrap();
+        assert_eq!(wait, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn retry_after_delay_clamps_past_http_date_to_zero() {
+        let now = 784_111_877;
+        let wait = retry_after_delay("Sun, 06 Nov 1994 08:49:37 GMT", now).unwrap();
+        assert_eq!(wait, Duration::ZERO);
+    }
+
+    #[test]
+    fn retry_after_delay_caps_far_future_http_date() {
+        let now = 784_111_777;
+        let wait = retry_after_delay("Sun, 06 Nov 1994 09:49:37 GMT", now).unwrap();
+        assert_eq!(wait, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn retry_after_delay_returns_none_for_garbage() {
+        assert_eq!(retry_after_delay("not-a-date", 1_000), None);
     }
 
     #[tokio::test]
