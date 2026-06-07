@@ -6,8 +6,8 @@ use serde_json::json;
 use tokio::sync::{Semaphore, mpsc, watch};
 
 use crate::app::{
-    AppEvent, ClipboardCopyResult, Command, PasteTarget, ProfileDeleteResult, SendPersistResult,
-    SettingChange, SetupResult, UnlockResult, WalletTextField,
+    AppEvent, ClipboardCopyResult, Command, PasteTarget, ProfileDeleteResult, ProfileOpenedPayload,
+    SendPersistResult, SettingChange, SetupResult, UnlockResult, WalletTextField,
 };
 use crate::db::{IntentTransitionOutcome, Storage};
 use crate::price::{
@@ -517,6 +517,50 @@ async fn handle_command(
             });
             let _ = evt
                 .send(AppEvent::ProfileDeleted {
+                    result,
+                    generation: cmd_gen,
+                })
+                .await;
+        }
+
+        Command::OpenProfile { config_dir, id } => {
+            let result = tokio::task::spawn_blocking(move || {
+                let path = crate::profiles::db_path(&config_dir, &id).map_err(|e| e.to_string())?;
+                let opened = crate::db::Db::open(&path).map_err(|e| e.to_string())?;
+                crate::app::App::validate_profile_scoped_state(&opened)
+                    .map_err(|e| e.to_string())?;
+                Ok(ProfileOpenedPayload {
+                    db: opened,
+                    id,
+                    created: false,
+                })
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("open profile task failed: {e}")));
+            let _ = evt
+                .send(AppEvent::ProfileOpened {
+                    result,
+                    generation: cmd_gen,
+                })
+                .await;
+        }
+
+        Command::CreateProfile { config_dir, id } => {
+            let result = tokio::task::spawn_blocking(move || {
+                let dir = crate::profiles::dir_for(&config_dir, &id).map_err(|e| e.to_string())?;
+                crate::profiles::ensure_private_dir(&dir).map_err(|e| e.to_string())?;
+                let opened =
+                    crate::db::Db::open(&dir.join("silo.db")).map_err(|e| e.to_string())?;
+                Ok(ProfileOpenedPayload {
+                    db: opened,
+                    id,
+                    created: true,
+                })
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("create profile task failed: {e}")));
+            let _ = evt
+                .send(AppEvent::ProfileOpened {
                     result,
                     generation: cmd_gen,
                 })
@@ -1344,6 +1388,20 @@ mod tests {
             }
             .ordered()
         );
+        assert!(
+            Command::OpenProfile {
+                config_dir: std::path::PathBuf::from("/tmp"),
+                id: "p".into(),
+            }
+            .ordered()
+        );
+        assert!(
+            Command::CreateProfile {
+                config_dir: std::path::PathBuf::from("/tmp"),
+                id: "p".into(),
+            }
+            .ordered()
+        );
         assert!(!Command::FetchPrice.ordered());
         assert!(!Command::FetchRentExempt.ordered());
         assert!(
@@ -1391,6 +1449,90 @@ mod tests {
             Arc::new(PriceCache::default()),
             client,
         )
+    }
+
+    #[tokio::test]
+    async fn open_profile_command_opens_off_thread_without_touching_shared_db() {
+        let (db, _sub) = storage_with_wallets();
+        let (rpc, price, client) = worker_deps();
+        let (evt_tx, mut evt_rx) = mpsc::channel(8);
+        let generation = Arc::new(AtomicU64::new(1));
+        let id = crate::profiles::new_id();
+        let config_dir =
+            std::env::temp_dir().join(format!("silo-open-test-{}-{id}", std::process::id()));
+        let dir = crate::profiles::dir_for(&config_dir, &id).unwrap();
+        crate::profiles::ensure_private_dir(&dir).unwrap();
+        let shared_before = db.with(|d| d.list_wallets().unwrap().len());
+
+        handle_command(
+            1,
+            Command::OpenProfile {
+                config_dir: config_dir.clone(),
+                id: id.clone(),
+            },
+            db.clone(),
+            rpc,
+            evt_tx,
+            price,
+            client,
+            generation,
+        )
+        .await;
+
+        match evt_rx.try_recv().unwrap() {
+            AppEvent::ProfileOpened { result, generation } => {
+                assert_eq!(generation, 1);
+                let payload = result.unwrap();
+                assert_eq!(payload.id, id);
+                assert!(!payload.created);
+                assert_eq!(payload.db.list_wallets().unwrap().len(), 0);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert_eq!(db.with(|d| d.list_wallets().unwrap().len()), shared_before);
+        let _ = std::fs::remove_dir_all(&config_dir);
+    }
+
+    #[tokio::test]
+    async fn create_profile_command_creates_dir_and_fresh_db_off_thread() {
+        let (db, _sub) = storage_with_wallets();
+        let (rpc, price, client) = worker_deps();
+        let (evt_tx, mut evt_rx) = mpsc::channel(8);
+        let generation = Arc::new(AtomicU64::new(2));
+        let id = crate::profiles::new_id();
+        let config_dir =
+            std::env::temp_dir().join(format!("silo-create-test-{}-{id}", std::process::id()));
+        let dir = crate::profiles::dir_for(&config_dir, &id).unwrap();
+        let shared_before = db.with(|d| d.list_wallets().unwrap().len());
+
+        handle_command(
+            2,
+            Command::CreateProfile {
+                config_dir: config_dir.clone(),
+                id: id.clone(),
+            },
+            db.clone(),
+            rpc,
+            evt_tx,
+            price,
+            client,
+            generation,
+        )
+        .await;
+
+        match evt_rx.try_recv().unwrap() {
+            AppEvent::ProfileOpened { result, generation } => {
+                assert_eq!(generation, 2);
+                let payload = result.unwrap();
+                assert_eq!(payload.id, id);
+                assert!(payload.created);
+                assert_eq!(payload.db.list_wallets().unwrap().len(), 0);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(dir.join("silo.db").exists());
+        assert_eq!(db.with(|d| d.list_wallets().unwrap().len()), shared_before);
+        let _ = std::fs::remove_dir_all(&config_dir);
     }
 
     #[tokio::test]

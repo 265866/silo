@@ -140,6 +140,14 @@ pub enum Command {
         id: String,
         name: String,
     },
+    OpenProfile {
+        config_dir: std::path::PathBuf,
+        id: String,
+    },
+    CreateProfile {
+        config_dir: std::path::PathBuf,
+        id: String,
+    },
 }
 
 impl Command {
@@ -160,7 +168,24 @@ impl Command {
                 | Command::SetWalletText { .. }
                 | Command::SetIntentNote { .. }
                 | Command::RenameProfile { .. }
+                | Command::OpenProfile { .. }
+                | Command::CreateProfile { .. }
         )
+    }
+}
+
+pub struct ProfileOpenedPayload {
+    pub db: crate::db::Db,
+    pub id: String,
+    pub created: bool,
+}
+
+impl std::fmt::Debug for ProfileOpenedPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProfileOpenedPayload")
+            .field("id", &self.id)
+            .field("created", &self.created)
+            .finish_non_exhaustive()
     }
 }
 
@@ -219,6 +244,10 @@ pub enum AppEvent {
     },
     ProfileDeleted {
         result: ProfileDeleteResult,
+        generation: u64,
+    },
+    ProfileOpened {
+        result: Result<ProfileOpenedPayload, String>,
         generation: u64,
     },
     ClipboardCopied {
@@ -539,6 +568,7 @@ pub struct App {
     pub(crate) profiles: Vec<crate::profiles::ProfileMeta>,
     pub(crate) profile_sel: usize,
     pub(crate) current_profile: Option<String>,
+    pub(crate) pending_profile_open: Option<usize>,
 
     pub(crate) frame: u64,
     pub(crate) confetti: Vec<Confetto>,
@@ -613,6 +643,7 @@ impl App {
             profiles: Vec::new(),
             profile_sel: 0,
             current_profile: None,
+            pending_profile_open: None,
             frame: 0,
             confetti: Vec::new(),
             confetti_rng: 0x2545_F491_4F6C_DD1D,
@@ -719,7 +750,7 @@ impl App {
         self.reset_price_baseline();
     }
 
-    fn validate_profile_scoped_state(db: &Db) -> anyhow::Result<()> {
+    pub(crate) fn validate_profile_scoped_state(db: &Db) -> anyhow::Result<()> {
         db.get_meta("rpc_url")?;
         db.get_meta("currency")?;
         db.get_meta("priority_fee_micro")?;
@@ -768,33 +799,24 @@ impl App {
     }
 
     pub fn switch_to_profile(&mut self, id: &str) -> anyhow::Result<()> {
+        crate::profiles::validate_id(id)?;
+        let old = self.generation.load(Ordering::SeqCst);
         self.bump_generation();
-        let db_path = crate::profiles::db_path(&self.config_dir, id)?;
-        let new_db = Db::open(&db_path)?;
-        Self::validate_profile_scoped_state(&new_db)?;
-        self.db.replace(new_db);
-        self.load_profile_scoped_state()?;
-
-        self.vault_path = crate::profiles::vault_path(&self.config_dir, id)?;
-        self.current_profile = Some(id.to_string());
-        self.seed = None;
-        self.wallets.clear();
-        self.anim_balance.clear();
-        self.detail_intents.clear();
-        self.focused_wallet = None;
-        self.reconcile_done = false;
-        self.net_status = NetStatus::Syncing;
-        self.hot_until = None;
-        self.inflight = 0;
-        self.reload_wallets();
-
-        self.send_cmd(Command::FetchRentExempt);
-        self.send_cmd(Command::FetchPrice);
-        self.request_balance_refresh();
+        if !self.send_cmd(Command::OpenProfile {
+            config_dir: self.config_dir.clone(),
+            id: id.to_string(),
+        }) {
+            let _ =
+                self.generation
+                    .compare_exchange(old + 1, old, Ordering::SeqCst, Ordering::SeqCst);
+            anyhow::bail!("could not queue profile open");
+        }
+        self.blocking_input = true;
         Ok(())
     }
 
     pub fn begin_new_profile(&mut self) {
+        let old = self.generation.load(Ordering::SeqCst);
         self.bump_generation();
         self.input.zeroize_secrets();
         self.setup
@@ -804,34 +826,37 @@ impl App {
         self.setup.scrub_confirm();
 
         let id = crate::profiles::new_id();
-        let dir = match crate::profiles::dir_for(&self.config_dir, &id) {
-            Ok(dir) => dir,
-            Err(e) => {
-                self.toast_err(format!("could not choose profile dir: {e}"));
-                return;
-            }
-        };
-        if let Err(e) = crate::profiles::ensure_private_dir(&dir) {
-            self.toast_err(format!("could not create profile dir: {e}"));
+        if !self.send_cmd(Command::CreateProfile {
+            config_dir: self.config_dir.clone(),
+            id,
+        }) {
+            let _ =
+                self.generation
+                    .compare_exchange(old + 1, old, Ordering::SeqCst, Ordering::SeqCst);
+            self.toast_err("could not queue new profile creation");
             return;
         }
-        match Db::open(&dir.join("silo.db")) {
-            Ok(d) => self.db.replace(d),
-            Err(e) => {
-                self.toast_err(format!("could not open profile DB: {e}"));
-                return;
+        self.blocking_input = true;
+    }
+
+    fn try_next_profile_fallback(&mut self, last_err: &str) {
+        let next = match self.pending_profile_open {
+            Some(idx) => idx + 1,
+            None => return,
+        };
+        if next < self.profiles.len() {
+            self.pending_profile_open = Some(next);
+            let id = self.profiles[next].id.clone();
+            if let Err(e) = self.switch_to_profile(&id) {
+                self.try_next_profile_fallback(&e.to_string());
             }
+        } else {
+            self.pending_profile_open = None;
+            self.toast_err(format!(
+                "Profile deleted, but no remaining profile could be opened: {last_err}"
+            ));
+            self.begin_new_profile();
         }
-        self.reset_profile_scoped_state();
-        self.current_profile = Some(id);
-        self.vault_path = dir.join("vault.json");
-        self.seed = None;
-        self.wallets.clear();
-        self.anim_balance.clear();
-        self.focused_wallet = None;
-        self.inflight = 0;
-        self.setup = SetupState::default();
-        self.route = Route::Setup;
     }
 
     pub fn reload_profiles(&mut self) {
@@ -1501,24 +1526,79 @@ impl App {
                     ProfileDeleteResult::Deleted { profiles } => {
                         self.profiles = profiles;
                         if self.profiles.is_empty() {
+                            self.pending_profile_open = None;
                             self.begin_new_profile();
                             self.toast_info("Profile deleted — set up a new wallet");
                         } else {
-                            for (idx, profile) in self.profiles.clone().into_iter().enumerate() {
-                                if self.switch_to_profile(&profile.id).is_ok() {
-                                    self.profile_sel = idx;
-                                    self.route = Route::ProfileSelect;
-                                    self.toast_ok("Profile deleted");
-                                    return;
-                                }
+                            self.pending_profile_open = Some(0);
+                            let id = self.profiles[0].id.clone();
+                            if let Err(e) = self.switch_to_profile(&id) {
+                                self.try_next_profile_fallback(&e.to_string());
                             }
-                            self.toast_err(
-                                "Profile deleted, but no remaining profile could be opened",
-                            );
-                            self.begin_new_profile();
                         }
                     }
                     ProfileDeleteResult::Failed(reason) => self.toast_err(reason),
+                }
+            }
+            AppEvent::ProfileOpened { result, generation } => {
+                if generation != self.generation.load(Ordering::SeqCst) {
+                    return;
+                }
+                self.blocking_input = false;
+                let payload = match result {
+                    Ok(p) => p,
+                    Err(e) => {
+                        if self.pending_profile_open.is_some() {
+                            self.try_next_profile_fallback(&e);
+                        } else {
+                            self.toast_err(format!("Could not open profile: {e}"));
+                        }
+                        return;
+                    }
+                };
+                let vault_path = match crate::profiles::vault_path(&self.config_dir, &payload.id) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.toast_err(format!("could not resolve profile path: {e}"));
+                        return;
+                    }
+                };
+                self.db.replace(payload.db);
+                self.vault_path = vault_path;
+                self.current_profile = Some(payload.id);
+                self.seed = None;
+                self.wallets.clear();
+                self.anim_balance.clear();
+                self.focused_wallet = None;
+                self.inflight = 0;
+                if payload.created {
+                    self.pending_profile_open = None;
+                    self.reset_profile_scoped_state();
+                    self.setup = SetupState::default();
+                    self.route = Route::Setup;
+                } else {
+                    if let Err(e) = self.load_profile_scoped_state() {
+                        self.toast_err(format!("could not load profile state: {e}"));
+                    }
+                    self.detail_intents.clear();
+                    self.reconcile_done = false;
+                    self.net_status = NetStatus::Syncing;
+                    self.hot_until = None;
+                    self.reload_wallets();
+                    self.send_cmd(Command::FetchRentExempt);
+                    self.send_cmd(Command::FetchPrice);
+                    self.request_balance_refresh();
+                    if let Some(idx) = self.pending_profile_open.take() {
+                        self.profile_sel = idx;
+                        self.route = Route::ProfileSelect;
+                        self.toast_ok("Profile deleted");
+                    } else {
+                        self.route = if crate::vault::vault_exists(&self.vault_path) {
+                            Route::Unlock
+                        } else {
+                            Route::Setup
+                        };
+                    }
                 }
             }
             AppEvent::ClipboardCopied { result, generation } => {
