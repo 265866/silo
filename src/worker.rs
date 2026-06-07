@@ -426,14 +426,22 @@ fn persist_signed_send_blocking(
             SendPersistResult::Failed(format!("Transfer was already {}", status.as_str()))
         }
         Err(e) => {
-            db.with_mut(|d| {
-                let _ = d.mark_terminal(
+            let cleaned = db.with_mut(|d| {
+                d.mark_terminal(
                     intent.id,
                     IntentStatus::Failed,
                     Some("could not persist signed transfer"),
-                );
+                )
             });
-            SendPersistResult::Failed(format!("Could not persist signed transfer: {e}"))
+            match cleaned {
+                Ok(_) => {
+                    SendPersistResult::Failed(format!("Could not persist signed transfer: {e}"))
+                }
+                Err(_) => SendPersistResult::Failed(format!(
+                    "Could not persist signed transfer, and could not clean up the pending \
+                     record: {e} — restart silo to reconcile before sending from this wallet again"
+                )),
+            }
         }
     }
 }
@@ -1482,6 +1490,80 @@ mod tests {
             )
             .unwrap();
         (Storage::new(db), sub.id)
+    }
+
+    #[test]
+    fn persist_signed_send_reports_wedged_wallet_when_cleanup_also_fails() {
+        let s = test_seed();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("silo.db");
+        let mut db = crate::db::Db::open(&path).unwrap();
+        db.unlock_audit_key(&[7u8; 32]).unwrap();
+        db.insert_wallet(
+            0,
+            crate::types::Role::Master,
+            &crate::crypto::derive_address(&s, 0),
+            None,
+        )
+        .unwrap();
+        let sub = db
+            .insert_wallet(
+                1,
+                crate::types::Role::Sub,
+                &crate::crypto::derive_address(&s, 1),
+                None,
+            )
+            .unwrap();
+        let sub_id = sub.id;
+
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER block_intent_updates BEFORE UPDATE ON tx_intents \
+                 BEGIN SELECT RAISE(ABORT, 'tx_intents writes blocked for test'); END;",
+            )
+            .unwrap();
+        }
+
+        let storage = Storage::new(db);
+        let pending = crate::app::PendingSend {
+            from_id: sub_id,
+            to: crate::crypto::derive_address(&s, 2),
+            lamports: 1_000,
+            blockhash: "11111111111111111111111111111111".to_string(),
+            lvbh: 100,
+            fee: 5_000,
+            dest_balance: 0,
+            priority_micro: 0,
+            prepared_at: std::time::Instant::now(),
+        };
+
+        let result = persist_signed_send_blocking(
+            storage.clone(),
+            pending,
+            sub,
+            vec![1, 2, 3, 4],
+            "sig11111111111111111111111111111111".to_string(),
+        );
+
+        let SendPersistResult::Failed(msg) = result else {
+            panic!("expected SendPersistResult::Failed, got {result:?}");
+        };
+        assert!(
+            msg.contains("restart silo to reconcile"),
+            "a wedged wallet (both writes failed) must tell the user to restart to reconcile, got: {msg}"
+        );
+
+        let blocked = storage.with_mut(|d| {
+            d.create_intent(sub_id, &crate::crypto::derive_address(&s, 2), 1_000, None)
+        });
+        assert!(
+            matches!(
+                blocked,
+                Err(crate::db::CreateIntentError::WalletHasOpenIntent)
+            ),
+            "the orphaned 'created' intent must keep blocking new sends from the wallet"
+        );
     }
 
     fn worker_deps() -> (Arc<Mutex<Rpc>>, Arc<PriceCache>, reqwest::Client) {
