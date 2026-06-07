@@ -138,8 +138,8 @@ Each profile stores its vault and database under `<config>/profiles/<id>/`.
 ## Testing
 
 ```sh
-cargo test                  # 74 unit tests
-cargo test -- --ignored     # 2 live tests (hit the network: price APIs + devnet RPC)
+cargo test
+cargo test -- --ignored     # live tests hit price APIs and devnet RPC
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
