@@ -110,9 +110,17 @@ cargo build --release --locked
 
 `silo` needs a TTY — run it in a real terminal.
 
-- **First run** opens a setup wizard that creates your first profile ("Wallet 1") — generate a new
-  mnemonic or import an existing one, then confirm the phrase word-by-word.
+- **First run** opens a setup wizard that creates your first profile ("Wallet 1"). Choose create or import, record the generated recovery phrase or enter your existing one, confirm the generated phrase word-by-word if creating, choose and confirm a vault passphrase, then unlock and use the wallet.
 - **Later runs** open the profile picker.
+
+Before funding a wallet:
+
+- Make sure your recovery phrase is written down, stored offline, and never shared.
+- Make sure you know your vault passphrase and do not share it.
+- Check that you can unlock the vault and that the receive address is correct.
+- Send a small test amount first when using a new address or setup.
+
+silo cannot recover lost recovery phrases or forgotten vault passphrases. The vault passphrase encrypts the recovery phrase on disk; use a strong, non-empty passphrase. The app allows an empty passphrase only after an explicit warning and confirmation, because anyone with access to your files could read the recovery phrase. For support, never include recovery phrases, passphrases, private keys, tokens, or live wallet secrets in issues, logs, screenshots, or diagnostics; see [Support and bug reports](#support-and-bug-reports) and [SECURITY.md](SECURITY.md).
 
 Configuration lives in your platform config directory, overridable with `SILO_CONFIG_DIR`:
 
