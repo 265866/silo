@@ -583,7 +583,7 @@ fn toggle_send_denom(app: &mut App) {
     match (app.input.send_in_fiat, lamports, app.price_now()) {
         (true, Some(l), Some(p)) => {
             let fiat = crate::money::lamports_to_sol(l) * p.value;
-            app.input.send_amount = format!("{fiat:.2}");
+            app.input.send_amount = format!("{fiat:.*}", p.currency.decimals());
         }
         (false, Some(l), _) => {
             app.input.send_amount = crate::money::format_lamports(l);

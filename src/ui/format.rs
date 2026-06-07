@@ -15,7 +15,11 @@ pub fn fmt_usd(price: Option<SolPrice>, lamports: u64) -> String {
     match price {
         Some(p) => {
             let value = lamports_to_sol(lamports) * p.value;
-            format!("{}{}", p.currency.symbol(), with_commas_f2(value))
+            format!(
+                "{}{}",
+                p.currency.symbol(),
+                with_commas_decimals(value, p.currency.decimals())
+            )
         }
         None => "—".to_string(),
     }
@@ -24,12 +28,16 @@ pub fn fmt_usd(price: Option<SolPrice>, lamports: u64) -> String {
 pub fn fmt_price(price: Option<SolPrice>) -> String {
     match price {
         Some(p) if p.is_stale() => format!(
-            "SOL {}{:.2} (stale {}m)",
+            "SOL {}{} (stale {}m)",
             p.currency.symbol(),
-            p.value,
+            with_commas_decimals(p.value, p.currency.decimals()),
             p.age_secs() / 60
         ),
-        Some(p) => format!("SOL {}{:.2}", p.currency.symbol(), p.value),
+        Some(p) => format!(
+            "SOL {}{}",
+            p.currency.symbol(),
+            with_commas_decimals(p.value, p.currency.decimals())
+        ),
         None => "SOL —".to_string(),
     }
 }
@@ -160,12 +168,16 @@ fn with_commas(n: u64) -> String {
     out
 }
 
-fn with_commas_f2(v: f64) -> String {
+fn with_commas_decimals(v: f64, decimals: usize) -> String {
     let v = if v < 0.0 { 0.0 } else { v };
-    let cents = (v * 100.0).round() as u128;
-    let whole = (cents / 100) as u64;
-    let frac = (cents % 100) as u64;
-    format!("{}.{:02}", with_commas(whole), frac)
+    if decimals == 0 {
+        return with_commas(v.round() as u64);
+    }
+    let scale = 10u128.pow(decimals as u32);
+    let scaled = (v * scale as f64).round() as u128;
+    let whole = (scaled / scale) as u64;
+    let frac = (scaled % scale) as u64;
+    format!("{}.{:0width$}", with_commas(whole), frac, width = decimals)
 }
 
 #[cfg(test)]
@@ -208,6 +220,40 @@ mod tests {
             source: crate::price::PriceSource::CoinGecko,
         };
         assert_eq!(fmt_usd(Some(eur), LAMPORTS_PER_SOL), "€100.00");
+    }
+
+    #[test]
+    fn zero_decimal_currencies_render_without_minor_units() {
+        let now = crate::db::now_ms() as u64 / 1000;
+        let jpy = SolPrice {
+            value: 21000.0,
+            currency: crate::types::Currency::Jpy,
+            fetched_at: now,
+            source: crate::price::PriceSource::CoinGecko,
+        };
+        assert_eq!(fmt_usd(Some(jpy), 124_500_000_000), "¥2,614,500");
+        assert_eq!(fmt_price(Some(jpy)), "SOL ¥21,000");
+
+        let cny = SolPrice {
+            value: 7000.0,
+            currency: crate::types::Currency::Cny,
+            fetched_at: now,
+            source: crate::price::PriceSource::CoinGecko,
+        };
+        assert_eq!(fmt_usd(Some(cny), 124_500_000_000), "CN¥871,500");
+        assert_eq!(fmt_price(Some(cny)), "SOL CN¥7,000");
+    }
+
+    #[test]
+    fn fmt_price_two_decimal_currencies_keep_minor_units() {
+        let now = crate::db::now_ms() as u64 / 1000;
+        let usd = SolPrice {
+            value: 21000.0,
+            currency: crate::types::Currency::Usd,
+            fetched_at: now,
+            source: crate::price::PriceSource::CoinGecko,
+        };
+        assert_eq!(fmt_price(Some(usd)), "SOL $21,000.00");
     }
 
     #[test]

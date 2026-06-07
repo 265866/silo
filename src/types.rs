@@ -86,6 +86,13 @@ impl Currency {
         }
     }
 
+    pub fn decimals(&self) -> usize {
+        match self {
+            Currency::Jpy | Currency::Cny => 0,
+            _ => 2,
+        }
+    }
+
     pub fn from_code(s: &str) -> Option<Self> {
         Currency::ALL.into_iter().find(|c| c.code() == s)
     }
