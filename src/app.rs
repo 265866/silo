@@ -503,7 +503,7 @@ impl App {
 
         let id = crate::profiles::new_id();
         let dir = crate::profiles::dir_for(&self.config_dir, &id);
-        if let Err(e) = std::fs::create_dir_all(&dir) {
+        if let Err(e) = crate::profiles::ensure_private_dir(&dir) {
             self.toast_err(format!("could not create profile dir: {e}"));
             return;
         }

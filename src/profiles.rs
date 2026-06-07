@@ -26,6 +26,17 @@ pub fn vault_path(config_dir: &Path, id: &str) -> PathBuf {
     dir_for(config_dir, id).join("vault.json")
 }
 
+pub fn ensure_private_dir(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("setting private permissions on {}", path.display()))?;
+    }
+    Ok(())
+}
+
 pub fn new_id() -> String {
     let mut b = [0u8; 8];
     crate::crypto::random_bytes(&mut b);
@@ -132,5 +143,17 @@ mod tests {
         remove(cfg, &id).unwrap();
         assert!(load(cfg).is_empty());
         assert!(!dir_for(cfg, &id).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_dir_mode_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles").join("abc");
+        ensure_private_dir(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
     }
 }

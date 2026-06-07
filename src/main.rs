@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
     clipboard::maybe_run_clip_daemon();
 
     let dir = config_dir();
-    std::fs::create_dir_all(&dir)?;
+    silo::profiles::ensure_private_dir(&dir)?;
 
     let _instance_lock = acquire_single_instance(&dir)?;
 
@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
         profiles[0].id.clone()
     };
     let profile_dir = silo::profiles::dir_for(&dir, &active_id);
-    std::fs::create_dir_all(&profile_dir)?;
+    silo::profiles::ensure_private_dir(&profile_dir)?;
 
     let db = Db::open(&profile_dir.join("silo.db"))?;
     let rpc_url = db

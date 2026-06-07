@@ -1,4 +1,4 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -188,7 +188,15 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     let tmp_path = dir.join(format!(".{file_name}.tmp"));
 
     {
-        let mut tmp = File::create(&tmp_path)
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut tmp = opts
+            .open(&tmp_path)
             .with_context(|| format!("creating temp file {}", tmp_path.display()))?;
         tmp.write_all(data)?;
         tmp.sync_all()?;
@@ -291,5 +299,19 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&vault).unwrap()).unwrap();
 
         assert!(unlock_vault(&path, "pw").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_file_mode_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.json");
+        let mnemonic = generate_mnemonic(WordCount::Twelve).unwrap();
+        create_vault(&path, &mnemonic, "pw").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }
