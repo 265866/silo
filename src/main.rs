@@ -1,7 +1,6 @@
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use futures_util::StreamExt;
 use ratatui::crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, EventStream};
 use ratatui::crossterm::execute;
@@ -18,10 +17,10 @@ use silo::{clipboard, input, ui, worker};
 async fn main() -> Result<()> {
     clipboard::maybe_run_clip_daemon();
 
-    let dir = config_dir();
+    let dir = silo::platform::config_dir();
     std::fs::create_dir_all(&dir)?;
 
-    let _instance_lock = acquire_single_instance(&dir)?;
+    let _instance_lock = silo::platform::acquire_single_instance(&dir)?;
 
     let profiles = silo::profiles::load(&dir);
     silo::profiles::cleanup_orphans(&dir, &profiles);
@@ -156,47 +155,4 @@ async fn run(
     app.input.zeroize_secrets();
     app.setup.mnemonic_words.zeroize();
     Ok(())
-}
-
-fn acquire_single_instance(dir: &Path) -> Result<std::fs::File> {
-    let path = dir.join("silo.lock");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => {
-            bail!("another silo instance is already running")
-        }
-        Err(std::fs::TryLockError::Error(e)) => {
-            Err(e).with_context(|| format!("acquiring single-instance lock at {}", path.display()))
-        }
-    }
-}
-
-fn config_dir() -> PathBuf {
-    if let Ok(x) = std::env::var("SILO_CONFIG_DIR") {
-        return PathBuf::from(x);
-    }
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(h) = std::env::var("HOME") {
-            return PathBuf::from(h).join("Library/Application Support/silo");
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(a) = std::env::var("APPDATA") {
-            return PathBuf::from(a).join("silo");
-        }
-    }
-    if let Ok(x) = std::env::var("XDG_CONFIG_HOME") {
-        return PathBuf::from(x).join("silo");
-    }
-    if let Ok(h) = std::env::var("HOME") {
-        return PathBuf::from(h).join(".config/silo");
-    }
-    PathBuf::from(".silo")
 }

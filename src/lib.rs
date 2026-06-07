@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod db;
 pub mod input;
 pub mod money;
+pub mod platform;
 pub mod price;
 pub mod profiles;
 pub mod solana;
