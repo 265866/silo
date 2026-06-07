@@ -18,8 +18,8 @@ const SALT_LEN: usize = 16;
 const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 24;
 
-const ARGON2_M_COST: u32 = 19_456;
-const ARGON2_T_COST: u32 = 2;
+const ARGON2_M_COST: u32 = 65_536;
+const ARGON2_T_COST: u32 = 3;
 const ARGON2_P_COST: u32 = 1;
 
 const ARGON2_M_COST_MAX: u32 = 1 << 21;
@@ -323,6 +323,65 @@ mod tests {
         assert!(vault_exists(&path));
 
         let recovered = unlock_vault(&path, "correct horse battery staple").unwrap();
+        assert_eq!(recovered.to_string(), mnemonic.to_string());
+    }
+
+    #[test]
+    fn create_time_params_meet_cold_storage_floor() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.json");
+        let mnemonic = generate_mnemonic(WordCount::Twelve).unwrap();
+        create_vault(&path, &mnemonic, "pw").unwrap();
+
+        let vault: VaultFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(
+            vault.m_cost >= 65_536,
+            "cold-storage vault must seal with at least 64 MiB of memory, got {}",
+            vault.m_cost
+        );
+        assert!(
+            vault.t_cost >= 2,
+            "cold-storage vault must seal with at least 2 passes, got {}",
+            vault.t_cost
+        );
+        assert!(vault.m_cost <= ARGON2_M_COST_MAX);
+        assert!(vault.t_cost <= ARGON2_T_COST_MAX);
+        assert!(vault.p_cost <= ARGON2_P_COST_MAX);
+    }
+
+    #[test]
+    fn legacy_param_vault_still_unlocks() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.json");
+        let mnemonic = generate_mnemonic(WordCount::Twelve).unwrap();
+
+        let legacy_m = 19_456;
+        let legacy_t = 2;
+        let legacy_p = 1;
+        let mut salt = [0u8; SALT_LEN];
+        crate::crypto::random_bytes(&mut salt);
+        let key = derive_key("legacy-pw", &salt, legacy_m, legacy_t, legacy_p).unwrap();
+        let cipher = XChaCha20Poly1305::new_from_slice(&*key).unwrap();
+        let nonce_bytes = [9u8; NONCE_LEN];
+        let nonce = XNonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher
+            .encrypt(nonce, mnemonic.to_string().as_bytes())
+            .unwrap();
+
+        let vault = VaultFile {
+            magic: MAGIC.to_string(),
+            version: VERSION,
+            kdf: "argon2id".to_string(),
+            m_cost: legacy_m,
+            t_cost: legacy_t,
+            p_cost: legacy_p,
+            salt_b58: bs58::encode(salt).into_string(),
+            nonce_b58: bs58::encode(nonce_bytes).into_string(),
+            ciphertext_b58: bs58::encode(&ciphertext).into_string(),
+        };
+        fs::write(&path, serde_json::to_vec(&vault).unwrap()).unwrap();
+
+        let recovered = unlock_vault(&path, "legacy-pw").unwrap();
         assert_eq!(recovered.to_string(), mnemonic.to_string());
     }
 
