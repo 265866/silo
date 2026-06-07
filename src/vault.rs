@@ -299,7 +299,17 @@ fn replace_atomic(tmp_path: &Path, path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::crypto::{WordCount, generate_mnemonic};
+    use proptest::prelude::*;
     use tempfile::tempdir;
+
+    const PROPTEST_CASES: u32 = 48;
+
+    fn fast_config() -> ProptestConfig {
+        ProptestConfig {
+            cases: PROPTEST_CASES,
+            ..ProptestConfig::default()
+        }
+    }
 
     #[test]
     fn create_then_unlock_roundtrip() {
@@ -431,5 +441,43 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&vault).unwrap()).unwrap();
 
         assert!(unlock_vault(&path, "pw").is_err());
+    }
+
+    proptest! {
+        #![proptest_config(fast_config())]
+
+        #[test]
+        fn malformed_vault_decoding_never_unlocks(
+            salt in prop::collection::vec(any::<u8>(), 0..40),
+            nonce in prop::collection::vec(any::<u8>(), 0..48),
+            ciphertext in prop::collection::vec(any::<u8>(), 0..64),
+            mutation in 0u8..7,
+        ) {
+            prop_assume!(salt.len() != SALT_LEN || nonce.len() != NONCE_LEN || mutation != 0);
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("vault.json");
+            let mut vault = VaultFile {
+                magic: MAGIC.to_string(),
+                version: VERSION,
+                kdf: "argon2id".to_string(),
+                m_cost: 8,
+                t_cost: 1,
+                p_cost: 1,
+                salt_b58: bs58::encode(&salt).into_string(),
+                nonce_b58: bs58::encode(&nonce).into_string(),
+                ciphertext_b58: bs58::encode(&ciphertext).into_string(),
+            };
+            match mutation {
+                1 => vault.magic = "not-silo".to_string(),
+                2 => vault.version = VERSION + 1,
+                3 => vault.m_cost = ARGON2_M_COST_MAX + 1,
+                4 => vault.t_cost = ARGON2_T_COST_MAX + 1,
+                5 => vault.salt_b58 = "0".to_string(),
+                6 => vault.nonce_b58 = "0".to_string(),
+                _ => {}
+            }
+            fs::write(&path, serde_json::to_vec(&vault).unwrap()).unwrap();
+            prop_assert!(unlock_vault(&path, "pw").is_err());
+        }
     }
 }

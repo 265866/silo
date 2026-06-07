@@ -166,6 +166,17 @@ pub fn signature_to_base58(sig: &[u8; 64]) -> String {
 mod tests {
     use super::*;
     use crate::crypto::{derive_signing_key, parse_mnemonic, seed_from_mnemonic};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use proptest::prelude::*;
+
+    const PROPTEST_CASES: u32 = 96;
+
+    fn fast_config() -> ProptestConfig {
+        ProptestConfig {
+            cases: PROPTEST_CASES,
+            ..ProptestConfig::default()
+        }
+    }
 
     const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
@@ -327,5 +338,54 @@ mod tests {
         let solana_sig = solana_secret.sign(&msg).to_bytes();
 
         assert_eq!(our_sig, solana_sig, "signature must match Solana's keypair");
+    }
+
+    proptest! {
+        #![proptest_config(fast_config())]
+
+        #[test]
+        fn compact_u16_roundtrips_against_decoder(v in any::<u16>()) {
+            let mut out = Vec::new();
+            write_compact_u16(&mut out, v);
+            let mut decoded = 0u32;
+            let mut shift = 0;
+            for (idx, byte) in out.iter().copied().enumerate() {
+                decoded |= ((byte & 0x7f) as u32) << shift;
+                if byte & 0x80 == 0 {
+                    prop_assert_eq!(idx + 1, out.len());
+                }
+                shift += 7;
+            }
+            prop_assert_eq!(decoded, v as u32);
+            prop_assert!(out.len() <= 3);
+            prop_assert_eq!(out.last().map(|b| b & 0x80), Some(0));
+        }
+
+        #[test]
+        fn base64_matches_reference(bytes in prop::collection::vec(any::<u8>(), 0..192)) {
+            prop_assert_eq!(base64_encode(&bytes), STANDARD.encode(&bytes));
+        }
+
+        #[test]
+        fn transfer_message_matches_official_solana(from in any::<[u8; 32]>(), to in any::<[u8; 32]>(), bh in any::<[u8; 32]>(), lamports in any::<u64>()) {
+            use solana_address::Address;
+            use solana_hash::Hash;
+            use solana_message::legacy::Message;
+            use solana_system_interface::instruction::transfer;
+
+            let ours = build_transfer_message(&from, &to, lamports, &bh, None);
+            let ix = transfer(
+                &Address::new_from_array(from),
+                &Address::new_from_array(to),
+                lamports,
+            );
+            let theirs = Message::new_with_blockhash(
+                &[ix],
+                Some(&Address::new_from_array(from)),
+                &Hash::new_from_array(bh),
+            )
+            .serialize();
+            prop_assert_eq!(ours, theirs);
+        }
     }
 }

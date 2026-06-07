@@ -48,6 +48,8 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+base64 = "0.22.1"
+proptest = "1.9.0"
 solana-address = "2.6"
 solana-compute-budget-interface = "3"
 solana-derivation-path = "3.0.0"

@@ -203,6 +203,16 @@ pub fn max_send_drain(src_balance: u64, fee: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    const PROPTEST_CASES: u32 = 128;
+
+    fn fast_config() -> ProptestConfig {
+        ProptestConfig {
+            cases: PROPTEST_CASES,
+            ..ProptestConfig::default()
+        }
+    }
 
     #[test]
     fn parse_basic() {
@@ -295,5 +305,50 @@ mod tests {
         );
         assert_eq!(max_send_drain(1_000_000, 5_000), Some(995_000));
         assert_eq!(max_send_drain(4_000, 5_000), None);
+    }
+
+    proptest! {
+        #![proptest_config(fast_config())]
+
+        #[test]
+        fn formatted_lamports_roundtrip(lamports in any::<u64>()) {
+            let formatted = format_lamports(lamports);
+            prop_assert_eq!(parse_sol_to_lamports(&formatted), Ok(lamports));
+            prop_assert!(!formatted.ends_with('.'));
+            prop_assert!(!formatted.contains(".000000000"));
+        }
+
+        #[test]
+        fn exact_decimal_lamports_parse(whole in 0u64..=18_446_744_073, frac in 0u64..LAMPORTS_PER_SOL) {
+            let Some(expected) = whole
+                .checked_mul(LAMPORTS_PER_SOL)
+                .and_then(|v| v.checked_add(frac)) else {
+                    return Ok(());
+                };
+            let amount = if frac == 0 {
+                whole.to_string()
+            } else {
+                let frac = format!("{frac:09}");
+                format!("{whole}.{}", frac.trim_end_matches('0'))
+            };
+            prop_assert_eq!(parse_sol_to_lamports(&amount), Ok(expected));
+        }
+
+        #[test]
+        fn fiat_conversion_matches_integer_rounding(cents in 0u64..=1_000_000_000, price_cents in 1u64..=1_000_000_000) {
+            let fiat = format!("{}.{:02}", cents / 100, cents % 100);
+            let price = price_cents as f64 / 100.0;
+            let expected = ((cents as u128) * (LAMPORTS_PER_SOL as u128) + (price_cents as u128 / 2)) / price_cents as u128;
+            prop_assert_eq!(fiat_to_lamports(&fiat, price), u64::try_from(expected).map_err(|_| AmountError::Overflow));
+        }
+
+        #[test]
+        fn priority_fee_is_ceil_saturating_product(price in any::<u64>()) {
+            let expected = (COMPUTE_UNIT_LIMIT as u64)
+                .saturating_mul(price)
+                .div_ceil(MICRO_LAMPORTS_PER_LAMPORT);
+            prop_assert_eq!(priority_fee_lamports(price), expected);
+            prop_assert_eq!(total_fee(price), BASE_FEE_PER_SIG.saturating_add(expected));
+        }
     }
 }
