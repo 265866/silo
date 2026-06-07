@@ -355,6 +355,12 @@ impl Db {
             last_hash = Some(row_hash);
         }
         let head = self.get_meta("audit_head_hash")?;
+        if head.is_some() != last_hash.is_some() {
+            return Ok(false);
+        }
+        if last_hash.is_none() && self.master_exists()? {
+            return Ok(false);
+        }
         Ok(head == last_hash)
     }
 }
@@ -609,6 +615,83 @@ mod tests {
         assert!(
             !d.verify_audit_chain().unwrap(),
             "tail truncation must be detected via the head anchor"
+        );
+    }
+
+    #[test]
+    fn audit_chain_fails_on_full_wipe() {
+        let mut d = db();
+        let m = d
+            .insert_wallet(
+                0,
+                Role::Master,
+                "MasterPubkey1111111111111111111111111111111",
+                None,
+            )
+            .unwrap();
+        d.set_label(m.id, Some("one")).unwrap();
+        assert!(d.verify_audit_chain().unwrap());
+
+        d.conn.execute("DELETE FROM audit_log", []).unwrap();
+        d.conn
+            .execute("DELETE FROM meta WHERE key='audit_head_hash'", [])
+            .unwrap();
+        assert!(
+            !d.verify_audit_chain().unwrap(),
+            "a full wipe of an initialized vault must not verify as intact"
+        );
+    }
+
+    #[test]
+    fn audit_chain_fails_when_rows_gone_but_head_remains() {
+        let mut d = db();
+        let m = d
+            .insert_wallet(
+                0,
+                Role::Master,
+                "MasterPubkey1111111111111111111111111111111",
+                None,
+            )
+            .unwrap();
+        d.set_label(m.id, Some("one")).unwrap();
+        assert!(d.verify_audit_chain().unwrap());
+
+        d.conn.execute("DELETE FROM audit_log", []).unwrap();
+        assert!(
+            !d.verify_audit_chain().unwrap(),
+            "empty log with a surviving head anchor must fail"
+        );
+    }
+
+    #[test]
+    fn audit_chain_fails_when_head_gone_but_rows_remain() {
+        let mut d = db();
+        let m = d
+            .insert_wallet(
+                0,
+                Role::Master,
+                "MasterPubkey1111111111111111111111111111111",
+                None,
+            )
+            .unwrap();
+        d.set_label(m.id, Some("one")).unwrap();
+        assert!(d.verify_audit_chain().unwrap());
+
+        d.conn
+            .execute("DELETE FROM meta WHERE key='audit_head_hash'", [])
+            .unwrap();
+        assert!(
+            !d.verify_audit_chain().unwrap(),
+            "surviving rows with no head anchor must fail"
+        );
+    }
+
+    #[test]
+    fn audit_chain_empty_uninitialized_vault_verifies() {
+        let d = db();
+        assert!(
+            d.verify_audit_chain().unwrap(),
+            "a fresh vault with no master and no audit log is intact"
         );
     }
 
