@@ -1998,4 +1998,70 @@ mod tests {
             "auto-refresh must enqueue a RefreshBalances command"
         );
     }
+
+    #[test]
+    fn send_prepared_off_send_route_is_dropped() {
+        let mut h = harness(true);
+        h.app.route = Route::WalletList;
+        h.app.modal = None;
+        h.app.pending_send = None;
+        let generation = h.app.generation.load(Ordering::SeqCst);
+        let from_id = h.app.wallets[0].id;
+        h.app.apply_app_event(AppEvent::SendPrepared {
+            from_id,
+            to: crypto::derive_address(
+                &crypto::seed_from_mnemonic(&crypto::parse_mnemonic(TEST_MNEMONIC).unwrap()),
+                1,
+            ),
+            lamports: 1_234_567,
+            blockhash: bs58::encode([3u8; 32]).into_string(),
+            lvbh: 99_999,
+            fee: 7_500,
+            dest_balance: 0,
+            priority_micro: 0,
+            generation,
+        });
+        assert!(
+            h.app.modal.is_none(),
+            "a confirm modal must not open once the user has left the Send screen"
+        );
+        assert!(
+            h.app.pending_send.is_none(),
+            "a stale SendPrepared off the Send route must not populate pending_send"
+        );
+    }
+
+    #[test]
+    fn send_prepared_on_send_route_opens_confirm_modal() {
+        let mut h = harness(true);
+        h.app.route = Route::Send;
+        h.app.modal = None;
+        h.app.pending_send = None;
+        h.app.reconcile_done = true;
+        h.app.wallets[0].balance_lamports = Some(1_234_567 + 7_500);
+        let generation = h.app.generation.load(Ordering::SeqCst);
+        let from_id = h.app.wallets[0].id;
+        h.app.apply_app_event(AppEvent::SendPrepared {
+            from_id,
+            to: crypto::derive_address(
+                &crypto::seed_from_mnemonic(&crypto::parse_mnemonic(TEST_MNEMONIC).unwrap()),
+                1,
+            ),
+            lamports: 1_234_567,
+            blockhash: bs58::encode([3u8; 32]).into_string(),
+            lvbh: 99_999,
+            fee: 7_500,
+            dest_balance: 0,
+            priority_micro: 0,
+            generation,
+        });
+        assert!(
+            matches!(h.app.modal, Some(Modal::ConfirmSend)),
+            "a SendPrepared on the Send route must open the confirm modal"
+        );
+        assert!(
+            h.app.pending_send.is_some(),
+            "a SendPrepared on the Send route must populate pending_send"
+        );
+    }
 }
