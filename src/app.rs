@@ -612,6 +612,7 @@ pub struct App {
     pub(crate) price_flash: f32,
     pub(crate) price_up: bool,
     last_price: Option<f64>,
+    needs_redraw: bool,
 }
 
 impl App {
@@ -688,6 +689,7 @@ impl App {
             price_flash: 0.0,
             price_up: true,
             last_price: None,
+            needs_redraw: true,
         }
     }
 
@@ -1028,7 +1030,8 @@ impl App {
         self.toast(t, ToastKind::Error);
     }
 
-    pub fn tick(&mut self) {
+    pub fn tick(&mut self) -> bool {
+        let was_active = self.animations_active();
         self.spinner_frame = (self.spinner_frame + 1) % SPINNER.len();
         self.frame = self.frame.wrapping_add(1);
         let now = Instant::now();
@@ -1039,6 +1042,52 @@ impl App {
         if self.price_flash > 0.0 {
             self.price_flash = (self.price_flash - PRICE_FLASH_DECAY).max(0.0);
         }
+        was_active || self.animations_active()
+    }
+
+    pub fn request_redraw(&mut self) {
+        self.needs_redraw = true;
+    }
+
+    pub fn take_redraw(&mut self) -> bool {
+        std::mem::take(&mut self.needs_redraw)
+    }
+
+    pub fn animations_active(&self) -> bool {
+        if !self.confetti.is_empty() {
+            return true;
+        }
+        if self.price_flash > 0.0 {
+            return true;
+        }
+        if !self.toasts.is_empty() {
+            return true;
+        }
+        if self.inflight > 0 {
+            return true;
+        }
+        if self.seed.is_some() && (!self.reconcile_done || !self.balances_settled()) {
+            return true;
+        }
+        false
+    }
+
+    pub fn anim_frame(&self) -> u64 {
+        if self.animations_active() {
+            self.frame
+        } else {
+            0
+        }
+    }
+
+    fn balances_settled(&self) -> bool {
+        self.wallets.iter().all(|w| match w.balance_lamports {
+            Some(target) => self
+                .anim_balance
+                .get(&w.id)
+                .is_some_and(|cur| (target as f64 - cur).abs() < 1.0),
+            None => true,
+        })
     }
 
     pub fn send_fee(&self) -> u64 {
@@ -1108,19 +1157,25 @@ impl App {
             .retain(|p| p.life > 0.0 && p.y < CONFETTI_FIELD_H);
     }
 
-    fn animate_balances(&mut self) {
+    fn animate_balances(&mut self) -> bool {
+        let mut changed = false;
         for w in &self.wallets {
             if let Some(target) = w.balance_lamports {
                 let cur = self.anim_balance.entry(w.id).or_insert(0.0);
                 let t = target as f64;
                 let diff = t - *cur;
                 if diff.abs() < 1.0 {
-                    *cur = t;
+                    if *cur != t {
+                        *cur = t;
+                        changed = true;
+                    }
                 } else {
                     *cur += diff * BALANCE_EASE;
+                    changed = true;
                 }
             }
         }
+        changed
     }
 
     pub fn shown_balance(&self, w: &WalletRow) -> Option<u64> {
@@ -2080,6 +2135,126 @@ mod tests {
         assert!(
             app.toasts.is_empty(),
             "stale events must not surface any toast"
+        );
+    }
+
+    fn idle_unlocked_app() -> (App, i64) {
+        let (mut app, _pubkey, wallet_id) = stale_event_app();
+        let seed = crate::crypto::seed_from_mnemonic(
+            &crate::crypto::parse_mnemonic(TEST_MNEMONIC).unwrap(),
+        );
+        app.seed = Some(seed);
+        app.reconcile_done = true;
+        app.net_status = NetStatus::Online;
+        app.inflight = 0;
+        app.price_flash = 0.0;
+        app.toasts.clear();
+        app.confetti.clear();
+        (app, wallet_id)
+    }
+
+    #[test]
+    fn animations_active_reflects_pending_visual_work() {
+        let (mut app, wallet_id) = idle_unlocked_app();
+        assert!(
+            !app.animations_active(),
+            "a settled, unlocked, online app must report no animation work"
+        );
+
+        app.toast_info("hello");
+        assert!(
+            app.animations_active(),
+            "a live toast keeps animations active"
+        );
+        app.toasts.clear();
+
+        app.celebrate(0.0, 0.0);
+        assert!(app.animations_active(), "confetti keeps animations active");
+        app.confetti.clear();
+
+        app.price_flash = 1.0;
+        assert!(
+            app.animations_active(),
+            "a price flash keeps animations active"
+        );
+        app.price_flash = 0.0;
+
+        app.inflight = 1;
+        assert!(
+            app.animations_active(),
+            "in-flight work keeps animations active"
+        );
+        app.inflight = 0;
+
+        app.reconcile_done = false;
+        assert!(
+            app.animations_active(),
+            "an unfinished reconcile keeps animations active"
+        );
+        app.reconcile_done = true;
+
+        app.wallets[0].balance_lamports = Some(5_000_000);
+        app.anim_balance.insert(wallet_id, 0.0);
+        assert!(
+            app.animations_active(),
+            "a balance still easing toward its target keeps animations active"
+        );
+
+        app.seed = None;
+        assert!(
+            !app.animations_active(),
+            "a locked screen must idle even with stale wallet balances"
+        );
+    }
+
+    #[test]
+    fn animate_balances_reports_no_change_once_converged() {
+        let (mut app, wallet_id) = idle_unlocked_app();
+        app.wallets[0].balance_lamports = Some(3_000_000);
+        app.anim_balance.clear();
+
+        let mut steps = 0;
+        while app.animate_balances() {
+            steps += 1;
+            assert!(steps < 100_000, "balance easing never converged");
+        }
+        assert!(
+            steps > 0,
+            "easing a non-zero balance from zero must take at least one step"
+        );
+        assert_eq!(app.anim_balance.get(&wallet_id).copied(), Some(3_000_000.0));
+        assert!(
+            !app.animate_balances(),
+            "a converged balance reports no change"
+        );
+        assert!(
+            app.balances_settled(),
+            "convergence must be observable via balances_settled"
+        );
+    }
+
+    #[test]
+    fn idle_ticks_skip_redraw_while_events_request_exactly_one() {
+        let (mut app, _wallet_id) = idle_unlocked_app();
+        app.take_redraw();
+
+        let mut draws = 0;
+        for _ in 0..200 {
+            let redraw = app.tick();
+            if redraw || app.animations_active() {
+                app.request_redraw();
+            }
+            if app.take_redraw() {
+                draws += 1;
+            }
+        }
+        assert_eq!(draws, 0, "a fully idle app must not repaint on idle ticks");
+
+        app.request_redraw();
+        assert!(app.take_redraw(), "an event must trigger a redraw");
+        assert!(
+            !app.take_redraw(),
+            "the redraw flag clears after a single draw"
         );
     }
 
