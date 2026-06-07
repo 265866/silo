@@ -132,8 +132,8 @@ Each profile stores its vault and database under `<config>/profiles/<id>/`.
 | Wallet list | `↑↓` move · `enter` open · `s` send · `M` →master · `F` fund · `n` new sub · `c` copy · `l` label · `t` note · `x` archive · `h` history · `a` audit · `g` settings · `r` refresh · `^L` lock · `q` quit |
 | Wallet detail | `s` send · `M` →master · `F` fund · `c` copy · `h` history · `esc` back |
 | Send | `tab` next field · `c` SOL/fiat · `m` max · `a` all · `enter` review · `^V` paste · `esc` cancel |
-| History | `↑↓` scroll · `t` note · `esc` back |
-| Settings | `e` edit RPC · `u` currency · `+/-` auto-lock · `L` lock now · `esc` back |
+| History | `↑↓` scroll · `c` copy txid · `t` note · `q/esc` back |
+| Settings | `e` edit RPC · `u` currency · `p` priority · `+/-` auto-lock · `L` lock now · `q/esc` back |
 
 ## Testing
 
