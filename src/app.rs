@@ -506,6 +506,7 @@ const CONFETTI_FADE: f32 = 0.022;
 const CONFETTI_BURST: usize = 60;
 const CONFETTI_MAX: usize = 400;
 const CONFETTI_FIELD_H: f32 = 400.0;
+const CONFETTI_GLYPHS: [char; 10] = ['✦', '✧', '★', '*', '•', '◆', '◇', '❄', '✺', '+'];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WalletListRow {
@@ -1022,7 +1023,7 @@ impl App {
     }
 
     pub fn celebrate(&mut self, cx: f32, cy: f32) {
-        const GLYPHS: [char; 10] = ['✦', '✧', '★', '*', '•', '◆', '◇', '❄', '✺', '＋'];
+        const GLYPHS: [char; 10] = CONFETTI_GLYPHS;
         let palette = [
             self.theme.accent,
             self.theme.usd,
@@ -1910,5 +1911,32 @@ impl App {
             }
         }
         self.audit_state.select(None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CONFETTI_GLYPHS;
+
+    #[test]
+    fn confetti_glyphs_are_all_single_width() {
+        for g in CONFETTI_GLYPHS {
+            let cp = g as u32;
+            assert_ne!(
+                cp, 0xFF0B,
+                "fullwidth plus sign re-added to confetti glyphs"
+            );
+            let fullwidth = (0x1100..=0x115F).contains(&cp)
+                || (0x2E80..=0xA4CF).contains(&cp)
+                || (0xAC00..=0xD7A3).contains(&cp)
+                || (0xF900..=0xFAFF).contains(&cp)
+                || (0xFE30..=0xFE4F).contains(&cp)
+                || (0xFF00..=0xFF60).contains(&cp)
+                || (0xFFE0..=0xFFE6).contains(&cp);
+            assert!(
+                !fullwidth,
+                "glyph U+{cp:04X} is in an East-Asian wide range and would overflow one cell"
+            );
+        }
     }
 }
