@@ -46,6 +46,26 @@ async fn send_error(evt: &mpsc::Sender<AppEvent>, generation: u64, message: impl
         .await;
 }
 
+fn definitive_rejection_reason(e: &crate::solana::rpc::RpcError) -> Option<String> {
+    use crate::solana::rpc::RpcError;
+    match e {
+        RpcError::JsonRpc { message, .. } => {
+            Some(format!("transfer rejected by network: {message}"))
+        }
+        RpcError::NonRetryHttp { status, body, .. } => {
+            let body = body.trim();
+            if body.is_empty() {
+                Some(format!("transfer rejected by network: HTTP {status}"))
+            } else {
+                Some(format!(
+                    "transfer rejected by network: HTTP {status}: {body}"
+                ))
+            }
+        }
+        _ => None,
+    }
+}
+
 pub fn build_client() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(concat!("silo/", env!("CARGO_PKG_VERSION")))
@@ -1188,6 +1208,20 @@ async fn broadcast_and_poll(
                 .await;
         }
         Err(e) => {
+            if let Some(reason) = definitive_rejection_reason(&e) {
+                finalize(
+                    &db,
+                    &evt,
+                    intent_id,
+                    &sig,
+                    IntentStatus::Failed,
+                    Some(&reason),
+                    &generation,
+                    cmd_gen,
+                )
+                .await;
+                return;
+            }
             send_error(
                 &evt,
                 cmd_gen,
@@ -1460,6 +1494,83 @@ mod tests {
             Arc::new(PriceCache::default()),
             client,
         )
+    }
+
+    struct RawMockServer {
+        url: String,
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+        _worker: std::thread::JoinHandle<()>,
+    }
+
+    impl RawMockServer {
+        fn new(bodies: Vec<String>) -> Self {
+            use std::collections::VecDeque;
+            use std::io::{Read, Write};
+            use std::net::TcpListener;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let requests_t = requests.clone();
+            let mut responses = VecDeque::from(bodies);
+            let worker = std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { break };
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        let n = stream.read(&mut tmp).unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&buf[..end]);
+                            let len = headers
+                                .lines()
+                                .find_map(|l| {
+                                    let (n, v) = l.split_once(':')?;
+                                    n.eq_ignore_ascii_case("content-length")
+                                        .then(|| v.trim().parse::<usize>().ok())
+                                        .flatten()
+                                })
+                                .unwrap_or(0);
+                            if buf.len().saturating_sub(end + 4) >= len {
+                                break;
+                            }
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&buf);
+                    let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+                        requests_t.lock().unwrap().push(v);
+                    }
+                    let resp_body = responses.pop_front().unwrap_or_else(|| "{}".to_string());
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        resp_body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(resp_body.as_bytes());
+                    if responses.is_empty() {
+                        break;
+                    }
+                }
+            });
+            RawMockServer {
+                url,
+                requests,
+                _worker: worker,
+            }
+        }
+
+        fn methods(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|v| v["method"].as_str().unwrap_or("").to_string())
+                .collect()
+        }
     }
 
     #[tokio::test]
@@ -1813,6 +1924,111 @@ mod tests {
         assert!(
             saw_result,
             "the on-chain confirmation must still reach the UI, not be silently dropped"
+        );
+    }
+
+    #[test]
+    fn definitive_rejections_are_classified_failed_uncertain_errors_are_not() {
+        use crate::solana::rpc::RpcError;
+
+        let jsonrpc = RpcError::JsonRpc {
+            method: "sendTransaction",
+            code: -32002,
+            message: "Transaction simulation failed: insufficient funds".into(),
+        };
+        let reason = definitive_rejection_reason(&jsonrpc).expect("JsonRpc is definitive");
+        assert!(reason.contains("transfer rejected by network"));
+        assert!(reason.contains("insufficient funds"));
+
+        let http4xx = RpcError::NonRetryHttp {
+            method: "sendTransaction",
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: "bad request".into(),
+        };
+        assert!(definitive_rejection_reason(&http4xx).is_some());
+
+        assert!(
+            definitive_rejection_reason(&RpcError::RetryExhaustedHttp {
+                method: "sendTransaction",
+                status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            })
+            .is_none()
+        );
+        assert!(
+            definitive_rejection_reason(&RpcError::MissingResult {
+                method: "sendTransaction"
+            })
+            .is_none()
+        );
+        assert!(
+            definitive_rejection_reason(&RpcError::LengthMismatch {
+                method: "sendTransaction",
+                expected: 1,
+                actual: 0,
+            })
+            .is_none()
+        );
+        let decode = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        assert!(
+            definitive_rejection_reason(&RpcError::Decode {
+                method: "sendTransaction",
+                source: decode,
+            })
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_finalizes_failed_on_preflight_rejection_without_polling() {
+        let (db, sub_id) = storage_with_wallets();
+        let to = crate::crypto::derive_address(&test_seed(), 0);
+        let intent = db
+            .with_mut(|d| d.create_intent(sub_id, &to, 1_000, None))
+            .unwrap();
+        let sig = "Sig1111111111111111111111111111111111111111111";
+        db.with_mut(|d| {
+            d.mark_signed(intent.id, sig, "bh", 1000, 5000, b"wire")
+                .unwrap()
+        });
+        assert!(db.with(|d| d.has_open_intent(sub_id).unwrap()));
+
+        let server = RawMockServer::new(vec![
+            json!({"jsonrpc":"2.0","id":1,"error":{"code":-32002,"message":"Transaction simulation failed: insufficient funds"}})
+                .to_string(),
+        ]);
+        let rpc = Arc::new(Mutex::new(Rpc::new(
+            reqwest::Client::new(),
+            server.url.clone(),
+        )));
+        let (evt_tx, mut evt_rx) = mpsc::channel(8);
+        let generation = Arc::new(AtomicU64::new(0));
+
+        broadcast_and_poll(intent.id, db.clone(), rpc, evt_tx, generation, 0).await;
+
+        let mut failed_reason = None;
+        while let Ok(ev) = evt_rx.try_recv() {
+            if let AppEvent::TransferResult {
+                outcome: TransferOutcome::Failed { reason },
+                ..
+            } = ev
+            {
+                failed_reason = Some(reason);
+            }
+        }
+        let reason = failed_reason.expect("a Failed TransferResult must be emitted");
+        assert!(reason.contains("transfer rejected by network"), "{reason}");
+        assert!(reason.contains("insufficient funds"), "{reason}");
+
+        let got = db.with(|d| d.get_intent(intent.id).unwrap().unwrap());
+        assert_eq!(got.status, IntentStatus::Failed);
+        assert!(
+            !db.with(|d| d.has_open_intent(sub_id).unwrap()),
+            "the source wallet's open-intent guard must be released"
+        );
+        assert_eq!(
+            server.methods(),
+            vec!["sendTransaction".to_string()],
+            "a definitively-rejected transfer must not enter the poll loop"
         );
     }
 
