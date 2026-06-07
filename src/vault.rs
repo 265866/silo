@@ -146,6 +146,9 @@ pub fn unlock_vault_keyed(path: &Path, passphrase: &str) -> Result<(Mnemonic, Va
     let salt = bs58::decode(&vault.salt_b58)
         .into_vec()
         .context("corrupt salt")?;
+    if salt.len() != SALT_LEN {
+        return Err(anyhow!("corrupt salt: expected {SALT_LEN} bytes"));
+    }
     let nonce_bytes = bs58::decode(&vault.nonce_b58)
         .into_vec()
         .context("corrupt nonce")?;
@@ -245,6 +248,40 @@ mod tests {
             unlock_vault(&path, "pw").unwrap().to_string(),
             m1.to_string()
         );
+    }
+
+    #[test]
+    fn corrupt_salt_length_errors_not_panics() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.json");
+        let mnemonic = generate_mnemonic(WordCount::Twelve).unwrap();
+        create_vault(&path, &mnemonic, "pw").unwrap();
+
+        let mut vault: VaultFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut salt = bs58::decode(&vault.salt_b58).into_vec().unwrap();
+        salt.truncate(8);
+        vault.salt_b58 = bs58::encode(salt).into_string();
+        fs::write(&path, serde_json::to_vec(&vault).unwrap()).unwrap();
+
+        let err = unlock_vault(&path, "pw").unwrap_err().to_string();
+        assert!(err.contains("corrupt salt"));
+    }
+
+    #[test]
+    fn oversized_salt_errors_not_panics() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.json");
+        let mnemonic = generate_mnemonic(WordCount::Twelve).unwrap();
+        create_vault(&path, &mnemonic, "pw").unwrap();
+
+        let mut vault: VaultFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut salt = bs58::decode(&vault.salt_b58).into_vec().unwrap();
+        salt.push(1);
+        vault.salt_b58 = bs58::encode(salt).into_string();
+        fs::write(&path, serde_json::to_vec(&vault).unwrap()).unwrap();
+
+        let err = unlock_vault(&path, "pw").unwrap_err().to_string();
+        assert!(err.contains("corrupt salt"));
     }
 
     #[test]
