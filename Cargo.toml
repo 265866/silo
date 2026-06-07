@@ -5,9 +5,13 @@ edition = "2024"
 rust-version = "1.89"
 license = "GPL-3.0-or-later"
 description = "SOL-only Solana wallet manager TUI"
+authors = ["265866 <github@coltons.space>"]
 repository = "https://github.com/265866/silo"
 homepage = "https://github.com/265866/silo"
+documentation = "https://github.com/265866/silo#readme"
 readme = "README.md"
+keywords = ["solana", "wallet", "tui", "terminal", "crypto"]
+categories = ["command-line-utilities", "cryptography::cryptocurrencies"]
 
 [package.metadata.dist]
 dist = true
