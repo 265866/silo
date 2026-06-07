@@ -25,9 +25,40 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
         with:
           command: check advisories licenses bans sources
+      - name: Check bincode advisory exception
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import os
+          import pathlib
+          import sys
+          import tomllib
+
+          advisory = 'RUSTSEC-2025-0141'
+          review_date = datetime.date.fromisoformat('2026-09-01')
+          today = datetime.date.fromisoformat(os.environ.get('BINCODE_ADVISORY_TODAY', datetime.date.today().isoformat()))
+          deny_config = tomllib.loads(pathlib.Path('deny.toml').read_text())
+          ignored_advisories = deny_config.get('advisories', {}).get('ignore', [])
+
+          if advisory in ignored_advisories and today >= review_date:
+              print(f'{advisory} is still ignored after review date {review_date}')
+              sys.exit(1)
+          PY
+          cargo tree --locked -e=no-dev -i bincode >/tmp/bincode-tree.txt 2>&1
+          python3 - <<'PY'
+          import pathlib
+          import sys
+
+          tree = pathlib.Path('/tmp/bincode-tree.txt').read_text()
+          if 'bincode v' in tree:
+              print(tree, end='')
+              print('bincode must not appear in the normal/non-dev dependency graph')
+              sys.exit(1)
+          PY
 
   release-workflow-installer-policy:
     name: release workflow installer policy
