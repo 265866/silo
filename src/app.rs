@@ -301,6 +301,37 @@ pub enum AppEvent {
     },
 }
 
+impl AppEvent {
+    fn generation(&self) -> u64 {
+        match self {
+            AppEvent::ReconcileComplete { generation, .. }
+            | AppEvent::ReconcileFailedOffline { generation, .. }
+            | AppEvent::Balances { generation, .. }
+            | AppEvent::BalancesFailed { generation, .. }
+            | AppEvent::Price { generation, .. }
+            | AppEvent::RentExempt { generation, .. }
+            | AppEvent::SendPrepared { generation, .. }
+            | AppEvent::TransferResult { generation, .. }
+            | AppEvent::SendPersisted { generation, .. }
+            | AppEvent::UnlockComplete { generation, .. }
+            | AppEvent::SetupComplete { generation, .. }
+            | AppEvent::ProfileDeleted { generation, .. }
+            | AppEvent::ProfileOpened { generation, .. }
+            | AppEvent::ClipboardCopied { generation, .. }
+            | AppEvent::ClipboardPasted { generation, .. }
+            | AppEvent::WalletArchived { generation, .. }
+            | AppEvent::SubwalletDerived { generation, .. }
+            | AppEvent::SettingPersisted { generation, .. }
+            | AppEvent::WalletTextSet { generation, .. }
+            | AppEvent::IntentNoteSet { generation, .. }
+            | AppEvent::ProfileRenamed { generation, .. }
+            | AppEvent::RpcChanged { generation, .. }
+            | AppEvent::NetStatus { generation, .. }
+            | AppEvent::Error { generation, .. } => *generation,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PasteTarget {
     SendTo,
@@ -1274,14 +1305,14 @@ impl App {
     }
 
     pub fn apply_app_event(&mut self, ev: AppEvent) {
+        if matches!(ev, AppEvent::SendPrepared { .. } | AppEvent::Error { .. }) {
+            self.preparing_send = false;
+        }
+        if ev.generation() != self.generation.load(Ordering::SeqCst) {
+            return;
+        }
         match ev {
-            AppEvent::ReconcileComplete {
-                resolved,
-                generation,
-            } => {
-                if generation != self.generation.load(Ordering::SeqCst) {
-                    return;
-                }
+            AppEvent::ReconcileComplete { resolved, .. } => {
                 self.reconcile_done = true;
                 if self.net_status == NetStatus::Syncing {
                     self.net_status = NetStatus::Online;
@@ -1291,17 +1322,11 @@ impl App {
                 }
                 self.request_balance_refresh();
             }
-            AppEvent::ReconcileFailedOffline { generation } => {
-                if generation != self.generation.load(Ordering::SeqCst) {
-                    return;
-                }
+            AppEvent::ReconcileFailedOffline { .. } => {
                 self.net_status = NetStatus::Offline;
                 self.toast_err("Offline — reconcile pending, sends disabled");
             }
-            AppEvent::Balances { list, generation } => {
-                if generation != self.generation.load(Ordering::SeqCst) {
-                    return;
-                }
+            AppEvent::Balances { list, .. } => {
                 if self.inflight > 0 {
                     self.inflight -= 1;
                 }
@@ -1324,10 +1349,7 @@ impl App {
                     self.arm_hot_refresh();
                 }
             }
-            AppEvent::BalancesFailed { reason, generation } => {
-                if generation != self.generation.load(Ordering::SeqCst) {
-                    return;
-                }
+            AppEvent::BalancesFailed { reason, .. } => {
                 if self.inflight > 0 {
                     self.inflight -= 1;
                 }
@@ -1336,13 +1358,7 @@ impl App {
                 }
                 self.net_status = NetStatus::Offline;
             }
-            AppEvent::Price {
-                price: p,
-                generation,
-            } => {
-                if generation != self.generation.load(Ordering::SeqCst) {
-                    return;
-                }
+            AppEvent::Price { price: p, .. } => {
                 if let Some(prev) = self.last_price
                     && (p.value - prev).abs() > f64::EPSILON
                 {
@@ -1351,13 +1367,7 @@ impl App {
                 }
                 self.last_price = Some(p.value);
             }
-            AppEvent::RentExempt {
-                lamports,
-                generation,
-            } => {
-                if generation != self.generation.load(Ordering::SeqCst) {
-                    return;
-                }
+            AppEvent::RentExempt { lamports, .. } => {
                 self.rent_exempt_min = lamports;
             }
             AppEvent::SendPrepared {
@@ -1369,11 +1379,9 @@ impl App {
                 fee,
                 dest_balance,
                 priority_micro,
-                generation,
+                ..
             } => {
-                self.preparing_send = false;
-                if generation != self.generation.load(Ordering::SeqCst) || self.route != Route::Send
-                {
+                if self.route != Route::Send {
                     return;
                 }
                 let duplicate = matches!(self.modal, Some(Modal::ConfirmSend))
@@ -1397,13 +1405,8 @@ impl App {
                 self.on_send_prepared();
             }
             AppEvent::TransferResult {
-                intent_id,
-                outcome,
-                generation,
+                intent_id, outcome, ..
             } => {
-                if generation != self.generation.load(Ordering::SeqCst) {
-                    return;
-                }
                 match &outcome {
                     TransferOutcome::Submitted { signature } => {
                         self.toast_info(format!(
@@ -1432,10 +1435,7 @@ impl App {
                 }
                 self.refresh_detail_intents();
             }
-            AppEvent::SendPersisted { result, generation } => {
-                if generation != self.generation.load(Ordering::SeqCst) {
-                    return;
-                }
+            AppEvent::SendPersisted { result, .. } => {
                 self.blocking_input = false;
                 match result {
                     SendPersistResult::Signed { intent_id } => {
@@ -1448,10 +1448,7 @@ impl App {
                     SendPersistResult::Failed(reason) => self.toast_err(reason),
                 }
             }
-            AppEvent::UnlockComplete { result, generation } => {
-                if generation != self.generation.load(Ordering::SeqCst) {
-                    return;
-                }
+            AppEvent::UnlockComplete { result, .. } => {
                 self.blocking_input = false;
                 match result {
                     UnlockResult::Unlocked { seed, wallets } => {
@@ -1501,10 +1498,7 @@ impl App {
                     }
                 }
             }
-            AppEvent::SetupComplete { result, generation } => {
-                if generation != self.generation.load(Ordering::SeqCst) {
-                    return;
-                }
+            AppEvent::SetupComplete { result, .. } => {
                 self.blocking_input = false;
                 match result {
                     SetupResult::Finished {
@@ -1535,10 +1529,7 @@ impl App {
                     SetupResult::Failed(reason) => self.toast_err(reason),
                 }
             }
-            AppEvent::ProfileDeleted { result, generation } => {
-                if generation != self.generation.load(Ordering::SeqCst) {
-                    return;
-                }
+            AppEvent::ProfileDeleted { result, .. } => {
                 self.blocking_input = false;
                 match result {
                     ProfileDeleteResult::Deleted { profiles } => {
@@ -1558,10 +1549,7 @@ impl App {
                     ProfileDeleteResult::Failed(reason) => self.toast_err(reason),
                 }
             }
-            AppEvent::ProfileOpened { result, generation } => {
-                if generation != self.generation.load(Ordering::SeqCst) {
-                    return;
-                }
+            AppEvent::ProfileOpened { result, .. } => {
                 self.blocking_input = false;
                 let payload = match result {
                     Ok(p) => p,
@@ -1619,39 +1607,29 @@ impl App {
                     }
                 }
             }
-            AppEvent::ClipboardCopied { result, generation } => {
-                if generation != self.generation.load(Ordering::SeqCst) {
-                    return;
+            AppEvent::ClipboardCopied { result, .. } => match result.outcome {
+                Ok(crate::clipboard::CopyOutcome::Persistent) => {
+                    self.toast_ok(result.ok_label);
+                    if result.arm_hot_refresh {
+                        self.arm_hot_refresh();
+                    }
                 }
-                match result.outcome {
-                    Ok(crate::clipboard::CopyOutcome::Persistent) => {
-                        self.toast_ok(result.ok_label);
-                        if result.arm_hot_refresh {
-                            self.arm_hot_refresh();
-                        }
+                Ok(crate::clipboard::CopyOutcome::NonPersistent) => {
+                    self.toast_info("Copied (won't persist after exit on this compositor)");
+                    if result.arm_hot_refresh {
+                        self.arm_hot_refresh();
                     }
-                    Ok(crate::clipboard::CopyOutcome::NonPersistent) => {
-                        self.toast_info("Copied (won't persist after exit on this compositor)");
-                        if result.arm_hot_refresh {
-                            self.arm_hot_refresh();
-                        }
-                    }
-                    Ok(crate::clipboard::CopyOutcome::PersistenceUnknown) => {
-                        self.toast_info("Copied (persistence not confirmed)");
-                        if result.arm_hot_refresh {
-                            self.arm_hot_refresh();
-                        }
-                    }
-                    Err(e) => self.toast_err(format!("Copy failed: {e}")),
                 }
-            }
-            AppEvent::ClipboardPasted {
-                target,
-                result,
-                generation,
-            } => {
-                if generation != self.generation.load(Ordering::SeqCst) || self.route != Route::Send
-                {
+                Ok(crate::clipboard::CopyOutcome::PersistenceUnknown) => {
+                    self.toast_info("Copied (persistence not confirmed)");
+                    if result.arm_hot_refresh {
+                        self.arm_hot_refresh();
+                    }
+                }
+                Err(e) => self.toast_err(format!("Copy failed: {e}")),
+            },
+            AppEvent::ClipboardPasted { target, result, .. } => {
+                if self.route != Route::Send {
                     return;
                 }
                 match result {
@@ -1663,156 +1641,102 @@ impl App {
                 }
             }
             AppEvent::WalletArchived {
-                id,
-                want,
-                result,
-                generation,
-            } => {
-                if generation != self.generation.load(Ordering::SeqCst) {
-                    return;
-                }
-                match result {
-                    Ok(wallets) => {
-                        self.apply_reloaded_wallets(wallets);
-                        if want {
-                            let sel = self.list_state.selected().unwrap_or(0);
-                            self.list_state.select(Some(sel.saturating_sub(1)));
-                            self.clamp_list_selection();
-                        } else {
-                            self.select_wallet_by_id(id);
-                        }
-                        self.toast_ok(if want { "Archived" } else { "Unarchived" });
+                id, want, result, ..
+            } => match result {
+                Ok(wallets) => {
+                    self.apply_reloaded_wallets(wallets);
+                    if want {
+                        let sel = self.list_state.selected().unwrap_or(0);
+                        self.list_state.select(Some(sel.saturating_sub(1)));
+                        self.clamp_list_selection();
+                    } else {
+                        self.select_wallet_by_id(id);
                     }
-                    Err(e) => self.toast_err(e),
+                    self.toast_ok(if want { "Archived" } else { "Unarchived" });
                 }
-            }
-            AppEvent::SubwalletDerived { result, generation } => {
-                if generation != self.generation.load(Ordering::SeqCst) {
-                    return;
+                Err(e) => self.toast_err(e),
+            },
+            AppEvent::SubwalletDerived { result, .. } => match result {
+                Ok((idx, wallets)) => {
+                    self.apply_reloaded_wallets(wallets);
+                    self.request_balance_refresh();
+                    self.toast_ok(format!("Derived subwallet #{idx}"));
                 }
-                match result {
-                    Ok((idx, wallets)) => {
-                        self.apply_reloaded_wallets(wallets);
-                        self.request_balance_refresh();
-                        self.toast_ok(format!("Derived subwallet #{idx}"));
+                Err(_) => self.toast_err("Could not derive subwallet"),
+            },
+            AppEvent::SettingPersisted { change, result, .. } => match (change, result) {
+                (SettingChange::Currency(c), Ok(())) => {
+                    self.currency = c;
+                    self.price.clear();
+                    self.reset_price_baseline();
+                    self.send_cmd(Command::FetchPrice);
+                    self.toast_info(format!("Currency: {}", self.currency.label()));
+                }
+                (SettingChange::Priority(p), Ok(())) => {
+                    self.priority_micro = p;
+                    self.toast_info(format!(
+                        "Priority fee: {} (≈ {} SOL)",
+                        crate::money::priority_label(self.priority_micro),
+                        crate::money::format_lamports(crate::money::priority_fee_lamports(
+                            self.priority_micro
+                        ))
+                    ));
+                }
+                (SettingChange::AutoLock(m), Ok(())) => {
+                    self.auto_lock_after = Duration::from_secs(m * 60);
+                    self.toast_info(format!("Auto-lock after {m} min"));
+                }
+                (SettingChange::Currency(_), Err(e)) => {
+                    self.toast_err(format!("Could not save currency: {e}"))
+                }
+                (SettingChange::Priority(_), Err(e)) => {
+                    self.toast_err(format!("Could not save priority fee: {e}"))
+                }
+                (SettingChange::AutoLock(_), Err(e)) => {
+                    self.toast_err(format!("Could not save auto-lock: {e}"))
+                }
+            },
+            AppEvent::WalletTextSet { field, result, .. } => match result {
+                Ok(wallets) => {
+                    self.apply_reloaded_wallets(wallets);
+                    self.toast_ok(match field {
+                        WalletTextField::Label => "Label updated",
+                        WalletTextField::Note => "Note updated",
+                    });
+                }
+                Err(e) => self.toast_err(match field {
+                    WalletTextField::Label => format!("Could not save label: {e}"),
+                    WalletTextField::Note => format!("Could not save note: {e}"),
+                }),
+            },
+            AppEvent::IntentNoteSet { result, .. } => match result {
+                Ok(intents) => {
+                    self.detail_intents = intents;
+                    self.history_state.select(None);
+                    self.toast_ok("Transfer note updated");
+                }
+                Err(e) => self.toast_err(format!("Could not save transfer note: {e}")),
+            },
+            AppEvent::ProfileRenamed { result, .. } => match result {
+                Ok(profiles) => {
+                    self.profiles = profiles;
+                    if self.profile_sel >= self.profiles.len() {
+                        self.profile_sel = self.profiles.len().saturating_sub(1);
                     }
-                    Err(_) => self.toast_err("Could not derive subwallet"),
+                    self.toast_ok("Renamed");
                 }
-            }
-            AppEvent::SettingPersisted {
-                change,
-                result,
-                generation,
-            } => {
-                if generation != self.generation.load(Ordering::SeqCst) {
-                    return;
-                }
-                match (change, result) {
-                    (SettingChange::Currency(c), Ok(())) => {
-                        self.currency = c;
-                        self.price.clear();
-                        self.reset_price_baseline();
-                        self.send_cmd(Command::FetchPrice);
-                        self.toast_info(format!("Currency: {}", self.currency.label()));
-                    }
-                    (SettingChange::Priority(p), Ok(())) => {
-                        self.priority_micro = p;
-                        self.toast_info(format!(
-                            "Priority fee: {} (≈ {} SOL)",
-                            crate::money::priority_label(self.priority_micro),
-                            crate::money::format_lamports(crate::money::priority_fee_lamports(
-                                self.priority_micro
-                            ))
-                        ));
-                    }
-                    (SettingChange::AutoLock(m), Ok(())) => {
-                        self.auto_lock_after = Duration::from_secs(m * 60);
-                        self.toast_info(format!("Auto-lock after {m} min"));
-                    }
-                    (SettingChange::Currency(_), Err(e)) => {
-                        self.toast_err(format!("Could not save currency: {e}"))
-                    }
-                    (SettingChange::Priority(_), Err(e)) => {
-                        self.toast_err(format!("Could not save priority fee: {e}"))
-                    }
-                    (SettingChange::AutoLock(_), Err(e)) => {
-                        self.toast_err(format!("Could not save auto-lock: {e}"))
-                    }
-                }
-            }
-            AppEvent::WalletTextSet {
-                field,
-                result,
-                generation,
-            } => {
-                if generation != self.generation.load(Ordering::SeqCst) {
-                    return;
-                }
-                match result {
-                    Ok(wallets) => {
-                        self.apply_reloaded_wallets(wallets);
-                        self.toast_ok(match field {
-                            WalletTextField::Label => "Label updated",
-                            WalletTextField::Note => "Note updated",
-                        });
-                    }
-                    Err(e) => self.toast_err(match field {
-                        WalletTextField::Label => format!("Could not save label: {e}"),
-                        WalletTextField::Note => format!("Could not save note: {e}"),
-                    }),
-                }
-            }
-            AppEvent::IntentNoteSet { result, generation } => {
-                if generation != self.generation.load(Ordering::SeqCst) {
-                    return;
-                }
-                match result {
-                    Ok(intents) => {
-                        self.detail_intents = intents;
-                        self.history_state.select(None);
-                        self.toast_ok("Transfer note updated");
-                    }
-                    Err(e) => self.toast_err(format!("Could not save transfer note: {e}")),
-                }
-            }
-            AppEvent::ProfileRenamed { result, generation } => {
-                if generation != self.generation.load(Ordering::SeqCst) {
-                    return;
-                }
-                match result {
-                    Ok(profiles) => {
-                        self.profiles = profiles;
-                        if self.profile_sel >= self.profiles.len() {
-                            self.profile_sel = self.profiles.len().saturating_sub(1);
-                        }
-                        self.toast_ok("Renamed");
-                    }
-                    Err(e) => self.toast_err(e),
-                }
-            }
-            AppEvent::RpcChanged { url, generation } => {
-                if generation != self.generation.load(Ordering::SeqCst) {
-                    return;
-                }
+                Err(e) => self.toast_err(e),
+            },
+            AppEvent::RpcChanged { url, .. } => {
                 self.rpc_url = url;
                 self.net_status = NetStatus::Syncing;
                 self.reconcile_done = false;
                 self.toast_info("RPC updated — reconciling");
             }
-            AppEvent::NetStatus { status, generation } => {
-                if generation != self.generation.load(Ordering::SeqCst) {
-                    return;
-                }
+            AppEvent::NetStatus { status, .. } => {
                 self.net_status = status;
             }
-            AppEvent::Error {
-                message,
-                generation,
-            } => {
-                self.preparing_send = false;
-                if generation != self.generation.load(Ordering::SeqCst) {
-                    return;
-                }
+            AppEvent::Error { message, .. } => {
                 self.toast_err(message);
             }
         }
@@ -1945,7 +1869,219 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::CONFETTI_GLYPHS;
+    use super::*;
+
+    const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    fn stale_event_app() -> (App, String, i64) {
+        let storage = Storage::new(Db::open_memory().unwrap());
+        let seed = crate::crypto::seed_from_mnemonic(
+            &crate::crypto::parse_mnemonic(TEST_MNEMONIC).unwrap(),
+        );
+        let pubkey = crate::crypto::derive_address(&seed, 0);
+        let wallet = storage
+            .with_mut(|d| d.insert_wallet(0, crate::types::Role::Master, &pubkey, None))
+            .unwrap();
+        let (tx, _rx) = mpsc::channel::<(u64, Command)>(8);
+        let config_dir =
+            std::env::temp_dir().join(format!("silo-stale-test-{}", std::process::id()));
+        let mut app = App::new(
+            storage,
+            Arc::new(PriceCache::default()),
+            tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(Mutex::new(crate::solana::rpc::Rpc::new(
+                reqwest::Client::new(),
+                "http://127.0.0.1:8899".to_string(),
+            ))),
+            reqwest::Client::new(),
+            config_dir.clone(),
+            "http://127.0.0.1:8899".to_string(),
+            config_dir.join("vault"),
+        );
+        app.wallets = vec![wallet.clone()];
+        (app, pubkey, wallet.id)
+    }
+
+    #[test]
+    fn every_app_event_is_dropped_when_generation_is_stale() {
+        let (mut app, pubkey, wallet_id) = stale_event_app();
+        app.generation.store(2, Ordering::SeqCst);
+        app.route = Route::Send;
+        app.net_status = NetStatus::Online;
+        app.blocking_input = true;
+        app.reconcile_done = false;
+        app.pending_send = None;
+        app.preparing_send = false;
+        app.last_price = None;
+        app.rent_exempt_min = 4242;
+        app.toasts.clear();
+
+        let balances_before: Vec<Option<u64>> =
+            app.wallets.iter().map(|w| w.balance_lamports).collect();
+        let last_price_before = app.last_price;
+        let net_status_before = app.net_status;
+        let rent_before = app.rent_exempt_min;
+        let profile_before = app.current_profile.clone();
+        let rpc_url_before = app.rpc_url.clone();
+        let db_wallets_before = app.db.with(|d| d.list_wallets().unwrap().len());
+
+        let stale = 1;
+        let events = vec![
+            AppEvent::ReconcileComplete {
+                resolved: 1,
+                generation: stale,
+            },
+            AppEvent::ReconcileFailedOffline { generation: stale },
+            AppEvent::Balances {
+                list: vec![(wallet_id, 987_654_321)],
+                generation: stale,
+            },
+            AppEvent::BalancesFailed {
+                reason: "x".into(),
+                generation: stale,
+            },
+            AppEvent::Price {
+                price: SolPrice {
+                    value: 424_242.0,
+                    currency: crate::types::Currency::Usd,
+                    fetched_at: 0,
+                    source: crate::price::PriceSource::CoinGecko,
+                },
+                generation: stale,
+            },
+            AppEvent::RentExempt {
+                lamports: 1_111_111,
+                generation: stale,
+            },
+            AppEvent::SendPrepared {
+                from_id: wallet_id,
+                to: pubkey.clone(),
+                lamports: 5,
+                blockhash: "bh".into(),
+                lvbh: 1,
+                fee: 5_000,
+                dest_balance: 0,
+                priority_micro: 0,
+                generation: stale,
+            },
+            AppEvent::TransferResult {
+                intent_id: 1,
+                outcome: TransferOutcome::Failed { reason: "x".into() },
+                generation: stale,
+            },
+            AppEvent::SendPersisted {
+                result: SendPersistResult::Failed("x".into()),
+                generation: stale,
+            },
+            AppEvent::UnlockComplete {
+                result: UnlockResult::WrongPassphrase,
+                generation: stale,
+            },
+            AppEvent::SetupComplete {
+                result: SetupResult::Failed("x".into()),
+                generation: stale,
+            },
+            AppEvent::ProfileDeleted {
+                result: ProfileDeleteResult::Failed("x".into()),
+                generation: stale,
+            },
+            AppEvent::ProfileOpened {
+                result: Ok(ProfileOpenedPayload {
+                    db: Db::open_memory().unwrap(),
+                    id: "00000000000000ab".into(),
+                    created: false,
+                }),
+                generation: stale,
+            },
+            AppEvent::ClipboardCopied {
+                result: ClipboardCopyResult {
+                    outcome: Err("x".into()),
+                    ok_label: "x".into(),
+                    arm_hot_refresh: false,
+                },
+                generation: stale,
+            },
+            AppEvent::ClipboardPasted {
+                target: PasteTarget::SendTo,
+                result: Err("x".into()),
+                generation: stale,
+            },
+            AppEvent::WalletArchived {
+                id: wallet_id,
+                want: true,
+                result: Err("x".into()),
+                generation: stale,
+            },
+            AppEvent::SubwalletDerived {
+                result: Err("x".into()),
+                generation: stale,
+            },
+            AppEvent::SettingPersisted {
+                change: SettingChange::AutoLock(9),
+                result: Err("x".into()),
+                generation: stale,
+            },
+            AppEvent::WalletTextSet {
+                field: WalletTextField::Label,
+                result: Err("x".into()),
+                generation: stale,
+            },
+            AppEvent::IntentNoteSet {
+                result: Err("x".into()),
+                generation: stale,
+            },
+            AppEvent::ProfileRenamed {
+                result: Err("x".into()),
+                generation: stale,
+            },
+            AppEvent::RpcChanged {
+                url: "https://other.example.com".into(),
+                generation: stale,
+            },
+            AppEvent::NetStatus {
+                status: NetStatus::Offline,
+                generation: stale,
+            },
+            AppEvent::Error {
+                message: "x".into(),
+                generation: stale,
+            },
+        ];
+        assert_eq!(
+            events.len(),
+            24,
+            "the parametrized test must cover every AppEvent variant"
+        );
+
+        for ev in events {
+            app.apply_app_event(ev);
+        }
+
+        assert_eq!(
+            app.wallets
+                .iter()
+                .map(|w| w.balance_lamports)
+                .collect::<Vec<_>>(),
+            balances_before
+        );
+        assert_eq!(app.last_price, last_price_before);
+        assert!(app.pending_send.is_none(), "stale SendPrepared leaked");
+        assert_eq!(app.net_status, net_status_before);
+        assert_eq!(app.rent_exempt_min, rent_before);
+        assert_eq!(app.current_profile, profile_before);
+        assert_eq!(app.rpc_url, rpc_url_before);
+        assert_eq!(
+            app.db.with(|d| d.list_wallets().unwrap().len()),
+            db_wallets_before
+        );
+        assert!(!app.reconcile_done, "stale event flipped reconcile_done");
+        assert!(app.blocking_input, "stale event unblocked input");
+        assert!(
+            app.toasts.is_empty(),
+            "stale events must not surface any toast"
+        );
+    }
 
     #[test]
     fn confetti_glyphs_are_all_single_width() {
