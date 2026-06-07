@@ -497,6 +497,7 @@ pub const AUTO_LOCK_MAX_MINUTES: u64 = 120;
 
 const LARGE_SEND_NUM: u64 = 9;
 const LARGE_SEND_DEN: u64 = 10;
+const LARGE_SEND_ARM_DEBOUNCE: Duration = Duration::from_millis(400);
 
 const PRICE_FLASH_DECAY: f32 = 0.07;
 const BALANCE_EASE: f64 = 0.28;
@@ -550,6 +551,7 @@ pub struct App {
     pub(crate) pending_send: Option<PendingSend>,
     pub(crate) preparing_send: bool,
     pub(crate) send_confirm_armed: bool,
+    pub(crate) send_confirm_armed_at: Option<Instant>,
     pub(crate) blocking_input: bool,
 
     pub(crate) last_activity: Instant,
@@ -627,6 +629,7 @@ impl App {
             pending_send: None,
             preparing_send: false,
             send_confirm_armed: false,
+            send_confirm_armed_at: None,
             blocking_input: false,
             last_activity: Instant::now(),
             last_wall: SystemTime::now(),
@@ -1819,6 +1822,7 @@ impl App {
         match self.evaluate_pending_send() {
             Ok(()) => {
                 self.send_confirm_armed = false;
+                self.send_confirm_armed_at = None;
                 self.modal = Some(Modal::ConfirmSend);
             }
             Err(msg) => {
@@ -1826,6 +1830,16 @@ impl App {
                 self.toast_err(msg);
             }
         }
+    }
+
+    pub fn large_send_confirm_ready(&self) -> bool {
+        if !self.pending_send_is_large() {
+            return true;
+        }
+        self.send_confirm_armed
+            && self
+                .send_confirm_armed_at
+                .is_some_and(|t| t.elapsed() >= LARGE_SEND_ARM_DEBOUNCE)
     }
 
     pub fn pending_send_is_large(&self) -> bool {
