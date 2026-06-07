@@ -1366,7 +1366,8 @@ impl App {
                 priority_micro,
                 generation,
             } => {
-                if generation != self.generation.load(Ordering::SeqCst) {
+                if generation != self.generation.load(Ordering::SeqCst) || self.route != Route::Send
+                {
                     return;
                 }
                 self.pending_send = Some(PendingSend {
