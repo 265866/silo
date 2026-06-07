@@ -190,7 +190,12 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.border_idle))
-        .title(shimmer_line("silo", app.frame, theme.text, theme.accent))
+        .title(shimmer_line(
+            "silo",
+            app.anim_frame(),
+            theme.text,
+            theme.accent,
+        ))
         .style(Style::default().bg(theme.bg));
     let inner = block.inner(area);
     f.render_widget(block, area);

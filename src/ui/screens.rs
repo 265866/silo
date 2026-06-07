@@ -326,7 +326,7 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
                 };
                 let star_span = if is_master {
                     let phase = w.account_index as f32 * 1.7;
-                    let tw = ((app.frame as f32 * 0.20 + phase).sin() * 0.5 + 0.5).powf(1.5);
+                    let tw = ((app.anim_frame() as f32 * 0.20 + phase).sin() * 0.5 + 0.5).powf(1.5);
                     Span::styled(
                         "★ ",
                         Style::default().fg(super::blend(
@@ -400,7 +400,7 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Length(14),
     ];
     const MARKERS: [&str; 6] = ["▏ ", "▎ ", "▍ ", "▌ ", "▍ ", "▎ "];
-    let marker = MARKERS[(app.frame as usize / 2) % MARKERS.len()];
+    let marker = MARKERS[(app.anim_frame() as usize / 2) % MARKERS.len()];
     let table = Table::new(rows, widths)
         .header(header)
         .row_highlight_style(

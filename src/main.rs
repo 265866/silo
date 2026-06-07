@@ -194,26 +194,37 @@ async fn run(
     mut workers: tokio::task::JoinHandle<()>,
 ) -> Result<()> {
     let mut events = EventStream::new();
-    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
+    let active_tick = std::time::Duration::from_millis(50);
+    let idle_tick = std::time::Duration::from_secs(1);
+    let tick = tokio::time::sleep(active_tick);
+    tokio::pin!(tick);
     let mut shutdown = Shutdown::new();
     let mut worker_done = false;
 
     let loop_result = loop {
-        if let Err(e) = terminal.draw(|f| ui::render(f, &mut app)) {
+        if app.take_redraw()
+            && let Err(e) = terminal.draw(|f| ui::render(f, &mut app))
+        {
             break Err(e.into());
         }
         tokio::select! {
-            maybe_ev = events.next() => match maybe_ev {
-                Some(Ok(ev)) => {
-                    app.note_activity();
-                    input::handle_event(&mut app, ev);
+            maybe_ev = events.next() => {
+                match maybe_ev {
+                    Some(Ok(ev)) => {
+                        app.note_activity();
+                        input::handle_event(&mut app, ev);
+                    }
+                    _ => app.stop(),
                 }
-                _ => app.stop(),
-            },
-            maybe_app_ev = evt_rx.recv() => match maybe_app_ev {
-                Some(app_ev) => app.apply_app_event(app_ev),
-                None => app.stop(),
-            },
+                app.request_redraw();
+            }
+            maybe_app_ev = evt_rx.recv() => {
+                match maybe_app_ev {
+                    Some(app_ev) => app.apply_app_event(app_ev),
+                    None => app.stop(),
+                }
+                app.request_redraw();
+            }
             worker_result = &mut workers => {
                 worker_done = true;
                 if let Err(e) = worker_result {
@@ -221,13 +232,24 @@ async fn run(
                 }
                 app.stop();
             },
-            _ = ticker.tick() => {
-                app.tick();
+            _ = &mut tick => {
+                let tick_redrew = app.tick();
                 app.maybe_auto_lock();
                 app.maybe_auto_refresh();
+                if tick_redrew || app.animations_active() {
+                    app.request_redraw();
+                }
+                let period = if app.animations_active() { active_tick } else { idle_tick };
+                tick.as_mut().reset(tokio::time::Instant::now() + period);
             }
             _ = shutdown.recv() => {
                 app.stop();
+            }
+        }
+        if app.animations_active() {
+            let soon = tokio::time::Instant::now() + active_tick;
+            if soon < tick.deadline() {
+                tick.as_mut().reset(soon);
             }
         }
         if !app.is_running() {
