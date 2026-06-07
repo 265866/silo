@@ -1,15 +1,7 @@
-pub mod app;
+#![allow(dead_code)]
+
 pub mod clipboard;
-pub mod crypto;
-pub mod db;
-pub mod input;
 pub mod money;
-pub mod platform;
 pub mod price;
-pub mod profiles;
-pub mod solana;
-pub mod sync;
+mod sync;
 pub mod types;
-pub mod ui;
-pub mod vault;
-pub mod worker;

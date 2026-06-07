@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -14,16 +14,25 @@ fn registry_path(config_dir: &Path) -> PathBuf {
     config_dir.join("profiles.json")
 }
 
-pub fn dir_for(config_dir: &Path, id: &str) -> PathBuf {
-    config_dir.join("profiles").join(id)
+pub fn validate_id(id: &str) -> Result<()> {
+    if id.len() == 16 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        Ok(())
+    } else {
+        bail!("unsafe profile id")
+    }
 }
 
-pub fn db_path(config_dir: &Path, id: &str) -> PathBuf {
-    dir_for(config_dir, id).join("silo.db")
+pub fn dir_for(config_dir: &Path, id: &str) -> Result<PathBuf> {
+    validate_id(id)?;
+    Ok(config_dir.join("profiles").join(id))
 }
 
-pub fn vault_path(config_dir: &Path, id: &str) -> PathBuf {
-    dir_for(config_dir, id).join("vault.json")
+pub fn db_path(config_dir: &Path, id: &str) -> Result<PathBuf> {
+    Ok(dir_for(config_dir, id)?.join("silo.db"))
+}
+
+pub fn vault_path(config_dir: &Path, id: &str) -> Result<PathBuf> {
+    Ok(dir_for(config_dir, id)?.join("vault.json"))
 }
 
 pub fn ensure_private_dir(path: &Path) -> Result<()> {
@@ -49,18 +58,42 @@ pub fn new_id() -> String {
 
 pub fn load(config_dir: &Path) -> Result<Vec<ProfileMeta>> {
     match std::fs::read(registry_path(config_dir)) {
-        Ok(bytes) => serde_json::from_slice(&bytes).context("profiles registry is not valid JSON"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Ok(bytes) => {
+            let list: Vec<ProfileMeta> =
+                serde_json::from_slice(&bytes).context("profiles registry is not valid JSON")?;
+            validate_list(&list)?;
+            Ok(list)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let recovered = recoverable(config_dir);
+            if !recovered.is_empty() {
+                save(config_dir, &recovered)?;
+            }
+            Ok(recovered)
+        }
         Err(e) => Err(e).context("reading profiles registry"),
     }
 }
 
+fn validate_list(list: &[ProfileMeta]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for p in list {
+        validate_id(&p.id).with_context(|| format!("invalid profile id {}", p.id))?;
+        if !seen.insert(p.id.as_str()) {
+            bail!("duplicate profile id {}", p.id);
+        }
+    }
+    Ok(())
+}
+
 pub fn save(config_dir: &Path, list: &[ProfileMeta]) -> Result<()> {
+    validate_list(list)?;
     let json = serde_json::to_vec_pretty(list).context("serializing profiles")?;
     crate::vault::write_atomic(&registry_path(config_dir), &json)
 }
 
 pub fn register(config_dir: &Path, meta: ProfileMeta) -> Result<()> {
+    validate_id(&meta.id)?;
     let mut list = load(config_dir)?;
     if !list.iter().any(|p| p.id == meta.id) {
         list.push(meta);
@@ -70,6 +103,7 @@ pub fn register(config_dir: &Path, meta: ProfileMeta) -> Result<()> {
 }
 
 pub fn rename(config_dir: &Path, id: &str, name: &str) -> Result<()> {
+    validate_id(id)?;
     let mut list = load(config_dir)?;
     if let Some(p) = list.iter_mut().find(|p| p.id == id) {
         p.name = name.to_string();
@@ -86,7 +120,7 @@ pub fn recoverable(config_dir: &Path) -> Vec<ProfileMeta> {
     for e in entries.flatten() {
         let path = e.path();
         let id = e.file_name().to_string_lossy().to_string();
-        if path.is_dir() && !id.starts_with('.') && path.join("vault.json").exists() {
+        if validate_id(&id).is_ok() && path.is_dir() && path.join("vault.json").exists() {
             out.push(ProfileMeta {
                 name: recovered_name(out.len() + 1),
                 id,
@@ -121,7 +155,9 @@ pub fn cleanup_orphans(config_dir: &Path, registry: &[ProfileMeta]) {
         }
         if let Some(id) = tombstone_id(&name) {
             if known.contains(id) {
-                let live = dir_for(config_dir, id);
+                let Ok(live) = dir_for(config_dir, id) else {
+                    continue;
+                };
                 if !live.exists() && std::fs::rename(&path, &live).is_ok() {
                     sync_dir(&root);
                 }
@@ -135,8 +171,9 @@ pub fn cleanup_orphans(config_dir: &Path, registry: &[ProfileMeta]) {
 }
 
 pub fn remove(config_dir: &Path, id: &str) -> Result<()> {
+    validate_id(id)?;
     let mut list = load(config_dir)?;
-    let dir = dir_for(config_dir, id);
+    let dir = dir_for(config_dir, id)?;
     if dir.exists() {
         let tombstone = tombstone_dir(config_dir, id)?;
         std::fs::rename(&dir, &tombstone).with_context(|| {
@@ -164,6 +201,7 @@ pub fn remove(config_dir: &Path, id: &str) -> Result<()> {
 }
 
 fn tombstone_dir(config_dir: &Path, id: &str) -> Result<PathBuf> {
+    validate_id(id)?;
     let root = config_dir.join("profiles");
     for _ in 0..16 {
         let suffix = new_id();
@@ -177,7 +215,8 @@ fn tombstone_dir(config_dir: &Path, id: &str) -> Result<PathBuf> {
 
 fn tombstone_id(name: &str) -> Option<&str> {
     let rest = name.strip_prefix(".delete-")?;
-    rest.split_once('-').map(|(id, _)| id)
+    let id = rest.split_once('-').map(|(id, _)| id)?;
+    validate_id(id).is_ok().then_some(id)
 }
 
 fn sync_dir(path: &Path) {
@@ -209,7 +248,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("profiles").join("abc");
+        let path = dir_for(dir.path(), "0000000000000001").unwrap();
         ensure_private_dir(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
@@ -218,14 +257,18 @@ mod tests {
     #[test]
     fn cleanup_restores_registered_tombstones() {
         let dir = tempfile::tempdir().unwrap();
-        let live = dir_for(dir.path(), "abc");
-        let tombstone = dir.path().join("profiles").join(".delete-abc-123");
+        let id = "0000000000000002";
+        let live = dir_for(dir.path(), id).unwrap();
+        let tombstone = dir
+            .path()
+            .join("profiles")
+            .join(format!(".delete-{id}-123"));
         std::fs::create_dir_all(&tombstone).unwrap();
         std::fs::write(tombstone.join("vault.json"), b"{}").unwrap();
         cleanup_orphans(
             dir.path(),
             &[ProfileMeta {
-                id: "abc".into(),
+                id: id.into(),
                 name: "Wallet".into(),
                 created_at: 1,
             }],
@@ -237,11 +280,35 @@ mod tests {
     #[test]
     fn cleanup_retries_tombstones() {
         let dir = tempfile::tempdir().unwrap();
-        let tombstone = dir.path().join("profiles").join(".delete-abc-123");
+        let tombstone = dir
+            .path()
+            .join("profiles")
+            .join(".delete-0000000000000003-123");
         std::fs::create_dir_all(&tombstone).unwrap();
         std::fs::write(tombstone.join("vault.json"), b"{}").unwrap();
         cleanup_orphans(dir.path(), &[]);
         assert!(!tombstone.exists());
+    }
+
+    #[test]
+    fn rejects_unsafe_profile_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(dir_for(dir.path(), "../bad").is_err());
+        assert!(dir_for(dir.path(), "ABCDEF0123456789").is_err());
+        assert!(dir_for(dir.path(), "0000000000000000").is_ok());
+    }
+
+    #[test]
+    fn missing_registry_recovers_vault_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "0000000000000004";
+        let profile = dir_for(dir.path(), id).unwrap();
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join("vault.json"), b"{}").unwrap();
+        let loaded = load(dir.path()).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, id);
+        assert!(registry_path(dir.path()).exists());
     }
 
     #[test]
@@ -275,9 +342,9 @@ mod tests {
         rename(cfg, &id, "Treasury").unwrap();
         assert_eq!(load(cfg).unwrap()[0].name, "Treasury");
 
-        std::fs::create_dir_all(dir_for(cfg, &id)).unwrap();
+        std::fs::create_dir_all(dir_for(cfg, &id).unwrap()).unwrap();
         remove(cfg, &id).unwrap();
         assert!(load(cfg).unwrap().is_empty());
-        assert!(!dir_for(cfg, &id).exists());
+        assert!(!dir_for(cfg, &id).unwrap().exists());
     }
 }

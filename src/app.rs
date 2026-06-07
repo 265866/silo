@@ -127,6 +127,10 @@ pub enum AppEvent {
         outcome: TransferOutcome,
         generation: u64,
     },
+    RpcChanged {
+        url: String,
+        generation: u64,
+    },
     NetStatus {
         status: NetStatus,
         generation: u64,
@@ -167,6 +171,7 @@ pub enum PromptKind {
     TxNote(i64),
     RpcUrl,
     ProfileName(String),
+    DeleteProfile { id: String, challenge: String },
 }
 
 impl PromptKind {
@@ -178,7 +183,6 @@ impl PromptKind {
 #[derive(Clone)]
 pub enum ConfirmAction {
     CreateWithEmptyPassphrase,
-    DeleteProfile(String),
 }
 
 pub enum Modal {
@@ -493,57 +497,103 @@ impl App {
         }
     }
 
+    pub fn send_rpc_change_cmd(&mut self, url: String) -> bool {
+        let old = self.generation.load(Ordering::SeqCst);
+        let new = old + 1;
+        self.generation.store(new, Ordering::SeqCst);
+        match self.cmd_tx.try_send((new, Command::ChangeRpc { url })) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let _ =
+                    self.generation
+                        .compare_exchange(new, old, Ordering::SeqCst, Ordering::SeqCst);
+                self.toast_err("Command queue is full — try again");
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                let _ =
+                    self.generation
+                        .compare_exchange(new, old, Ordering::SeqCst, Ordering::SeqCst);
+                self.toast_err("Background worker stopped");
+                false
+            }
+        }
+    }
+
     fn bump_generation(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
-    pub fn bump_generation_for_rpc_change(&self) {
-        self.bump_generation();
+    fn reset_profile_scoped_state(&mut self) {
+        let url = crate::types::Network::MainnetBeta
+            .default_rpc_url()
+            .to_string();
+        *self.rpc.lock_recover() = crate::solana::rpc::Rpc::new(self.client.clone(), url.clone());
+        self.rpc_url = url;
+        self.currency = crate::types::Currency::Usd;
+        self.priority_micro = crate::money::DEFAULT_PRIORITY_FEE_MICRO;
+        self.auto_lock_after = Duration::from_secs(DEFAULT_AUTO_LOCK_MINUTES * 60);
+        self.price.clear();
+        self.reset_price_baseline();
     }
 
-    pub fn switch_to_profile(&mut self, id: &str) -> anyhow::Result<()> {
-        self.bump_generation();
-        let db_path = crate::profiles::db_path(&self.config_dir, id);
-        let new_db = Db::open(&db_path)?;
-        self.db.replace(new_db);
-        self.price.clear();
+    fn validate_profile_scoped_state(db: &Db) -> anyhow::Result<()> {
+        db.get_meta("rpc_url")?;
+        db.get_meta("currency")?;
+        db.get_meta("priority_fee_micro")?;
+        db.get_meta("auto_lock_minutes")?;
+        db.get_meta("last_price")?;
+        Ok(())
+    }
 
-        let url = self.db.with(|d| {
-            d.get_meta("rpc_url").ok().flatten().unwrap_or_else(|| {
+    fn load_profile_scoped_state(&mut self) -> anyhow::Result<()> {
+        let url = self.db.with(|d| -> anyhow::Result<_> {
+            Ok(d.get_meta("rpc_url")?.unwrap_or_else(|| {
                 crate::types::Network::MainnetBeta
                     .default_rpc_url()
                     .to_string()
-            })
-        });
+            }))
+        })?;
         *self.rpc.lock_recover() = crate::solana::rpc::Rpc::new(self.client.clone(), url.clone());
         self.rpc_url = url;
         self.currency = self
             .db
-            .with(|d| d.get_meta("currency").ok().flatten())
+            .with(|d| d.get_meta("currency"))?
             .and_then(|s| crate::types::Currency::from_code(&s))
             .unwrap_or(crate::types::Currency::Usd);
         self.priority_micro = self
             .db
-            .with(|d| d.get_meta("priority_fee_micro").ok().flatten())
+            .with(|d| d.get_meta("priority_fee_micro"))?
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(crate::money::DEFAULT_PRIORITY_FEE_MICRO);
-        if let Some(m) = self
+        self.auto_lock_after = self
             .db
-            .with(|d| d.get_meta("auto_lock_minutes").ok().flatten())
+            .with(|d| d.get_meta("auto_lock_minutes"))?
             .and_then(|s| s.parse::<u64>().ok())
-        {
-            self.auto_lock_after =
-                Duration::from_secs(m.clamp(AUTO_LOCK_MIN_MINUTES, AUTO_LOCK_MAX_MINUTES) * 60);
-        }
+            .map(|m| m.clamp(AUTO_LOCK_MIN_MINUTES, AUTO_LOCK_MAX_MINUTES))
+            .map(|m| Duration::from_secs(m * 60))
+            .unwrap_or_else(|| Duration::from_secs(DEFAULT_AUTO_LOCK_MINUTES * 60));
+        self.price.clear();
+        self.reset_price_baseline();
         if let Some(s) = self.db.with(|d| d.get_meta("last_price"))? {
             match crate::price::SolPrice::from_meta_json(&s) {
-                Ok(p) if p.currency == self.currency => self.price.seed(p),
+                Ok(p) if p.currency == self.currency && !p.is_stale() => self.price.seed(p),
                 Ok(_) => {}
                 Err(e) => self.toast_err(format!("Invalid cached price: {e}")),
             }
         }
+        Ok(())
+    }
 
-        self.vault_path = crate::profiles::vault_path(&self.config_dir, id);
+    pub fn switch_to_profile(&mut self, id: &str) -> anyhow::Result<()> {
+        self.bump_generation();
+        let db_path = crate::profiles::db_path(&self.config_dir, id)?;
+        let new_db = Db::open(&db_path)?;
+        Self::validate_profile_scoped_state(&new_db)?;
+        self.db.replace(new_db);
+        self.load_profile_scoped_state()?;
+
+        self.vault_path = crate::profiles::vault_path(&self.config_dir, id)?;
         self.current_profile = Some(id.to_string());
         self.seed = None;
         self.wallets.clear();
@@ -572,7 +622,13 @@ impl App {
         self.setup.scrub_confirm();
 
         let id = crate::profiles::new_id();
-        let dir = crate::profiles::dir_for(&self.config_dir, &id);
+        let dir = match crate::profiles::dir_for(&self.config_dir, &id) {
+            Ok(dir) => dir,
+            Err(e) => {
+                self.toast_err(format!("could not choose profile dir: {e}"));
+                return;
+            }
+        };
         if let Err(e) = crate::profiles::ensure_private_dir(&dir) {
             self.toast_err(format!("could not create profile dir: {e}"));
             return;
@@ -584,7 +640,7 @@ impl App {
                 return;
             }
         }
-        self.price.clear();
+        self.reset_profile_scoped_state();
         self.current_profile = Some(id);
         self.vault_path = dir.join("vault.json");
         self.seed = None;
@@ -977,7 +1033,7 @@ impl App {
     }
 
     pub fn price_now(&self) -> Option<SolPrice> {
-        self.price.get()
+        self.price.get().filter(|p| !p.is_stale())
     }
 
     pub fn reset_price_baseline(&mut self) {
@@ -1146,6 +1202,15 @@ impl App {
                     }
                 }
                 self.refresh_detail_intents();
+            }
+            AppEvent::RpcChanged { url, generation } => {
+                if generation != self.generation.load(Ordering::SeqCst) {
+                    return;
+                }
+                self.rpc_url = url;
+                self.net_status = NetStatus::Syncing;
+                self.reconcile_done = false;
+                self.toast_info("RPC updated — reconciling");
             }
             AppEvent::NetStatus { status, generation } => {
                 if generation != self.generation.load(Ordering::SeqCst) {

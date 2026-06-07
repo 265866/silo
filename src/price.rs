@@ -48,7 +48,7 @@ impl SolPrice {
         self.age_secs() > STALE_AFTER_SECS
     }
 
-    pub fn to_meta_json(&self) -> String {
+    pub fn to_meta_json(self) -> String {
         serde_json::json!({
             "value": self.value,
             "currency": self.currency.code(),
