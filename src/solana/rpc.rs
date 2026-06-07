@@ -280,6 +280,135 @@ fn backoff(attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+
+    struct MockResponse {
+        status: u16,
+        headers: Vec<(&'static str, &'static str)>,
+        body: String,
+    }
+
+    impl MockResponse {
+        fn new(status: u16, body: impl Into<String>) -> Self {
+            MockResponse {
+                status,
+                headers: Vec::new(),
+                body: body.into(),
+            }
+        }
+
+        fn header(mut self, name: &'static str, value: &'static str) -> Self {
+            self.headers.push((name, value));
+            self
+        }
+    }
+
+    struct MockServer {
+        url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+        _worker: std::thread::JoinHandle<()>,
+    }
+
+    impl MockServer {
+        fn new(responses: Vec<MockResponse>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let requests_for_thread = requests.clone();
+            let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
+            let responses_for_thread = responses.clone();
+            let worker = std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let mut stream = stream.unwrap();
+                    let request = read_request(&mut stream);
+                    requests_for_thread.lock().unwrap().push(request);
+                    let response = responses_for_thread
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or_else(|| MockResponse::new(500, "unexpected request"));
+                    let done = responses_for_thread.lock().unwrap().is_empty();
+                    write_response(&mut stream, response);
+                    if done {
+                        break;
+                    }
+                }
+            });
+            MockServer {
+                url,
+                requests,
+                _worker: worker,
+            }
+        }
+
+        fn url(&self) -> &str {
+            &self.url
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    fn read_request(stream: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut tmp).unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&buf[..end]);
+                let len = content_length(&headers);
+                if buf.len().saturating_sub(end + 4) >= len {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn content_length(headers: &str) -> usize {
+        headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0)
+    }
+
+    fn write_response(stream: &mut TcpStream, response: MockResponse) {
+        let reason = match response.status {
+            200 => "OK",
+            408 => "Request Timeout",
+            429 => "Too Many Requests",
+            500 => "Internal Server Error",
+            _ => "OK",
+        };
+        let mut head = format!(
+            "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            response.status,
+            reason,
+            response.body.len()
+        );
+        for (name, value) in response.headers {
+            head.push_str(name);
+            head.push_str(": ");
+            head.push_str(value);
+            head.push_str("\r\n");
+        }
+        head.push_str("\r\n");
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(response.body.as_bytes()).unwrap();
+    }
 
     #[test]
     fn rpc_url_validation_accepts_http_https() {
@@ -379,6 +508,37 @@ mod tests {
         assert!((250..350).contains(&b0));
         assert!(b3 > b0);
         assert!(backoff(20).as_millis() <= 8_100);
+    }
+
+    #[tokio::test]
+    async fn retries_transient_http_statuses() {
+        let server = MockServer::new(vec![
+            MockResponse::new(408, "").header("Retry-After", "0"),
+            MockResponse::new(429, "").header("Retry-After", "0"),
+            MockResponse::new(500, "").header("Retry-After", "0"),
+            MockResponse::new(200, r#"{"jsonrpc":"2.0","id":1,"result":123}"#),
+        ]);
+        let rpc = Rpc::new(reqwest::Client::new(), server.url());
+        assert_eq!(rpc.get_block_height().await.unwrap(), 123);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 4);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.contains(r#""method":"getBlockHeight""#))
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_error_envelope_is_reported_through_call_path() {
+        let server = MockServer::new(vec![MockResponse::new(
+            200,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32002,"message":"blockhash not found"}}"#,
+        )]);
+        let rpc = Rpc::new(reqwest::Client::new(), server.url());
+        let err = rpc.get_block_height().await.unwrap_err().to_string();
+        assert!(err.contains("RPC getBlockHeight error -32002"));
+        assert!(err.contains("blockhash not found"));
     }
 
     #[tokio::test]

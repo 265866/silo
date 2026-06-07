@@ -535,13 +535,12 @@ impl App {
             self.auto_lock_after =
                 Duration::from_secs(m.clamp(AUTO_LOCK_MIN_MINUTES, AUTO_LOCK_MAX_MINUTES) * 60);
         }
-        if let Some(p) = self
-            .db
-            .with(|d| d.get_meta("last_price").ok().flatten())
-            .and_then(|s| crate::price::SolPrice::from_meta_json(&s))
-            .filter(|p| p.currency == self.currency)
-        {
-            self.price.seed(p);
+        if let Some(s) = self.db.with(|d| d.get_meta("last_price"))? {
+            match crate::price::SolPrice::from_meta_json(&s) {
+                Ok(p) if p.currency == self.currency => self.price.seed(p),
+                Ok(_) => {}
+                Err(e) => self.toast_err(format!("Invalid cached price: {e}")),
+            }
         }
 
         self.vault_path = crate::profiles::vault_path(&self.config_dir, id);
@@ -942,16 +941,25 @@ impl App {
         self.wallets.iter().find(|w| w.id == id)
     }
 
-    pub fn reload_wallets(&mut self) {
-        if let Ok(mut rows) = self.db.with(|d| d.list_wallets()) {
-            for r in &mut rows {
-                if let Some(old) = self.wallets.iter().find(|w| w.id == r.id) {
-                    r.balance_lamports = old.balance_lamports;
-                }
+    pub fn try_reload_wallets(&mut self) -> anyhow::Result<()> {
+        let mut rows = self.db.with(|d| d.list_wallets())?;
+        for r in &mut rows {
+            if let Some(old) = self.wallets.iter().find(|w| w.id == r.id) {
+                r.balance_lamports = old.balance_lamports;
             }
-            self.wallets = rows;
         }
+        self.wallets = rows;
         self.clamp_list_selection();
+        Ok(())
+    }
+
+    pub fn reload_wallets(&mut self) {
+        if let Err(e) = self.try_reload_wallets() {
+            self.wallets.clear();
+            self.anim_balance.clear();
+            self.clamp_list_selection();
+            self.toast_err(format!("Could not load wallets: {e}"));
+        }
     }
 
     pub fn sign_for(
@@ -1245,18 +1253,27 @@ impl App {
     }
 
     pub fn refresh_detail_intents(&mut self) {
-        if let Some(id) = self.focused_wallet
-            && let Ok(v) = self.db.with(|d| d.list_intents_for_wallet(id, 50))
-        {
-            self.detail_intents = v;
+        match self.focused_wallet {
+            Some(id) => match self.db.with(|d| d.list_intents_for_wallet(id, 50)) {
+                Ok(v) => self.detail_intents = v,
+                Err(e) => {
+                    self.detail_intents.clear();
+                    self.toast_err(format!("Could not load transfer history: {e}"));
+                }
+            },
+            None => self.detail_intents.clear(),
         }
         self.history_state.select(None);
         self.reload_wallets();
     }
 
     pub fn refresh_audit(&mut self) {
-        if let Ok(v) = self.db.with(|d| d.list_audit(200)) {
-            self.audit = v;
+        match self.db.with(|d| d.list_audit(200)) {
+            Ok(v) => self.audit = v,
+            Err(e) => {
+                self.audit.clear();
+                self.toast_err(format!("Could not load audit log: {e}"));
+            }
         }
         self.audit_state.select(None);
     }

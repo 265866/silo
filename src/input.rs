@@ -91,23 +91,58 @@ fn try_unlock(app: &mut App) {
                 });
                 return;
             }
-            if !consistency_ok(app, &seed) {
-                app.db.with_mut(|d| {
-                    let _ = d.audit(AuditEvent::IntegrityCheckFailed, &serde_json::json!({}));
-                });
+            match consistency_ok(app, &seed) {
+                Ok(true) => {}
+                Ok(false) => {
+                    app.db.with_mut(|d| {
+                        let _ = d.audit(AuditEvent::IntegrityCheckFailed, &serde_json::json!({}));
+                    });
+                    app.modal = Some(Modal::Error {
+                        title: "Database / vault mismatch".into(),
+                        body: "A stored wallet address does not match this recovery phrase. \
+                               Refusing to operate to avoid misrouting funds."
+                            .into(),
+                    });
+                    return;
+                }
+                Err(e) => {
+                    app.modal = Some(Modal::Error {
+                        title: "Cannot verify wallet database".into(),
+                        body: format!(
+                            "Wallet metadata could not be read: {e}. Refusing to operate."
+                        ),
+                    });
+                    return;
+                }
+            }
+            match app.db.with(|d| d.verify_audit_chain()) {
+                Ok(true) => {}
+                Ok(false) => {
+                    app.modal = Some(Modal::Error {
+                        title: "Audit log integrity check failed".into(),
+                        body: "The audit log does not match its stored integrity chain. \
+                               Refusing to operate."
+                            .into(),
+                    });
+                    return;
+                }
+                Err(e) => {
+                    app.modal = Some(Modal::Error {
+                        title: "Cannot verify audit log".into(),
+                        body: format!("Audit chain verification failed: {e}. Refusing to operate."),
+                    });
+                    return;
+                }
+            }
+            if let Err(e) = app.try_reload_wallets() {
+                app.wallets.clear();
+                app.anim_balance.clear();
+                app.clamp_list_selection();
                 app.modal = Some(Modal::Error {
-                    title: "Database / vault mismatch".into(),
-                    body: "A stored wallet address does not match this recovery phrase. \
-                           Refusing to operate to avoid misrouting funds."
-                        .into(),
+                    title: "Cannot load wallets".into(),
+                    body: format!("Wallet rows could not be loaded: {e}. Refusing to operate."),
                 });
                 return;
-            }
-            let audit_tampered = app
-                .db
-                .with(|d| d.verify_audit_chain().map(|ok| !ok).unwrap_or(false));
-            if audit_tampered {
-                app.toast_err("⚠ audit log integrity check failed — history may be tampered");
             }
             app.seed = Some(seed);
             app.db.with_mut(|d| {
@@ -115,7 +150,6 @@ fn try_unlock(app: &mut App) {
             });
             app.route = Route::WalletList;
             app.note_activity();
-            app.reload_wallets();
             app.send_cmd(Command::Reconcile);
             app.request_balance_refresh();
             app.toast_ok("Unlocked");
@@ -129,11 +163,11 @@ fn try_unlock(app: &mut App) {
     }
 }
 
-fn consistency_ok(app: &App, seed: &crypto::Seed) -> bool {
-    let wallets = app.db.with(|d| d.list_wallets().unwrap_or_default());
-    wallets
+fn consistency_ok(app: &App, seed: &crypto::Seed) -> anyhow::Result<bool> {
+    let wallets = app.db.with(|d| d.list_wallets())?;
+    Ok(wallets
         .iter()
-        .all(|w| crypto::derive_address(seed, w.account_index) == w.pubkey)
+        .all(|w| crypto::derive_address(seed, w.account_index) == w.pubkey))
 }
 
 fn setup_keys(app: &mut App, key: KeyEvent) {
@@ -314,16 +348,27 @@ fn create_vault_and_finish(app: &mut App) {
     };
 
     let seed = crypto::seed_from_mnemonic(&mnemonic);
-    if !consistency_ok(app, &seed) {
-        app.db.with_mut(|d| {
-            let _ = d.audit(AuditEvent::IntegrityCheckFailed, &serde_json::json!({}));
-        });
-        app.modal = Some(Modal::Error {
-            title: "Database / phrase mismatch".into(),
-            body: "Existing wallet records don't match this recovery phrase. Refusing to proceed."
-                .into(),
-        });
-        return;
+    match consistency_ok(app, &seed) {
+        Ok(true) => {}
+        Ok(false) => {
+            app.db.with_mut(|d| {
+                let _ = d.audit(AuditEvent::IntegrityCheckFailed, &serde_json::json!({}));
+            });
+            app.modal = Some(Modal::Error {
+                title: "Database / phrase mismatch".into(),
+                body:
+                    "Existing wallet records don't match this recovery phrase. Refusing to proceed."
+                        .into(),
+            });
+            return;
+        }
+        Err(e) => {
+            app.modal = Some(Modal::Error {
+                title: "Cannot verify wallet database".into(),
+                body: format!("Wallet metadata could not be read: {e}. Refusing to proceed."),
+            });
+            return;
+        }
     }
 
     let vault_key = if crate::vault::vault_exists(&app.vault_path) {
@@ -1003,12 +1048,12 @@ fn settings_keys(app: &mut App, key: KeyEvent) {
         KeyCode::Char('u') => {
             let currency = app.currency.next();
             let persisted = app.db.with_mut(|d| {
-                d.set_meta("currency", currency.code()).and_then(|_| {
-                    d.audit(
-                        AuditEvent::SettingsChanged,
-                        &serde_json::json!({"currency": currency.code()}),
-                    )
-                })
+                d.set_meta_audited(
+                    "currency",
+                    currency.code(),
+                    AuditEvent::SettingsChanged,
+                    &serde_json::json!({"currency": currency.code()}),
+                )
             });
             match persisted {
                 Ok(()) => {
@@ -1027,14 +1072,14 @@ fn settings_keys(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('p') => {
             let priority = crate::money::next_priority_preset(app.priority_micro);
+            let priority_text = priority.to_string();
             let persisted = app.db.with_mut(|d| {
-                d.set_meta("priority_fee_micro", &priority.to_string())
-                    .and_then(|_| {
-                        d.audit(
-                            AuditEvent::SettingsChanged,
-                            &serde_json::json!({"priority_fee_micro": priority}),
-                        )
-                    })
+                d.set_meta_audited(
+                    "priority_fee_micro",
+                    &priority_text,
+                    AuditEvent::SettingsChanged,
+                    &serde_json::json!({"priority_fee_micro": priority}),
+                )
             });
             match persisted {
                 Ok(()) => {
@@ -1066,14 +1111,14 @@ fn settings_keys(app: &mut App, key: KeyEvent) {
 }
 
 fn set_auto_lock_minutes(app: &mut App, mins: u64) {
+    let mins_text = mins.to_string();
     let persisted = app.db.with_mut(|d| {
-        d.set_meta("auto_lock_minutes", &mins.to_string())
-            .and_then(|_| {
-                d.audit(
-                    AuditEvent::SettingsChanged,
-                    &serde_json::json!({"auto_lock_minutes": mins}),
-                )
-            })
+        d.set_meta_audited(
+            "auto_lock_minutes",
+            &mins_text,
+            AuditEvent::SettingsChanged,
+            &serde_json::json!({"auto_lock_minutes": mins}),
+        )
     });
     match persisted {
         Ok(()) => {

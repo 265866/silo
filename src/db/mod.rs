@@ -232,6 +232,27 @@ impl Db {
         Ok(())
     }
 
+    pub fn set_meta_audited(
+        &mut self,
+        key: &str,
+        value: &str,
+        event: AuditEvent,
+        details: &serde_json::Value,
+    ) -> Result<()> {
+        let audit_key = self.require_audit_key()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO meta (key,value) VALUES (?1,?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
+        )?;
+        append_audit(&tx, &audit_key, event, details)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn audit(&mut self, event: AuditEvent, details: &serde_json::Value) -> Result<()> {
         let Some(key) = self.audit_key else {
             return Ok(());
@@ -255,7 +276,13 @@ impl Db {
                 id: r.get(0)?,
                 ts: r.get(1)?,
                 event_type: r.get(2)?,
-                details: serde_json::from_str(&details_text).unwrap_or(serde_json::Value::Null),
+                details: serde_json::from_str(&details_text).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
                 prev_hash: r.get(4)?,
                 row_hash: r.get(5)?,
             })
@@ -561,6 +588,55 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn audited_meta_write_commits_meta_and_audit_together() {
+        let mut d = db();
+        d.set_meta_audited(
+            "currency",
+            "eur",
+            AuditEvent::SettingsChanged,
+            &serde_json::json!({"currency":"eur"}),
+        )
+        .unwrap();
+        assert_eq!(d.get_meta("currency").unwrap().as_deref(), Some("eur"));
+        assert!(d.verify_audit_chain().unwrap());
+        assert_eq!(d.list_audit(1).unwrap()[0].event_type, "settings_changed");
+    }
+
+    #[test]
+    fn audited_meta_write_rolls_back_when_audit_fails() {
+        let mut d = db();
+        d.conn
+            .execute_batch(
+                "CREATE TRIGGER abort_audit BEFORE INSERT ON audit_log
+                 BEGIN SELECT RAISE(ABORT, 'audit disabled'); END;",
+            )
+            .unwrap();
+        assert!(
+            d.set_meta_audited(
+                "currency",
+                "eur",
+                AuditEvent::SettingsChanged,
+                &serde_json::json!({"currency":"eur"}),
+            )
+            .is_err()
+        );
+        assert!(d.get_meta("currency").unwrap().is_none());
+    }
+
+    #[test]
+    fn malformed_audit_details_are_read_errors() {
+        let d = db();
+        d.conn
+            .execute(
+                "INSERT INTO audit_log (ts,event_type,details,prev_hash,row_hash)
+                 VALUES (1,'settings_changed','not-json',NULL,'x')",
+                [],
+            )
+            .unwrap();
+        assert!(d.list_audit(1).is_err());
     }
 
     #[test]

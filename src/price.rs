@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::sync::RwLockExt;
 use crate::types::Currency;
 
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
@@ -29,6 +30,16 @@ pub struct SolPrice {
     pub source: PriceSource,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum PriceMetaError {
+    #[error("price cache JSON was not valid: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("price cache field is missing or invalid: {0}")]
+    Field(&'static str),
+    #[error("unknown price source: {0}")]
+    Source(String),
+}
+
 impl SolPrice {
     pub fn age_secs(&self) -> u64 {
         now_secs().saturating_sub(self.fetched_at)
@@ -50,21 +61,78 @@ impl SolPrice {
         .to_string()
     }
 
-    pub fn from_meta_json(s: &str) -> Option<SolPrice> {
-        let v: serde_json::Value = serde_json::from_str(s).ok()?;
-        Some(SolPrice {
-            value: v.get("value")?.as_f64()?,
-            currency: Currency::from_code(v.get("currency")?.as_str()?)?,
-            fetched_at: v.get("fetched_at")?.as_u64()?,
-            source: match v.get("source")?.as_str()? {
-                "jupiter" => PriceSource::Jupiter,
-                _ => PriceSource::CoinGecko,
-            },
+    pub fn from_meta_json(s: &str) -> Result<SolPrice, PriceMetaError> {
+        let v: serde_json::Value = serde_json::from_str(s)?;
+        let value = v
+            .get("value")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .ok_or(PriceMetaError::Field("value"))?;
+        let currency = v
+            .get("currency")
+            .and_then(serde_json::Value::as_str)
+            .and_then(Currency::from_code)
+            .ok_or(PriceMetaError::Field("currency"))?;
+        let fetched_at = v
+            .get("fetched_at")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(PriceMetaError::Field("fetched_at"))?;
+        let source_raw = v
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(PriceMetaError::Field("source"))?;
+        let source = match source_raw {
+            "coingecko" => PriceSource::CoinGecko,
+            "jupiter" => PriceSource::Jupiter,
+            other => return Err(PriceMetaError::Source(other.to_string())),
+        };
+        Ok(SolPrice {
+            value,
+            currency,
+            fetched_at,
+            source,
         })
     }
 }
 
 pub const COINGECKO_BACKOFF_SECS: u64 = 300;
+
+#[derive(Clone)]
+struct PriceEndpoints {
+    coingecko: String,
+    jupiter: String,
+    fx: String,
+}
+
+impl PriceEndpoints {
+    fn live() -> Self {
+        PriceEndpoints {
+            coingecko: "https://api.coingecko.com/api/v3/simple/price".to_string(),
+            jupiter: "https://lite-api.jup.ag/price/v3".to_string(),
+            fx: "https://api.frankfurter.dev/v1/latest".to_string(),
+        }
+    }
+
+    fn coingecko_url(&self, currency: Currency) -> String {
+        format!(
+            "{}?ids=solana&vs_currencies={}",
+            self.coingecko,
+            currency.code()
+        )
+    }
+
+    fn jupiter_url(&self) -> String {
+        format!("{}?ids={SOL_MINT}", self.jupiter)
+    }
+
+    fn fx_url(&self, currency: Currency) -> String {
+        format!(
+            "{}?base=USD&symbols={}",
+            self.fx,
+            currency.code().to_ascii_uppercase()
+        )
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PriceError {
@@ -107,11 +175,20 @@ pub async fn fetch_price(
     client: &reqwest::Client,
     currency: Currency,
 ) -> Result<SolPrice, PriceError> {
-    let primary = match fetch_coingecko(client, currency).await {
+    let endpoints = PriceEndpoints::live();
+    fetch_price_with_endpoints(client, currency, &endpoints).await
+}
+
+async fn fetch_price_with_endpoints(
+    client: &reqwest::Client,
+    currency: Currency,
+    endpoints: &PriceEndpoints,
+) -> Result<SolPrice, PriceError> {
+    let primary = match fetch_coingecko(client, currency, endpoints).await {
         Ok(p) => return Ok(p),
         Err(e) => e,
     };
-    fetch_price_fallback_only(client, currency)
+    fetch_price_fallback_only_with_endpoints(client, currency, endpoints)
         .await
         .map_err(|fallback| PriceError::Fallback {
             primary: Box::new(primary),
@@ -123,11 +200,20 @@ pub async fn fetch_price_fallback_only(
     client: &reqwest::Client,
     currency: Currency,
 ) -> Result<SolPrice, PriceError> {
-    let usd = fetch_jupiter(client).await?;
+    let endpoints = PriceEndpoints::live();
+    fetch_price_fallback_only_with_endpoints(client, currency, &endpoints).await
+}
+
+async fn fetch_price_fallback_only_with_endpoints(
+    client: &reqwest::Client,
+    currency: Currency,
+    endpoints: &PriceEndpoints,
+) -> Result<SolPrice, PriceError> {
+    let usd = fetch_jupiter(client, endpoints).await?;
     if currency == Currency::Usd {
         return Ok(usd);
     }
-    let rate = fetch_fx_rate(client, currency).await?;
+    let rate = fetch_fx_rate(client, currency, endpoints).await?;
     validate(usd.value * rate, currency, PriceSource::Jupiter)
 }
 
@@ -136,23 +222,42 @@ pub async fn fetch_price_backoff_aware(
     currency: Currency,
     skip_coingecko: bool,
 ) -> (Result<SolPrice, PriceError>, bool) {
+    let endpoints = PriceEndpoints::live();
+    fetch_price_backoff_aware_with_endpoints(client, currency, skip_coingecko, &endpoints).await
+}
+
+async fn fetch_price_backoff_aware_with_endpoints(
+    client: &reqwest::Client,
+    currency: Currency,
+    skip_coingecko: bool,
+    endpoints: &PriceEndpoints,
+) -> (Result<SolPrice, PriceError>, bool) {
     if !skip_coingecko {
-        match fetch_coingecko(client, currency).await {
+        match fetch_coingecko(client, currency, endpoints).await {
             Ok(p) => return (Ok(p), false),
             Err(PriceError::RateLimited) => {
-                return (fetch_price_fallback_only(client, currency).await, true);
+                return (
+                    fetch_price_fallback_only_with_endpoints(client, currency, endpoints).await,
+                    true,
+                );
             }
             Err(_) => {}
         }
     }
-    (fetch_price_fallback_only(client, currency).await, false)
+    (
+        fetch_price_fallback_only_with_endpoints(client, currency, endpoints).await,
+        false,
+    )
 }
 
-async fn fetch_fx_rate(client: &reqwest::Client, currency: Currency) -> Result<f64, PriceError> {
+async fn fetch_fx_rate(
+    client: &reqwest::Client,
+    currency: Currency,
+    endpoints: &PriceEndpoints,
+) -> Result<f64, PriceError> {
     let code = currency.code().to_ascii_uppercase();
-    let url = format!("https://api.frankfurter.dev/v1/latest?base=USD&symbols={code}");
     let resp = client
-        .get(url)
+        .get(endpoints.fx_url(currency))
         .send()
         .await
         .map_err(|e| PriceError::Http(e.to_string()))?
@@ -174,13 +279,10 @@ async fn fetch_fx_rate(client: &reqwest::Client, currency: Currency) -> Result<f
 async fn fetch_coingecko(
     client: &reqwest::Client,
     currency: Currency,
+    endpoints: &PriceEndpoints,
 ) -> Result<SolPrice, PriceError> {
-    let url = format!(
-        "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies={}",
-        currency.code()
-    );
     let resp = client
-        .get(url)
+        .get(endpoints.coingecko_url(currency))
         .send()
         .await
         .map_err(|e| PriceError::Http(e.to_string()))?;
@@ -200,15 +302,17 @@ async fn fetch_coingecko(
     validate(value, currency, PriceSource::CoinGecko)
 }
 
-async fn fetch_jupiter(client: &reqwest::Client) -> Result<SolPrice, PriceError> {
+async fn fetch_jupiter(
+    client: &reqwest::Client,
+    endpoints: &PriceEndpoints,
+) -> Result<SolPrice, PriceError> {
     #[derive(serde::Deserialize)]
     struct Entry {
         #[serde(rename = "usdPrice")]
         usd_price: f64,
     }
-    let url = format!("https://lite-api.jup.ag/price/v3?ids={SOL_MINT}");
     let resp = client
-        .get(url)
+        .get(endpoints.jupiter_url())
         .send()
         .await
         .map_err(|e| PriceError::Http(e.to_string()))?
@@ -228,16 +332,16 @@ impl PriceCache {
         Self::default()
     }
     pub fn get(&self) -> Option<SolPrice> {
-        *self.inner.read().unwrap()
+        *self.inner.read_recover()
     }
     pub fn set(&self, p: SolPrice) {
-        *self.inner.write().unwrap() = Some(p);
+        *self.inner.write_recover() = Some(p);
     }
     pub fn clear(&self) {
-        *self.inner.write().unwrap() = None;
+        *self.inner.write_recover() = None;
     }
     pub fn seed(&self, p: SolPrice) {
-        let mut g = self.inner.write().unwrap();
+        let mut g = self.inner.write_recover();
         if g.is_none() {
             *g = Some(p);
         }
@@ -247,6 +351,134 @@ impl PriceCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+
+    struct MockResponse {
+        status: u16,
+        headers: Vec<(&'static str, &'static str)>,
+        body: String,
+    }
+
+    impl MockResponse {
+        fn new(status: u16, body: impl Into<String>) -> Self {
+            MockResponse {
+                status,
+                headers: Vec::new(),
+                body: body.into(),
+            }
+        }
+    }
+
+    struct MockServer {
+        url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+        _worker: std::thread::JoinHandle<()>,
+    }
+
+    impl MockServer {
+        fn new(responses: Vec<MockResponse>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let requests_for_thread = requests.clone();
+            let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
+            let responses_for_thread = responses.clone();
+            let worker = std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let mut stream = stream.unwrap();
+                    let request = read_request(&mut stream);
+                    requests_for_thread.lock().unwrap().push(request);
+                    let response = responses_for_thread
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or_else(|| MockResponse::new(500, "unexpected request"));
+                    let done = responses_for_thread.lock().unwrap().is_empty();
+                    write_response(&mut stream, response);
+                    if done {
+                        break;
+                    }
+                }
+            });
+            MockServer {
+                url,
+                requests,
+                _worker: worker,
+            }
+        }
+
+        fn endpoints(&self) -> PriceEndpoints {
+            PriceEndpoints {
+                coingecko: format!("{}/coingecko", self.url),
+                jupiter: format!("{}/jupiter", self.url),
+                fx: format!("{}/fx", self.url),
+            }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    fn read_request(stream: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut tmp).unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&buf[..end]);
+                let len = content_length(&headers);
+                if buf.len().saturating_sub(end + 4) >= len {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn content_length(headers: &str) -> usize {
+        headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0)
+    }
+
+    fn write_response(stream: &mut TcpStream, response: MockResponse) {
+        let reason = match response.status {
+            200 => "OK",
+            408 => "Request Timeout",
+            429 => "Too Many Requests",
+            500 => "Internal Server Error",
+            _ => "OK",
+        };
+        let mut head = format!(
+            "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            response.status,
+            reason,
+            response.body.len()
+        );
+        for (name, value) in response.headers {
+            head.push_str(name);
+            head.push_str(": ");
+            head.push_str(value);
+            head.push_str("\r\n");
+        }
+        head.push_str("\r\n");
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(response.body.as_bytes()).unwrap();
+    }
 
     #[test]
     fn decode_coingecko_shape() {
@@ -296,6 +528,15 @@ mod tests {
     }
 
     #[test]
+    fn meta_json_rejects_unknown_source() {
+        let err = SolPrice::from_meta_json(
+            r#"{"value":146.31,"currency":"usd","fetched_at":1700000000,"source":"mystery"}"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PriceMetaError::Source(_)));
+    }
+
+    #[test]
     fn validate_rejects_bad_values() {
         let c = Currency::Usd;
         assert!(validate(f64::NAN, c, PriceSource::CoinGecko).is_err());
@@ -337,6 +578,68 @@ mod tests {
             source: PriceSource::Jupiter,
         };
         assert!(old.is_stale());
+    }
+
+    #[test]
+    fn cache_recovers_from_poison() {
+        let c = Arc::new(PriceCache::new());
+        let c2 = c.clone();
+        let _ = std::thread::spawn(move || {
+            let mut g = c2.inner.write().unwrap();
+            *g = Some(SolPrice {
+                value: 10.0,
+                currency: Currency::Usd,
+                fetched_at: now_secs(),
+                source: PriceSource::CoinGecko,
+            });
+            panic!("poison it");
+        })
+        .join();
+        assert_eq!(c.get().unwrap().value, 10.0);
+        c.clear();
+        assert!(c.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn coingecko_429_falls_back_to_jupiter() {
+        let body = format!(r#"{{"{SOL_MINT}":{{"usdPrice":146.31}}}}"#);
+        let server = MockServer::new(vec![
+            MockResponse::new(429, ""),
+            MockResponse::new(200, body),
+        ]);
+        let endpoints = server.endpoints();
+        let client = reqwest::Client::new();
+        let (result, backed_off) =
+            fetch_price_backoff_aware_with_endpoints(&client, Currency::Usd, false, &endpoints)
+                .await;
+        let p = result.unwrap();
+        assert!(backed_off);
+        assert_eq!(p.source, PriceSource::Jupiter);
+        assert_eq!(p.value, 146.31);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("/coingecko?ids=solana&vs_currencies=usd"));
+        assert!(requests[1].contains("/jupiter?ids="));
+    }
+
+    #[tokio::test]
+    async fn malformed_provider_payloads_return_parse_errors() {
+        let server = MockServer::new(vec![
+            MockResponse::new(200, r#"{"solana":{}}"#),
+            MockResponse::new(200, r#"{}"#),
+        ]);
+        let endpoints = server.endpoints();
+        let client = reqwest::Client::new();
+        let err = fetch_price_with_endpoints(&client, Currency::Usd, &endpoints)
+            .await
+            .unwrap_err();
+        match err {
+            PriceError::Fallback { primary, fallback } => {
+                assert!(matches!(*primary, PriceError::Parse));
+                assert!(matches!(*fallback, PriceError::Parse));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[tokio::test]
