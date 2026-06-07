@@ -189,7 +189,7 @@ impl Db {
             .context("missing audit_key_salt")?;
         let salt = from_hex32(&salt_hex).context("corrupt audit_key_salt")?;
         let mut k = [0u8; 32];
-        crate::crypto::hkdf_sha256(vault_key, &salt, b"silo-audit-key-v1", &mut k);
+        crate::crypto::hkdf_sha256(vault_key, &salt, b"silo-audit-key-v1", &mut k)?;
         self.audit_key = Some(k);
         Ok(())
     }
