@@ -138,6 +138,55 @@ fn disable_bracketed_paste(w: &mut impl std::io::Write) {
     let _ = execute!(w, DisableBracketedPaste);
 }
 
+struct Shutdown {
+    #[cfg(unix)]
+    term: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    hup: Option<tokio::signal::unix::Signal>,
+}
+
+impl Shutdown {
+    fn new() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Shutdown {
+                term: signal(SignalKind::terminate()).ok(),
+                hup: signal(SignalKind::hangup()).ok(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Shutdown {}
+        }
+    }
+
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            match (self.term.as_mut(), self.hup.as_mut()) {
+                (Some(t), Some(h)) => {
+                    tokio::select! {
+                        _ = t.recv() => {}
+                        _ = h.recv() => {}
+                    }
+                }
+                (Some(t), None) => {
+                    let _ = t.recv().await;
+                }
+                (None, Some(h)) => {
+                    let _ = h.recv().await;
+                }
+                (None, None) => std::future::pending::<()>().await,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
 async fn run(
     terminal: &mut ratatui::DefaultTerminal,
     mut app: App,
@@ -146,6 +195,7 @@ async fn run(
 ) -> Result<()> {
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
+    let mut shutdown = Shutdown::new();
     let mut worker_done = false;
 
     let loop_result = loop {
@@ -176,6 +226,9 @@ async fn run(
                 app.maybe_auto_lock();
                 app.maybe_auto_refresh();
             }
+            _ = shutdown.recv() => {
+                app.stop();
+            }
         }
         if !app.is_running() {
             break Ok(());
@@ -192,12 +245,24 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::disable_bracketed_paste;
+    use super::{Shutdown, disable_bracketed_paste};
 
     #[test]
     fn teardown_emits_disable_bracketed_paste() {
         let mut buf: Vec<u8> = Vec::new();
         disable_bracketed_paste(&mut buf);
         assert_eq!(buf, b"\x1b[?2004l");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn shutdown_recv_wakes_on_sigterm() {
+        let mut shutdown = Shutdown::new();
+        unsafe {
+            libc::raise(libc::SIGTERM);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), shutdown.recv())
+            .await
+            .expect("SIGTERM must wake the shutdown future so the run loop can stop");
     }
 }
