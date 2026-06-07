@@ -29,6 +29,32 @@ jobs:
         with:
           command: check advisories licenses bans sources
 
+  release-workflow-installer-policy:
+    name: release workflow installer policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check release installer patterns
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          workflow = pathlib.Path('.github/workflows/release.yml')
+          text = workflow.read_text()
+          patterns = [
+              re.compile(r'curl[^\n|;]*\|[^\n]*(?:sh|bash)\b'),
+              re.compile(r'sh\.rustup\.rs'),
+          ]
+          for pattern in patterns:
+              match = pattern.search(text)
+              if match:
+                  line = text[:match.start()].count('\n') + 1
+                  print(f'{workflow}:{line}: disallowed installer pattern: {match.group(0)}')
+                  sys.exit(1)
+          PY
+
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest
