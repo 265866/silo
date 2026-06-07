@@ -996,16 +996,27 @@ async fn finalize(
     }) else {
         return;
     };
-    let final_status = if matches!(outcome, Ok(IntentTransitionOutcome::Applied)) {
-        status
-    } else {
-        match db.with_current(generation, cmd_gen, |d| {
+    let final_status = match outcome {
+        Ok(IntentTransitionOutcome::Applied) => status,
+        Err(e) => {
+            send_error(
+                evt,
+                cmd_gen,
+                format!(
+                    "transfer {} on-chain but could not be recorded locally — will reconcile on restart: {e}",
+                    status.as_str()
+                ),
+            )
+            .await;
+            status
+        }
+        Ok(_) => match db.with_current(generation, cmd_gen, |d| {
             d.get_intent(intent_id).ok().flatten().map(|i| i.status)
         }) {
             Some(Some(s)) => s,
             Some(None) => status,
             None => return,
-        }
+        },
     };
     let outcome = match final_status {
         IntentStatus::Confirmed => TransferOutcome::Confirmed {
@@ -1752,6 +1763,57 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn finalize_surfaces_db_write_failure_instead_of_dropping_result() {
+        let (db, sub_id) = storage_with_wallets();
+        let to = crate::crypto::derive_address(&test_seed(), 0);
+        let intent = db
+            .with_mut(|d| d.create_intent(sub_id, &to, 1_000, None))
+            .unwrap();
+        db.with_mut(|d| d.lock_audit_key());
+        let (evt_tx, mut evt_rx) = mpsc::channel(8);
+        let generation = Arc::new(AtomicU64::new(0));
+
+        finalize(
+            &db,
+            &evt_tx,
+            intent.id,
+            "sig-finalize-err",
+            IntentStatus::Confirmed,
+            None,
+            &generation,
+            0,
+        )
+        .await;
+
+        let mut saw_error = false;
+        let mut saw_result = false;
+        while let Ok(ev) = evt_rx.try_recv() {
+            match ev {
+                AppEvent::Error { message, .. } => {
+                    assert!(message.contains("could not be recorded locally"));
+                    saw_error = true;
+                }
+                AppEvent::TransferResult {
+                    intent_id, outcome, ..
+                } => {
+                    assert_eq!(intent_id, intent.id);
+                    assert!(matches!(outcome, TransferOutcome::Confirmed { .. }));
+                    saw_result = true;
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(
+            saw_error,
+            "a DB write failure while finalizing must be surfaced as an error event"
+        );
+        assert!(
+            saw_result,
+            "the on-chain confirmation must still reach the UI, not be silently dropped"
+        );
     }
 
     #[tokio::test]
