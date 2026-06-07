@@ -52,6 +52,19 @@ pub enum SetupStage {
     SetPassphrase,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingChange {
+    Currency(crate::types::Currency),
+    Priority(u64),
+    AutoLock(u64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalletTextField {
+    Label,
+    Note,
+}
+
 #[derive(Debug)]
 pub enum Command {
     Reconcile,
@@ -66,11 +79,66 @@ pub enum Command {
         lamports: u64,
         priority_micro: u64,
     },
+    PersistSignedSend {
+        pending: PendingSend,
+        from: WalletRow,
+        wire: Vec<u8>,
+        sig_b58: String,
+    },
     Broadcast {
         intent_id: i64,
     },
     ChangeRpc {
         url: String,
+    },
+    UnlockVault {
+        vault_path: std::path::PathBuf,
+        passphrase: Zeroizing<String>,
+    },
+    FinishSetup {
+        vault_path: std::path::PathBuf,
+        config_dir: std::path::PathBuf,
+        current_profile: Option<String>,
+        creating: bool,
+        phrase: Zeroizing<String>,
+        passphrase: Zeroizing<String>,
+    },
+    DeleteProfile {
+        config_dir: std::path::PathBuf,
+        id: String,
+    },
+    ClipboardCopy {
+        text: String,
+        ok_label: String,
+        arm_hot_refresh: bool,
+    },
+    ClipboardPaste {
+        target: PasteTarget,
+    },
+    ArchiveWallet {
+        id: i64,
+        want: bool,
+    },
+    DeriveSubwallet {
+        seed: Seed,
+    },
+    PersistSetting {
+        change: SettingChange,
+    },
+    SetWalletText {
+        id: i64,
+        field: WalletTextField,
+        value: Option<String>,
+    },
+    SetIntentNote {
+        wallet_id: i64,
+        id: i64,
+        value: Option<String>,
+    },
+    RenameProfile {
+        config_dir: std::path::PathBuf,
+        id: String,
+        name: String,
     },
 }
 
@@ -80,8 +148,18 @@ impl Command {
             self,
             Command::Reconcile
                 | Command::PrepareSend { .. }
+                | Command::PersistSignedSend { .. }
                 | Command::Broadcast { .. }
                 | Command::ChangeRpc { .. }
+                | Command::UnlockVault { .. }
+                | Command::FinishSetup { .. }
+                | Command::DeleteProfile { .. }
+                | Command::ArchiveWallet { .. }
+                | Command::DeriveSubwallet { .. }
+                | Command::PersistSetting { .. }
+                | Command::SetWalletText { .. }
+                | Command::SetIntentNote { .. }
+                | Command::RenameProfile { .. }
         )
     }
 }
@@ -127,6 +205,59 @@ pub enum AppEvent {
         outcome: TransferOutcome,
         generation: u64,
     },
+    SendPersisted {
+        result: SendPersistResult,
+        generation: u64,
+    },
+    UnlockComplete {
+        result: UnlockResult,
+        generation: u64,
+    },
+    SetupComplete {
+        result: SetupResult,
+        generation: u64,
+    },
+    ProfileDeleted {
+        result: ProfileDeleteResult,
+        generation: u64,
+    },
+    ClipboardCopied {
+        result: ClipboardCopyResult,
+        generation: u64,
+    },
+    ClipboardPasted {
+        target: PasteTarget,
+        result: Result<String, String>,
+        generation: u64,
+    },
+    WalletArchived {
+        id: i64,
+        want: bool,
+        result: Result<Vec<WalletRow>, String>,
+        generation: u64,
+    },
+    SubwalletDerived {
+        result: Result<(u32, Vec<WalletRow>), String>,
+        generation: u64,
+    },
+    SettingPersisted {
+        change: SettingChange,
+        result: Result<(), String>,
+        generation: u64,
+    },
+    WalletTextSet {
+        field: WalletTextField,
+        result: Result<Vec<WalletRow>, String>,
+        generation: u64,
+    },
+    IntentNoteSet {
+        result: Result<Vec<Intent>, String>,
+        generation: u64,
+    },
+    ProfileRenamed {
+        result: Result<Vec<crate::profiles::ProfileMeta>, String>,
+        generation: u64,
+    },
     RpcChanged {
         url: String,
         generation: u64,
@@ -139,6 +270,54 @@ pub enum AppEvent {
         message: String,
         generation: u64,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasteTarget {
+    SendTo,
+    SendAmount,
+}
+
+#[derive(Debug)]
+pub enum UnlockResult {
+    Unlocked { seed: Seed, wallets: Vec<WalletRow> },
+    WrongPassphrase,
+    AuditKey,
+    WalletMismatch,
+    WalletRead(String),
+    AuditChainFailed,
+    AuditChainRead(String),
+}
+
+#[derive(Debug)]
+pub enum SetupResult {
+    Finished {
+        seed: Seed,
+        wallets: Vec<WalletRow>,
+        profiles: Vec<crate::profiles::ProfileMeta>,
+    },
+    Failed(String),
+}
+
+#[derive(Debug)]
+pub enum SendPersistResult {
+    Signed { intent_id: i64 },
+    Failed(String),
+}
+
+#[derive(Debug)]
+pub enum ProfileDeleteResult {
+    Deleted {
+        profiles: Vec<crate::profiles::ProfileMeta>,
+    },
+    Failed(String),
+}
+
+#[derive(Debug)]
+pub struct ClipboardCopyResult {
+    pub outcome: Result<crate::clipboard::CopyOutcome, String>,
+    pub ok_label: String,
+    pub arm_hot_refresh: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -202,6 +381,7 @@ pub enum Modal {
     },
 }
 
+#[derive(Clone, Debug)]
 pub struct PendingSend {
     pub from_id: i64,
     pub to: String,
@@ -339,6 +519,7 @@ pub struct App {
     pub(crate) audit: Vec<crate::types::AuditEntry>,
     pub(crate) pending_send: Option<PendingSend>,
     pub(crate) send_confirm_armed: bool,
+    pub(crate) blocking_input: bool,
 
     pub(crate) last_activity: Instant,
     pub(crate) last_wall: SystemTime,
@@ -413,6 +594,7 @@ impl App {
             audit: Vec::new(),
             pending_send: None,
             send_confirm_armed: false,
+            blocking_input: false,
             last_activity: Instant::now(),
             last_wall: SystemTime::now(),
             #[cfg(target_os = "linux")]
@@ -998,7 +1180,12 @@ impl App {
     }
 
     pub fn try_reload_wallets(&mut self) -> anyhow::Result<()> {
-        let mut rows = self.db.with(|d| d.list_wallets())?;
+        let rows = self.db.with(|d| d.list_wallets())?;
+        self.apply_reloaded_wallets(rows);
+        Ok(())
+    }
+
+    pub fn apply_reloaded_wallets(&mut self, mut rows: Vec<WalletRow>) {
         for r in &mut rows {
             if let Some(old) = self.wallets.iter().find(|w| w.id == r.id) {
                 r.balance_lamports = old.balance_lamports;
@@ -1006,7 +1193,6 @@ impl App {
         }
         self.wallets = rows;
         self.clamp_list_selection();
-        Ok(())
     }
 
     pub fn reload_wallets(&mut self) {
@@ -1202,6 +1388,309 @@ impl App {
                     }
                 }
                 self.refresh_detail_intents();
+            }
+            AppEvent::SendPersisted { result, generation } => {
+                if generation != self.generation.load(Ordering::SeqCst) {
+                    return;
+                }
+                self.blocking_input = false;
+                match result {
+                    SendPersistResult::Signed { intent_id } => {
+                        if self.send_cmd(Command::Broadcast { intent_id }) {
+                            self.route = Route::WalletDetail;
+                            self.refresh_detail_intents();
+                            self.toast_info("Signing & broadcasting…");
+                        }
+                    }
+                    SendPersistResult::Failed(reason) => self.toast_err(reason),
+                }
+            }
+            AppEvent::UnlockComplete { result, generation } => {
+                if generation != self.generation.load(Ordering::SeqCst) {
+                    return;
+                }
+                self.blocking_input = false;
+                match result {
+                    UnlockResult::Unlocked { seed, wallets } => {
+                        self.seed = Some(seed);
+                        self.wallets = wallets;
+                        self.clamp_list_selection();
+                        self.route = Route::WalletList;
+                        self.note_activity();
+                        self.send_cmd(Command::Reconcile);
+                        self.request_balance_refresh();
+                        self.toast_ok("Unlocked");
+                    }
+                    UnlockResult::WrongPassphrase => self.toast_err("Wrong passphrase"),
+                    UnlockResult::AuditKey => {
+                        self.modal = Some(Modal::Error {
+                            title: "Cannot open audit log".into(),
+                            body: "The audit key could not be derived (database/vault inconsistent). Refusing to operate.".into(),
+                        });
+                    }
+                    UnlockResult::WalletMismatch => {
+                        self.modal = Some(Modal::Error {
+                            title: "Database / vault mismatch".into(),
+                            body: "A stored wallet address does not match this recovery phrase. Refusing to operate to avoid misrouting funds.".into(),
+                        });
+                    }
+                    UnlockResult::WalletRead(e) => {
+                        self.modal = Some(Modal::Error {
+                            title: "Cannot verify wallet database".into(),
+                            body: format!(
+                                "Wallet metadata could not be read: {e}. Refusing to operate."
+                            ),
+                        });
+                    }
+                    UnlockResult::AuditChainFailed => {
+                        self.modal = Some(Modal::Error {
+                            title: "Audit log integrity check failed".into(),
+                            body: "The audit log does not match its stored integrity chain. Refusing to operate.".into(),
+                        });
+                    }
+                    UnlockResult::AuditChainRead(e) => {
+                        self.modal = Some(Modal::Error {
+                            title: "Cannot verify audit log".into(),
+                            body: format!(
+                                "Audit chain verification failed: {e}. Refusing to operate."
+                            ),
+                        });
+                    }
+                }
+            }
+            AppEvent::SetupComplete { result, generation } => {
+                if generation != self.generation.load(Ordering::SeqCst) {
+                    return;
+                }
+                self.blocking_input = false;
+                match result {
+                    SetupResult::Finished {
+                        seed,
+                        wallets,
+                        profiles,
+                    } => {
+                        self.seed = Some(seed);
+                        self.profiles = profiles;
+                        self.wallets = wallets;
+                        self.clamp_list_selection();
+                        self.setup
+                            .mnemonic_words
+                            .iter_mut()
+                            .for_each(|w| w.zeroize());
+                        self.setup.mnemonic_words.clear();
+                        self.setup.scrub_confirm();
+                        self.input.zeroize_secrets();
+                        self.route = Route::WalletList;
+                        self.note_activity();
+                        self.send_cmd(Command::FetchRentExempt);
+                        self.send_cmd(Command::FetchPrice);
+                        self.send_cmd(Command::Reconcile);
+                        self.request_balance_refresh();
+                        self.toast_ok("Vault created");
+                        self.celebrate_center();
+                    }
+                    SetupResult::Failed(reason) => self.toast_err(reason),
+                }
+            }
+            AppEvent::ProfileDeleted { result, generation } => {
+                if generation != self.generation.load(Ordering::SeqCst) {
+                    return;
+                }
+                self.blocking_input = false;
+                match result {
+                    ProfileDeleteResult::Deleted { profiles } => {
+                        self.profiles = profiles;
+                        if self.profiles.is_empty() {
+                            self.begin_new_profile();
+                            self.toast_info("Profile deleted — set up a new wallet");
+                        } else {
+                            for (idx, profile) in self.profiles.clone().into_iter().enumerate() {
+                                if self.switch_to_profile(&profile.id).is_ok() {
+                                    self.profile_sel = idx;
+                                    self.route = Route::ProfileSelect;
+                                    self.toast_ok("Profile deleted");
+                                    return;
+                                }
+                            }
+                            self.toast_err(
+                                "Profile deleted, but no remaining profile could be opened",
+                            );
+                            self.begin_new_profile();
+                        }
+                    }
+                    ProfileDeleteResult::Failed(reason) => self.toast_err(reason),
+                }
+            }
+            AppEvent::ClipboardCopied { result, generation } => {
+                if generation != self.generation.load(Ordering::SeqCst) {
+                    return;
+                }
+                match result.outcome {
+                    Ok(crate::clipboard::CopyOutcome::Persistent) => {
+                        self.toast_ok(result.ok_label);
+                        if result.arm_hot_refresh {
+                            self.arm_hot_refresh();
+                        }
+                    }
+                    Ok(crate::clipboard::CopyOutcome::NonPersistent) => {
+                        self.toast_info("Copied (won't persist after exit on this compositor)");
+                        if result.arm_hot_refresh {
+                            self.arm_hot_refresh();
+                        }
+                    }
+                    Ok(crate::clipboard::CopyOutcome::PersistenceUnknown) => {
+                        self.toast_info("Copied (persistence not confirmed)");
+                        if result.arm_hot_refresh {
+                            self.arm_hot_refresh();
+                        }
+                    }
+                    Err(e) => self.toast_err(format!("Copy failed: {e}")),
+                }
+            }
+            AppEvent::ClipboardPasted {
+                target,
+                result,
+                generation,
+            } => {
+                if generation != self.generation.load(Ordering::SeqCst) || self.route != Route::Send
+                {
+                    return;
+                }
+                match result {
+                    Ok(text) => match target {
+                        PasteTarget::SendTo => self.input.send_to = text.trim().to_string(),
+                        PasteTarget::SendAmount => self.input.send_amount = text.trim().to_string(),
+                    },
+                    Err(e) => self.toast_err(format!("Paste failed: {e}")),
+                }
+            }
+            AppEvent::WalletArchived {
+                id,
+                want,
+                result,
+                generation,
+            } => {
+                if generation != self.generation.load(Ordering::SeqCst) {
+                    return;
+                }
+                match result {
+                    Ok(wallets) => {
+                        self.apply_reloaded_wallets(wallets);
+                        if want {
+                            let sel = self.list_state.selected().unwrap_or(0);
+                            self.list_state.select(Some(sel.saturating_sub(1)));
+                            self.clamp_list_selection();
+                        } else {
+                            self.select_wallet_by_id(id);
+                        }
+                        self.toast_ok(if want { "Archived" } else { "Unarchived" });
+                    }
+                    Err(e) => self.toast_err(e),
+                }
+            }
+            AppEvent::SubwalletDerived { result, generation } => {
+                if generation != self.generation.load(Ordering::SeqCst) {
+                    return;
+                }
+                match result {
+                    Ok((idx, wallets)) => {
+                        self.apply_reloaded_wallets(wallets);
+                        self.request_balance_refresh();
+                        self.toast_ok(format!("Derived subwallet #{idx}"));
+                    }
+                    Err(_) => self.toast_err("Could not derive subwallet"),
+                }
+            }
+            AppEvent::SettingPersisted {
+                change,
+                result,
+                generation,
+            } => {
+                if generation != self.generation.load(Ordering::SeqCst) {
+                    return;
+                }
+                match (change, result) {
+                    (SettingChange::Currency(c), Ok(())) => {
+                        self.currency = c;
+                        self.price.clear();
+                        self.reset_price_baseline();
+                        self.send_cmd(Command::FetchPrice);
+                        self.toast_info(format!("Currency: {}", self.currency.label()));
+                    }
+                    (SettingChange::Priority(p), Ok(())) => {
+                        self.priority_micro = p;
+                        self.toast_info(format!(
+                            "Priority fee: {} (≈ {} SOL)",
+                            crate::money::priority_label(self.priority_micro),
+                            crate::money::format_lamports(crate::money::priority_fee_lamports(
+                                self.priority_micro
+                            ))
+                        ));
+                    }
+                    (SettingChange::AutoLock(m), Ok(())) => {
+                        self.auto_lock_after = Duration::from_secs(m * 60);
+                        self.toast_info(format!("Auto-lock after {m} min"));
+                    }
+                    (SettingChange::Currency(_), Err(e)) => {
+                        self.toast_err(format!("Could not save currency: {e}"))
+                    }
+                    (SettingChange::Priority(_), Err(e)) => {
+                        self.toast_err(format!("Could not save priority fee: {e}"))
+                    }
+                    (SettingChange::AutoLock(_), Err(e)) => {
+                        self.toast_err(format!("Could not save auto-lock: {e}"))
+                    }
+                }
+            }
+            AppEvent::WalletTextSet {
+                field,
+                result,
+                generation,
+            } => {
+                if generation != self.generation.load(Ordering::SeqCst) {
+                    return;
+                }
+                match result {
+                    Ok(wallets) => {
+                        self.apply_reloaded_wallets(wallets);
+                        self.toast_ok(match field {
+                            WalletTextField::Label => "Label updated",
+                            WalletTextField::Note => "Note updated",
+                        });
+                    }
+                    Err(e) => self.toast_err(match field {
+                        WalletTextField::Label => format!("Could not save label: {e}"),
+                        WalletTextField::Note => format!("Could not save note: {e}"),
+                    }),
+                }
+            }
+            AppEvent::IntentNoteSet { result, generation } => {
+                if generation != self.generation.load(Ordering::SeqCst) {
+                    return;
+                }
+                match result {
+                    Ok(intents) => {
+                        self.detail_intents = intents;
+                        self.history_state.select(None);
+                        self.toast_ok("Transfer note updated");
+                    }
+                    Err(e) => self.toast_err(format!("Could not save transfer note: {e}")),
+                }
+            }
+            AppEvent::ProfileRenamed { result, generation } => {
+                if generation != self.generation.load(Ordering::SeqCst) {
+                    return;
+                }
+                match result {
+                    Ok(profiles) => {
+                        self.profiles = profiles;
+                        if self.profile_sel >= self.profiles.len() {
+                            self.profile_sel = self.profiles.len().saturating_sub(1);
+                        }
+                        self.toast_ok("Renamed");
+                    }
+                    Err(e) => self.toast_err(e),
+                }
             }
             AppEvent::RpcChanged { url, generation } => {
                 if generation != self.generation.load(Ordering::SeqCst) {

@@ -5,7 +5,10 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use tokio::sync::{Semaphore, mpsc, watch};
 
-use crate::app::{AppEvent, Command};
+use crate::app::{
+    AppEvent, ClipboardCopyResult, Command, PasteTarget, ProfileDeleteResult, SendPersistResult,
+    SettingChange, SetupResult, UnlockResult, WalletTextField,
+};
 use crate::db::{IntentTransitionOutcome, Storage};
 use crate::price::{
     COINGECKO_BACKOFF_SECS, PriceCache, SolPrice, fetch_price, fetch_price_backoff_aware,
@@ -187,6 +190,234 @@ pub fn spawn_workers(
     })
 }
 
+fn next_wallet_name(profiles: &[crate::profiles::ProfileMeta]) -> String {
+    let max = profiles
+        .iter()
+        .filter_map(|p| p.name.strip_prefix("Wallet "))
+        .filter_map(|n| n.trim().parse::<u32>().ok())
+        .max()
+        .unwrap_or(0);
+    format!("Wallet {}", max + 1)
+}
+
+fn wallet_consistency(
+    db: &Storage,
+    seed: &crate::crypto::Seed,
+) -> Result<Vec<crate::types::WalletRow>, String> {
+    let wallets = db.with(|d| d.list_wallets()).map_err(|e| e.to_string())?;
+    if wallets
+        .iter()
+        .all(|w| crate::crypto::derive_address(seed, w.account_index) == w.pubkey)
+    {
+        Ok(wallets)
+    } else {
+        Err("wallet mismatch".to_string())
+    }
+}
+
+fn unlock_vault_blocking(
+    db: Storage,
+    vault_path: std::path::PathBuf,
+    passphrase: zeroize::Zeroizing<String>,
+) -> UnlockResult {
+    let unlocked = crate::vault::unlock_vault_keyed(&vault_path, &passphrase);
+    drop(passphrase);
+    let (mnemonic, vault_key) = match unlocked {
+        Ok(v) => v,
+        Err(_) => {
+            db.with_mut(|d| {
+                let _ = d.audit(AuditEvent::VaultUnlockFailed, &serde_json::json!({}));
+            });
+            return UnlockResult::WrongPassphrase;
+        }
+    };
+    let seed = crate::crypto::seed_from_mnemonic(&mnemonic);
+    drop(mnemonic);
+    let key_ok = db.with_mut(|d| d.unlock_audit_key(vault_key.as_bytes()).is_ok());
+    drop(vault_key);
+    if !key_ok {
+        return UnlockResult::AuditKey;
+    }
+    let wallets = match wallet_consistency(&db, &seed) {
+        Ok(wallets) => wallets,
+        Err(e) if e == "wallet mismatch" => {
+            db.with_mut(|d| {
+                let _ = d.audit(AuditEvent::IntegrityCheckFailed, &serde_json::json!({}));
+            });
+            return UnlockResult::WalletMismatch;
+        }
+        Err(e) => return UnlockResult::WalletRead(e),
+    };
+    match db.with(|d| d.verify_audit_chain()) {
+        Ok(true) => {
+            db.with_mut(|d| {
+                let _ = d.audit(AuditEvent::VaultUnlocked, &serde_json::json!({}));
+            });
+            UnlockResult::Unlocked { seed, wallets }
+        }
+        Ok(false) => UnlockResult::AuditChainFailed,
+        Err(e) => UnlockResult::AuditChainRead(e.to_string()),
+    }
+}
+
+fn finish_setup_blocking(
+    db: Storage,
+    vault_path: std::path::PathBuf,
+    config_dir: std::path::PathBuf,
+    current_profile: Option<String>,
+    creating: bool,
+    phrase: zeroize::Zeroizing<String>,
+    passphrase: zeroize::Zeroizing<String>,
+) -> SetupResult {
+    let mnemonic = match crate::crypto::parse_mnemonic(&phrase) {
+        Ok(m) => m,
+        Err(e) => return SetupResult::Failed(format!("invalid phrase: {e}")),
+    };
+    drop(phrase);
+    let seed = crate::crypto::seed_from_mnemonic(&mnemonic);
+    match wallet_consistency(&db, &seed) {
+        Ok(_) => {}
+        Err(e) if e == "wallet mismatch" => {
+            db.with_mut(|d| {
+                let _ = d.audit(AuditEvent::IntegrityCheckFailed, &serde_json::json!({}));
+            });
+            return SetupResult::Failed(
+                "Existing wallet records don't match this recovery phrase. Refusing to proceed."
+                    .to_string(),
+            );
+        }
+        Err(e) => {
+            return SetupResult::Failed(format!(
+                "Wallet metadata could not be read: {e}. Refusing to proceed."
+            ));
+        }
+    }
+
+    let vault_key = if crate::vault::vault_exists(&vault_path) {
+        match crate::vault::unlock_vault_keyed(&vault_path, &passphrase) {
+            Ok((existing, key)) if existing.to_string() == mnemonic.to_string() => key,
+            Ok(_) => {
+                return SetupResult::Failed(
+                    "Existing vault does not match this recovery phrase".to_string(),
+                );
+            }
+            Err(e) => return SetupResult::Failed(format!("could not reopen existing vault: {e}")),
+        }
+    } else {
+        match crate::vault::create_vault(&vault_path, &mnemonic, &passphrase) {
+            Ok(k) => k,
+            Err(e) => return SetupResult::Failed(format!("could not create vault: {e}")),
+        }
+    };
+    drop(passphrase);
+    drop(mnemonic);
+
+    let master_ok = {
+        let master_addr = crate::crypto::derive_address(&seed, 0);
+        db.with_mut(|d| {
+            let key_ok = d.unlock_audit_key(vault_key.as_bytes()).is_ok();
+            let _ = d.audit(AuditEvent::VaultCreated, &serde_json::json!({}));
+            key_ok
+                && match d.master_exists() {
+                    Ok(true) => true,
+                    Ok(false) => d
+                        .insert_wallet(0, crate::types::Role::Master, &master_addr, None)
+                        .is_ok(),
+                    Err(_) => false,
+                }
+        })
+    };
+    drop(vault_key);
+    if !master_ok {
+        return SetupResult::Failed(
+            "Could not initialize the master wallet — please retry".to_string(),
+        );
+    }
+
+    if let Some(id) = current_profile {
+        let profiles = match crate::profiles::load(&config_dir) {
+            Ok(profiles) => profiles,
+            Err(e) => return SetupResult::Failed(format!("could not load profiles: {e}")),
+        };
+        let name = next_wallet_name(&profiles);
+        if let Err(e) = crate::profiles::register(
+            &config_dir,
+            crate::profiles::ProfileMeta {
+                id,
+                name,
+                created_at: crate::db::now_ms(),
+            },
+        ) {
+            return SetupResult::Failed(format!("could not register profile: {e}"));
+        }
+    }
+
+    let wallets = match db.with(|d| d.list_wallets()) {
+        Ok(wallets) => wallets,
+        Err(e) => return SetupResult::Failed(format!("Could not load wallets: {e}")),
+    };
+    let profiles = match crate::profiles::load(&config_dir) {
+        Ok(profiles) => profiles,
+        Err(e) => return SetupResult::Failed(format!("Could not load profiles: {e}")),
+    };
+    let _ = creating;
+    SetupResult::Finished {
+        seed,
+        wallets,
+        profiles,
+    }
+}
+
+fn persist_signed_send_blocking(
+    db: Storage,
+    pending: crate::app::PendingSend,
+    from: crate::types::WalletRow,
+    wire: Vec<u8>,
+    sig_b58: String,
+) -> SendPersistResult {
+    let created = db.with_mut(|d| d.create_intent(from.id, &pending.to, pending.lamports, None));
+    let intent = match created {
+        Ok(intent) => intent,
+        Err(crate::db::CreateIntentError::WalletHasOpenIntent) => {
+            return SendPersistResult::Failed(
+                "This wallet already has a transfer in progress".to_string(),
+            );
+        }
+        Err(e) => return SendPersistResult::Failed(format!("Could not record transfer: {e}")),
+    };
+    let signed = db.with_mut(|d| {
+        d.mark_signed(
+            intent.id,
+            &sig_b58,
+            &pending.blockhash,
+            pending.lvbh,
+            pending.fee,
+            &wire,
+        )
+    });
+    match signed {
+        Ok(IntentTransitionOutcome::Applied) => SendPersistResult::Signed {
+            intent_id: intent.id,
+        },
+        Ok(IntentTransitionOutcome::NotFound) => {
+            SendPersistResult::Failed("Transfer record vanished before signing".to_string())
+        }
+        Ok(IntentTransitionOutcome::WrongState(status)) => {
+            SendPersistResult::Failed(format!("Transfer was already {}", status.as_str()))
+        }
+        Err(e) => {
+            db.with_mut(|d| {
+                let _ = d.mark_terminal(
+                    intent.id,
+                    IntentStatus::Failed,
+                    Some("could not persist signed transfer"),
+                );
+            });
+            SendPersistResult::Failed(format!("Could not persist signed transfer: {e}"))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_command(
     cmd_gen: u64,
@@ -201,6 +432,294 @@ async fn handle_command(
     let rpc_now = { rpc.lock_recover().clone() };
 
     match cmd {
+        Command::UnlockVault {
+            vault_path,
+            passphrase,
+        } => {
+            let db = db.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                unlock_vault_blocking(db, vault_path, passphrase)
+            })
+            .await
+            .unwrap_or_else(|e| UnlockResult::AuditChainRead(e.to_string()));
+            let _ = evt
+                .send(AppEvent::UnlockComplete {
+                    result,
+                    generation: cmd_gen,
+                })
+                .await;
+        }
+
+        Command::FinishSetup {
+            vault_path,
+            config_dir,
+            current_profile,
+            creating,
+            phrase,
+            passphrase,
+        } => {
+            let db = db.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                finish_setup_blocking(
+                    db,
+                    vault_path,
+                    config_dir,
+                    current_profile,
+                    creating,
+                    phrase,
+                    passphrase,
+                )
+            })
+            .await
+            .unwrap_or_else(|e| SetupResult::Failed(format!("setup task failed: {e}")));
+            let _ = evt
+                .send(AppEvent::SetupComplete {
+                    result,
+                    generation: cmd_gen,
+                })
+                .await;
+        }
+
+        Command::PersistSignedSend {
+            pending,
+            from,
+            wire,
+            sig_b58,
+        } => {
+            let db = db.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                persist_signed_send_blocking(db, pending, from, wire, sig_b58)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                SendPersistResult::Failed(format!("send persistence task failed: {e}"))
+            });
+            let _ = evt
+                .send(AppEvent::SendPersisted {
+                    result,
+                    generation: cmd_gen,
+                })
+                .await;
+        }
+
+        Command::DeleteProfile { config_dir, id } => {
+            let result = tokio::task::spawn_blocking(move || {
+                crate::profiles::remove(&config_dir, &id)
+                    .and_then(|_| crate::profiles::load(&config_dir))
+                    .map(|profiles| ProfileDeleteResult::Deleted { profiles })
+                    .unwrap_or_else(|e| {
+                        ProfileDeleteResult::Failed(format!("Could not delete profile: {e}"))
+                    })
+            })
+            .await
+            .unwrap_or_else(|e| {
+                ProfileDeleteResult::Failed(format!("delete profile task failed: {e}"))
+            });
+            let _ = evt
+                .send(AppEvent::ProfileDeleted {
+                    result,
+                    generation: cmd_gen,
+                })
+                .await;
+        }
+
+        Command::ClipboardCopy {
+            text,
+            ok_label,
+            arm_hot_refresh,
+        } => {
+            let result = tokio::task::spawn_blocking(move || ClipboardCopyResult {
+                outcome: crate::clipboard::ClipboardManager::new()
+                    .copy(&text)
+                    .map_err(|e| e.to_string()),
+                ok_label,
+                arm_hot_refresh,
+            })
+            .await
+            .unwrap_or_else(|e| ClipboardCopyResult {
+                outcome: Err(e.to_string()),
+                ok_label: "Copied".to_string(),
+                arm_hot_refresh: false,
+            });
+            let _ = evt
+                .send(AppEvent::ClipboardCopied {
+                    result,
+                    generation: cmd_gen,
+                })
+                .await;
+        }
+
+        Command::ClipboardPaste { target } => {
+            let result = tokio::task::spawn_blocking(move || {
+                crate::clipboard::ClipboardManager::new()
+                    .paste()
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+            let _ = evt
+                .send(AppEvent::ClipboardPasted {
+                    target,
+                    result,
+                    generation: cmd_gen,
+                })
+                .await;
+        }
+
+        Command::ArchiveWallet { id, want } => {
+            let db = db.clone();
+            let generation = generation.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                db.with_current(&generation, cmd_gen, |d| -> anyhow::Result<_> {
+                    d.set_archived(id, want)?;
+                    d.list_wallets()
+                })
+            })
+            .await
+            .unwrap_or_else(|e| Some(Err(anyhow::anyhow!("archive task failed: {e}"))));
+            if let Some(res) = outcome {
+                let _ = evt
+                    .send(AppEvent::WalletArchived {
+                        id,
+                        want,
+                        result: res.map_err(|e| e.to_string()),
+                        generation: cmd_gen,
+                    })
+                    .await;
+            }
+        }
+
+        Command::DeriveSubwallet { seed } => {
+            let db = db.clone();
+            let generation = generation.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                db.with_current(&generation, cmd_gen, |d| -> anyhow::Result<_> {
+                    let idx = d.next_account_index().unwrap_or(1).max(1);
+                    let addr = crate::crypto::derive_address(&seed, idx);
+                    d.insert_wallet(idx, crate::types::Role::Sub, &addr, None)?;
+                    Ok((idx, d.list_wallets()?))
+                })
+            })
+            .await
+            .unwrap_or_else(|e| Some(Err(anyhow::anyhow!("derive task failed: {e}"))));
+            if let Some(res) = outcome {
+                let _ = evt
+                    .send(AppEvent::SubwalletDerived {
+                        result: res.map_err(|e| e.to_string()),
+                        generation: cmd_gen,
+                    })
+                    .await;
+            }
+        }
+
+        Command::PersistSetting { change } => {
+            let db = db.clone();
+            let generation = generation.clone();
+            let (key, value, details) = match change {
+                SettingChange::Currency(c) => (
+                    "currency",
+                    c.code().to_string(),
+                    json!({ "currency": c.code() }),
+                ),
+                SettingChange::Priority(p) => (
+                    "priority_fee_micro",
+                    p.to_string(),
+                    json!({ "priority_fee_micro": p }),
+                ),
+                SettingChange::AutoLock(m) => (
+                    "auto_lock_minutes",
+                    m.to_string(),
+                    json!({ "auto_lock_minutes": m }),
+                ),
+            };
+            let outcome = tokio::task::spawn_blocking(move || {
+                db.with_current(&generation, cmd_gen, |d| {
+                    d.set_meta_audited(key, &value, AuditEvent::SettingsChanged, &details)
+                })
+            })
+            .await
+            .unwrap_or_else(|e| Some(Err(anyhow::anyhow!("setting task failed: {e}"))));
+            if let Some(res) = outcome {
+                let _ = evt
+                    .send(AppEvent::SettingPersisted {
+                        change,
+                        result: res.map_err(|e| e.to_string()),
+                        generation: cmd_gen,
+                    })
+                    .await;
+            }
+        }
+
+        Command::SetWalletText { id, field, value } => {
+            let db = db.clone();
+            let generation = generation.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                db.with_current(&generation, cmd_gen, |d| -> anyhow::Result<_> {
+                    match field {
+                        WalletTextField::Label => d.set_label(id, value.as_deref())?,
+                        WalletTextField::Note => d.set_note(id, value.as_deref())?,
+                    }
+                    d.list_wallets()
+                })
+            })
+            .await
+            .unwrap_or_else(|e| Some(Err(anyhow::anyhow!("wallet text task failed: {e}"))));
+            if let Some(res) = outcome {
+                let _ = evt
+                    .send(AppEvent::WalletTextSet {
+                        field,
+                        result: res.map_err(|e| e.to_string()),
+                        generation: cmd_gen,
+                    })
+                    .await;
+            }
+        }
+
+        Command::SetIntentNote {
+            wallet_id,
+            id,
+            value,
+        } => {
+            let db = db.clone();
+            let generation = generation.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                db.with_current(&generation, cmd_gen, |d| -> anyhow::Result<_> {
+                    d.set_intent_note(id, value.as_deref())?;
+                    d.list_intents_for_wallet(wallet_id, 50)
+                })
+            })
+            .await
+            .unwrap_or_else(|e| Some(Err(anyhow::anyhow!("intent note task failed: {e}"))));
+            if let Some(res) = outcome {
+                let _ = evt
+                    .send(AppEvent::IntentNoteSet {
+                        result: res.map_err(|e| e.to_string()),
+                        generation: cmd_gen,
+                    })
+                    .await;
+            }
+        }
+
+        Command::RenameProfile {
+            config_dir,
+            id,
+            name,
+        } => {
+            let result = tokio::task::spawn_blocking(move || {
+                crate::profiles::rename(&config_dir, &id, &name)
+                    .and_then(|_| crate::profiles::load(&config_dir))
+                    .map_err(|e| format!("Could not rename profile: {e}"))
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("rename profile task failed: {e}")));
+            let _ = evt
+                .send(AppEvent::ProfileRenamed {
+                    result,
+                    generation: cmd_gen,
+                })
+                .await;
+        }
+
         Command::Reconcile => match reconcile_boot(&db, &rpc_now, &generation, cmd_gen).await {
             Ok(resolved) => {
                 let _ = evt
@@ -793,6 +1312,38 @@ mod tests {
             }
             .ordered()
         );
+        assert!(Command::ArchiveWallet { id: 1, want: true }.ordered());
+        assert!(Command::DeriveSubwallet { seed: test_seed() }.ordered());
+        assert!(
+            Command::PersistSetting {
+                change: SettingChange::AutoLock(5),
+            }
+            .ordered()
+        );
+        assert!(
+            Command::SetWalletText {
+                id: 1,
+                field: WalletTextField::Label,
+                value: None,
+            }
+            .ordered()
+        );
+        assert!(
+            Command::SetIntentNote {
+                wallet_id: 1,
+                id: 1,
+                value: None,
+            }
+            .ordered()
+        );
+        assert!(
+            Command::RenameProfile {
+                config_dir: std::path::PathBuf::from("/tmp"),
+                id: "p".into(),
+                name: "n".into(),
+            }
+            .ordered()
+        );
         assert!(!Command::FetchPrice.ordered());
         assert!(!Command::FetchRentExempt.ordered());
         assert!(
@@ -801,6 +1352,292 @@ mod tests {
             }
             .ordered()
         );
+    }
+
+    const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    fn test_seed() -> crate::crypto::Seed {
+        crate::crypto::seed_from_mnemonic(&crate::crypto::parse_mnemonic(TEST_MNEMONIC).unwrap())
+    }
+
+    fn storage_with_wallets() -> (Storage, i64) {
+        let s = test_seed();
+        let mut db = crate::db::Db::open_memory().unwrap();
+        db.insert_wallet(
+            0,
+            crate::types::Role::Master,
+            &crate::crypto::derive_address(&s, 0),
+            None,
+        )
+        .unwrap();
+        let sub = db
+            .insert_wallet(
+                1,
+                crate::types::Role::Sub,
+                &crate::crypto::derive_address(&s, 1),
+                None,
+            )
+            .unwrap();
+        (Storage::new(db), sub.id)
+    }
+
+    fn worker_deps() -> (Arc<Mutex<Rpc>>, Arc<PriceCache>, reqwest::Client) {
+        let client = reqwest::Client::new();
+        (
+            Arc::new(Mutex::new(Rpc::new(
+                client.clone(),
+                "http://127.0.0.1:8899".to_string(),
+            ))),
+            Arc::new(PriceCache::default()),
+            client,
+        )
+    }
+
+    #[tokio::test]
+    async fn archive_wallet_command_persists_and_emits_reloaded_wallets() {
+        let (db, sub_id) = storage_with_wallets();
+        let (rpc, price, client) = worker_deps();
+        let (evt_tx, mut evt_rx) = mpsc::channel(8);
+        let generation = Arc::new(AtomicU64::new(0));
+        handle_command(
+            0,
+            Command::ArchiveWallet {
+                id: sub_id,
+                want: true,
+            },
+            db.clone(),
+            rpc,
+            evt_tx,
+            price,
+            client,
+            generation,
+        )
+        .await;
+        match evt_rx.try_recv().unwrap() {
+            AppEvent::WalletArchived {
+                id, want, result, ..
+            } => {
+                assert_eq!(id, sub_id);
+                assert!(want);
+                let wallets = result.unwrap();
+                assert!(wallets.iter().find(|w| w.id == sub_id).unwrap().archived);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(
+            db.with(|d| d.list_wallets())
+                .unwrap()
+                .iter()
+                .find(|w| w.id == sub_id)
+                .unwrap()
+                .archived
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_wallet_command_stale_generation_skips_write_and_event() {
+        let (db, sub_id) = storage_with_wallets();
+        let (rpc, price, client) = worker_deps();
+        let (evt_tx, mut evt_rx) = mpsc::channel(8);
+        let generation = Arc::new(AtomicU64::new(5));
+        handle_command(
+            0,
+            Command::ArchiveWallet {
+                id: sub_id,
+                want: true,
+            },
+            db.clone(),
+            rpc,
+            evt_tx,
+            price,
+            client,
+            generation,
+        )
+        .await;
+        assert!(evt_rx.try_recv().is_err(), "stale command must not emit");
+        assert!(
+            !db.with(|d| d.list_wallets())
+                .unwrap()
+                .iter()
+                .find(|w| w.id == sub_id)
+                .unwrap()
+                .archived,
+            "stale command must not write"
+        );
+    }
+
+    #[tokio::test]
+    async fn derive_subwallet_command_inserts_next_index() {
+        let (db, _sub_id) = storage_with_wallets();
+        let before = db.with(|d| d.list_wallets()).unwrap().len();
+        let (rpc, price, client) = worker_deps();
+        let (evt_tx, mut evt_rx) = mpsc::channel(8);
+        let generation = Arc::new(AtomicU64::new(0));
+        handle_command(
+            0,
+            Command::DeriveSubwallet { seed: test_seed() },
+            db.clone(),
+            rpc,
+            evt_tx,
+            price,
+            client,
+            generation,
+        )
+        .await;
+        match evt_rx.try_recv().unwrap() {
+            AppEvent::SubwalletDerived { result, .. } => {
+                let (idx, wallets) = result.unwrap();
+                assert_eq!(idx, 2);
+                assert_eq!(wallets.len(), before + 1);
+                assert!(
+                    wallets
+                        .iter()
+                        .any(|w| w.account_index == 2 && w.role == crate::types::Role::Sub)
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn persist_setting_command_writes_audited_meta() {
+        let (db, _sub_id) = storage_with_wallets();
+        let (rpc, price, client) = worker_deps();
+        let (evt_tx, mut evt_rx) = mpsc::channel(8);
+        let generation = Arc::new(AtomicU64::new(0));
+        handle_command(
+            0,
+            Command::PersistSetting {
+                change: SettingChange::AutoLock(9),
+            },
+            db.clone(),
+            rpc,
+            evt_tx,
+            price,
+            client,
+            generation,
+        )
+        .await;
+        match evt_rx.try_recv().unwrap() {
+            AppEvent::SettingPersisted { change, result, .. } => {
+                assert_eq!(change, SettingChange::AutoLock(9));
+                result.unwrap();
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert_eq!(
+            db.with(|d| d.get_meta("auto_lock_minutes")).unwrap(),
+            Some("9".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn set_wallet_text_command_persists_label() {
+        let (db, sub_id) = storage_with_wallets();
+        let (rpc, price, client) = worker_deps();
+        let (evt_tx, mut evt_rx) = mpsc::channel(8);
+        let generation = Arc::new(AtomicU64::new(0));
+        handle_command(
+            0,
+            Command::SetWalletText {
+                id: sub_id,
+                field: WalletTextField::Label,
+                value: Some("hot".into()),
+            },
+            db.clone(),
+            rpc,
+            evt_tx,
+            price,
+            client,
+            generation,
+        )
+        .await;
+        match evt_rx.try_recv().unwrap() {
+            AppEvent::WalletTextSet { field, result, .. } => {
+                assert_eq!(field, WalletTextField::Label);
+                let wallets = result.unwrap();
+                assert_eq!(
+                    wallets
+                        .iter()
+                        .find(|w| w.id == sub_id)
+                        .unwrap()
+                        .label
+                        .as_deref(),
+                    Some("hot")
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_intent_note_command_persists_note() {
+        let (db, sub_id) = storage_with_wallets();
+        let to = crate::crypto::derive_address(&test_seed(), 0);
+        let intent = db
+            .with_mut(|d| d.create_intent(sub_id, &to, 1_000, None))
+            .unwrap();
+        let (rpc, price, client) = worker_deps();
+        let (evt_tx, mut evt_rx) = mpsc::channel(8);
+        let generation = Arc::new(AtomicU64::new(0));
+        handle_command(
+            0,
+            Command::SetIntentNote {
+                wallet_id: sub_id,
+                id: intent.id,
+                value: Some("memo".into()),
+            },
+            db.clone(),
+            rpc,
+            evt_tx,
+            price,
+            client,
+            generation,
+        )
+        .await;
+        match evt_rx.try_recv().unwrap() {
+            AppEvent::IntentNoteSet { result, .. } => {
+                let intents = result.unwrap();
+                assert_eq!(
+                    intents
+                        .iter()
+                        .find(|i| i.id == intent.id)
+                        .unwrap()
+                        .note
+                        .as_deref(),
+                    Some("memo")
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_profile_command_reports_failure_for_missing_profile() {
+        let (db, _sub_id) = storage_with_wallets();
+        let (rpc, price, client) = worker_deps();
+        let (evt_tx, mut evt_rx) = mpsc::channel(8);
+        let generation = Arc::new(AtomicU64::new(0));
+        let dir = std::env::temp_dir().join(format!("silo-test-rename-{}", std::process::id()));
+        handle_command(
+            0,
+            Command::RenameProfile {
+                config_dir: dir,
+                id: "does-not-exist".into(),
+                name: "x".into(),
+            },
+            db,
+            rpc,
+            evt_tx,
+            price,
+            client,
+            generation,
+        )
+        .await;
+        match evt_rx.try_recv().unwrap() {
+            AppEvent::ProfileRenamed { result, .. } => assert!(result.is_err()),
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[test]

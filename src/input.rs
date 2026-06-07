@@ -5,7 +5,7 @@ use crate::app::{App, Command, ConfirmAction, Modal, PromptKind, Route, SetupSta
 use crate::clipboard::validate_solana_pubkey;
 use crate::crypto;
 use crate::solana::tx;
-use crate::types::{AuditEvent, IntentStatus, Role, RouteError, WalletRow};
+use crate::types::{Role, RouteError, WalletRow};
 
 const BLOCKHASH_REFRESH_AFTER: std::time::Duration = std::time::Duration::from_secs(45);
 
@@ -72,102 +72,18 @@ fn unlock_keys(app: &mut App, key: KeyEvent) {
 }
 
 fn try_unlock(app: &mut App) {
-    let result = crate::vault::unlock_vault_keyed(&app.vault_path, &app.input.passphrase);
-    app.input.passphrase.zeroize();
-    match result {
-        Ok((mnemonic, vault_key)) => {
-            let seed = crypto::seed_from_mnemonic(&mnemonic);
-            drop(mnemonic);
-            let key_ok = app
-                .db
-                .with_mut(|d| d.unlock_audit_key(vault_key.as_bytes()).is_ok());
-            drop(vault_key);
-            if !key_ok {
-                app.modal = Some(Modal::Error {
-                    title: "Cannot open audit log".into(),
-                    body: "The audit key could not be derived (database/vault inconsistent). \
-                           Refusing to operate."
-                        .into(),
-                });
-                return;
-            }
-            match consistency_ok(app, &seed) {
-                Ok(true) => {}
-                Ok(false) => {
-                    app.db.with_mut(|d| {
-                        let _ = d.audit(AuditEvent::IntegrityCheckFailed, &serde_json::json!({}));
-                    });
-                    app.modal = Some(Modal::Error {
-                        title: "Database / vault mismatch".into(),
-                        body: "A stored wallet address does not match this recovery phrase. \
-                               Refusing to operate to avoid misrouting funds."
-                            .into(),
-                    });
-                    return;
-                }
-                Err(e) => {
-                    app.modal = Some(Modal::Error {
-                        title: "Cannot verify wallet database".into(),
-                        body: format!(
-                            "Wallet metadata could not be read: {e}. Refusing to operate."
-                        ),
-                    });
-                    return;
-                }
-            }
-            match app.db.with(|d| d.verify_audit_chain()) {
-                Ok(true) => {}
-                Ok(false) => {
-                    app.modal = Some(Modal::Error {
-                        title: "Audit log integrity check failed".into(),
-                        body: "The audit log does not match its stored integrity chain. \
-                               Refusing to operate."
-                            .into(),
-                    });
-                    return;
-                }
-                Err(e) => {
-                    app.modal = Some(Modal::Error {
-                        title: "Cannot verify audit log".into(),
-                        body: format!("Audit chain verification failed: {e}. Refusing to operate."),
-                    });
-                    return;
-                }
-            }
-            if let Err(e) = app.try_reload_wallets() {
-                app.wallets.clear();
-                app.anim_balance.clear();
-                app.clamp_list_selection();
-                app.modal = Some(Modal::Error {
-                    title: "Cannot load wallets".into(),
-                    body: format!("Wallet rows could not be loaded: {e}. Refusing to operate."),
-                });
-                return;
-            }
-            app.seed = Some(seed);
-            app.db.with_mut(|d| {
-                let _ = d.audit(AuditEvent::VaultUnlocked, &serde_json::json!({}));
-            });
-            app.route = Route::WalletList;
-            app.note_activity();
-            app.send_cmd(Command::Reconcile);
-            app.request_balance_refresh();
-            app.toast_ok("Unlocked");
-        }
-        Err(_) => {
-            app.db.with_mut(|d| {
-                let _ = d.audit(AuditEvent::VaultUnlockFailed, &serde_json::json!({}));
-            });
-            app.toast_err("Wrong passphrase");
-        }
+    if app.blocking_input {
+        app.toast_info("Unlock already in progress");
+        return;
     }
-}
-
-fn consistency_ok(app: &App, seed: &crypto::Seed) -> anyhow::Result<bool> {
-    let wallets = app.db.with(|d| d.list_wallets())?;
-    Ok(wallets
-        .iter()
-        .all(|w| crypto::derive_address(seed, w.account_index) == w.pubkey))
+    let passphrase = std::mem::replace(&mut app.input.passphrase, Zeroizing::new(String::new()));
+    if app.send_cmd(Command::UnlockVault {
+        vault_path: app.vault_path.clone(),
+        passphrase,
+    }) {
+        app.blocking_input = true;
+        app.toast_info("Unlocking…");
+    }
 }
 
 fn setup_keys(app: &mut App, key: KeyEvent) {
@@ -334,119 +250,37 @@ fn finish_setup(app: &mut App) {
 }
 
 fn create_vault_and_finish(app: &mut App) {
-    let mnemonic = if app.setup.creating {
-        crypto::parse_mnemonic(&Zeroizing::new(app.setup.mnemonic_words.join(" ")))
-    } else {
-        crypto::parse_mnemonic(&app.input.import_phrase)
-    };
-    let mnemonic = match mnemonic {
-        Ok(m) => m,
-        Err(e) => {
-            app.toast_err(format!("invalid phrase: {e}"));
-            return;
-        }
-    };
-
-    let seed = crypto::seed_from_mnemonic(&mnemonic);
-    match consistency_ok(app, &seed) {
-        Ok(true) => {}
-        Ok(false) => {
-            app.db.with_mut(|d| {
-                let _ = d.audit(AuditEvent::IntegrityCheckFailed, &serde_json::json!({}));
-            });
-            app.modal = Some(Modal::Error {
-                title: "Database / phrase mismatch".into(),
-                body:
-                    "Existing wallet records don't match this recovery phrase. Refusing to proceed."
-                        .into(),
-            });
-            return;
-        }
-        Err(e) => {
-            app.modal = Some(Modal::Error {
-                title: "Cannot verify wallet database".into(),
-                body: format!("Wallet metadata could not be read: {e}. Refusing to proceed."),
-            });
-            return;
-        }
-    }
-
-    let vault_key = if crate::vault::vault_exists(&app.vault_path) {
-        match crate::vault::unlock_vault_keyed(&app.vault_path, &app.input.passphrase) {
-            Ok((existing, key)) if existing.to_string() == mnemonic.to_string() => key,
-            Ok(_) => {
-                app.toast_err("Existing vault does not match this recovery phrase");
-                return;
-            }
-            Err(e) => {
-                app.toast_err(format!("could not reopen existing vault: {e}"));
-                return;
-            }
-        }
-    } else {
-        match crate::vault::create_vault(&app.vault_path, &mnemonic, &app.input.passphrase) {
-            Ok(k) => k,
-            Err(e) => {
-                app.toast_err(format!("could not create vault: {e}"));
-                return;
-            }
-        }
-    };
-    drop(mnemonic);
-
-    let master_ok = {
-        let master_addr = crypto::derive_address(&seed, 0);
-        app.db.with_mut(|d| {
-            let key_ok = d.unlock_audit_key(vault_key.as_bytes()).is_ok();
-            let _ = d.audit(AuditEvent::VaultCreated, &serde_json::json!({}));
-            key_ok
-                && match d.master_exists() {
-                    Ok(true) => true,
-                    Ok(false) => d.insert_wallet(0, Role::Master, &master_addr, None).is_ok(),
-                    Err(_) => false,
-                }
-        })
-    };
-    drop(vault_key);
-    if !master_ok {
-        app.toast_err("Could not initialize the master wallet — please retry");
+    if app.blocking_input {
+        app.toast_info("Setup already in progress");
         return;
     }
-
-    if let Some(id) = app.current_profile.clone() {
-        let name = next_wallet_name(&app.profiles);
-        if let Err(e) = crate::profiles::register(
-            &app.config_dir,
-            crate::profiles::ProfileMeta {
-                id,
-                name,
-                created_at: crate::db::now_ms(),
-            },
-        ) {
-            app.toast_err(format!("could not register profile: {e}"));
-            return;
-        }
-        app.reload_profiles();
+    let phrase = if app.setup.creating {
+        Zeroizing::new(app.setup.mnemonic_words.join(" "))
+    } else {
+        Zeroizing::new(app.input.import_phrase.to_string())
+    };
+    if let Err(e) = crypto::parse_mnemonic(&phrase) {
+        app.toast_err(format!("invalid phrase: {e}"));
+        return;
     }
-
-    app.seed = Some(seed);
-    app.setup
-        .mnemonic_words
-        .iter_mut()
-        .for_each(|w| w.zeroize());
-    app.setup.mnemonic_words.clear();
-    app.setup.scrub_confirm();
-    app.input.zeroize_secrets();
-
-    app.route = Route::WalletList;
-    app.note_activity();
-    app.reload_wallets();
-    app.send_cmd(Command::FetchRentExempt);
-    app.send_cmd(Command::FetchPrice);
-    app.send_cmd(Command::Reconcile);
-    app.request_balance_refresh();
-    app.toast_ok("Vault created");
-    app.celebrate_center();
+    let passphrase = std::mem::replace(&mut app.input.passphrase, Zeroizing::new(String::new()));
+    app.input.passphrase2.zeroize();
+    app.input.import_phrase.zeroize();
+    if app.send_cmd(Command::FinishSetup {
+        vault_path: app.vault_path.clone(),
+        config_dir: app.config_dir.clone(),
+        current_profile: app.current_profile.clone(),
+        creating: app.setup.creating,
+        phrase,
+        passphrase,
+    }) {
+        app.blocking_input = true;
+        app.toast_info(if app.setup.creating {
+            "Creating vault…"
+        } else {
+            "Importing vault…"
+        });
+    }
 }
 
 fn next_wallet_name(profiles: &[crate::profiles::ProfileMeta]) -> String {
@@ -526,18 +360,9 @@ fn derive_subwallet(app: &mut App) {
         app.toast_err("Wallet is locked");
         return;
     };
-    let idx = app.db.with(|d| d.next_account_index().unwrap_or(1).max(1));
-    let addr = crypto::derive_address(seed, idx);
-    let res = app
-        .db
-        .with_mut(|d| d.insert_wallet(idx, Role::Sub, &addr, None));
-    match res {
-        Ok(_) => {
-            app.reload_wallets();
-            app.request_balance_refresh();
-            app.toast_ok(format!("Derived subwallet #{idx}"));
-        }
-        _ => app.toast_err("Could not derive subwallet"),
+    let seed = seed.clone();
+    if app.send_cmd(Command::DeriveSubwallet { seed }) {
+        app.toast_info("Deriving subwallet…");
     }
 }
 
@@ -548,31 +373,16 @@ fn copy_selected_address(app: &mut App) {
     }
 }
 
-fn copy_text(app: &mut App, text: &str, ok_label: &str) -> bool {
-    match app.clip.copy(text) {
-        Ok(crate::clipboard::CopyOutcome::Persistent) => {
-            app.toast_ok(ok_label.to_string());
-            true
-        }
-        Ok(crate::clipboard::CopyOutcome::NonPersistent) => {
-            app.toast_info("Copied (won't persist after exit on this compositor)");
-            true
-        }
-        Ok(crate::clipboard::CopyOutcome::PersistenceUnknown) => {
-            app.toast_info("Copied (persistence not confirmed)");
-            true
-        }
-        Err(e) => {
-            app.toast_err(format!("Copy failed: {e}"));
-            false
-        }
-    }
+fn copy_text(app: &mut App, text: &str, ok_label: &str, arm_hot_refresh: bool) -> bool {
+    app.send_cmd(Command::ClipboardCopy {
+        text: text.to_string(),
+        ok_label: ok_label.to_string(),
+        arm_hot_refresh,
+    })
 }
 
 fn copy_addr(app: &mut App, addr: &str) {
-    if copy_text(app, addr, "Copied address") {
-        app.arm_hot_refresh();
-    }
+    copy_text(app, addr, "Copied address", true);
 }
 
 fn copy_selected_txid(app: &mut App) {
@@ -585,7 +395,7 @@ fn copy_selected_txid(app: &mut App) {
     };
     match intent.signature.clone() {
         Some(sig) => {
-            copy_text(app, &sig, "Copied transaction id");
+            copy_text(app, &sig, "Copied transaction id", false);
         }
         None => app.toast_info("No transaction id yet (not signed)"),
     }
@@ -600,20 +410,12 @@ fn archive_selected(app: &mut App) {
         return;
     }
     let (id, want) = (w.id, !w.archived);
-    let sel = app.list_state.selected().unwrap_or(0);
-    let res = app.db.with_mut(|d| d.set_archived(id, want));
-    match res {
-        Ok(()) => {
-            app.reload_wallets();
-            if want {
-                app.list_state.select(Some(sel.saturating_sub(1)));
-                app.clamp_list_selection();
-            } else {
-                app.select_wallet_by_id(id);
-            }
-            app.toast_ok(if want { "Archived" } else { "Unarchived" });
-        }
-        Err(e) => app.toast_err(e.to_string()),
+    if app.send_cmd(Command::ArchiveWallet { id, want }) {
+        app.toast_info(if want {
+            "Archiving…"
+        } else {
+            "Unarchiving…"
+        });
     }
 }
 
@@ -791,17 +593,12 @@ fn toggle_send_denom(app: &mut App) {
 }
 
 fn paste_into_focused_send(app: &mut App) {
-    match app.clip.paste() {
-        Ok(text) => {
-            let t = text.trim().to_string();
-            if app.input.focus == 0 {
-                app.input.send_to = t;
-            } else {
-                app.input.send_amount = t;
-            }
-        }
-        Err(e) => app.toast_err(format!("Paste failed: {e}")),
-    }
+    let target = if app.input.focus == 0 {
+        crate::app::PasteTarget::SendTo
+    } else {
+        crate::app::PasteTarget::SendAmount
+    };
+    app.send_cmd(Command::ClipboardPaste { target });
 }
 
 fn prepare_send(app: &mut App) {
@@ -896,21 +693,6 @@ fn execute_send(app: &mut App) {
         }
     };
 
-    let created = app
-        .db
-        .with_mut(|d| d.create_intent(from.id, &ps.to, ps.lamports, None));
-    let intent = match created {
-        Ok(i) => i,
-        Err(crate::db::CreateIntentError::WalletHasOpenIntent) => {
-            app.toast_err("This wallet already has a transfer in progress");
-            return;
-        }
-        Err(e) => {
-            app.toast_err(format!("Could not record transfer: {e}"));
-            return;
-        }
-    };
-
     let priority = (ps.priority_micro > 0).then_some(tx::PriorityFee {
         unit_limit: crate::money::COMPUTE_UNIT_LIMIT,
         micro_lamports_per_cu: ps.priority_micro,
@@ -920,7 +702,6 @@ fn execute_send(app: &mut App) {
     let sig = match app.sign_for(from.account_index, &message) {
         Ok(s) => s.to_bytes(),
         Err(e) => {
-            fail_intent(app, intent.id, "signing failed");
             app.toast_err(format!("Signing failed: {e}"));
             return;
         }
@@ -928,39 +709,15 @@ fn execute_send(app: &mut App) {
     let wire = tx::assemble_tx(&message, &sig);
     let sig_b58 = tx::signature_to_base58(&sig);
 
-    let signed = app
-        .db
-        .with_mut(|d| d.mark_signed(intent.id, &sig_b58, &ps.blockhash, ps.lvbh, ps.fee, &wire));
-    match signed {
-        Ok(crate::db::IntentTransitionOutcome::Applied) => {}
-        Ok(crate::db::IntentTransitionOutcome::NotFound) => {
-            app.toast_err("Transfer record vanished before signing");
-            return;
-        }
-        Ok(crate::db::IntentTransitionOutcome::WrongState(status)) => {
-            app.toast_err(format!("Transfer was already {}", status.as_str()));
-            return;
-        }
-        Err(e) => {
-            fail_intent(app, intent.id, "could not persist signed transfer");
-            app.toast_err(format!("Could not persist signed transfer: {e}"));
-            return;
-        }
-    }
-
-    if app.send_cmd(Command::Broadcast {
-        intent_id: intent.id,
+    if app.send_cmd(Command::PersistSignedSend {
+        pending: ps,
+        from,
+        wire,
+        sig_b58,
     }) {
-        app.route = Route::WalletDetail;
-        app.refresh_detail_intents();
-        app.toast_info("Signing & broadcasting…");
+        app.blocking_input = true;
+        app.toast_info("Persisting signed transfer…");
     }
-}
-
-fn fail_intent(app: &App, intent_id: i64, reason: &str) {
-    app.db.with_mut(|d| {
-        let _ = d.mark_terminal(intent_id, IntentStatus::Failed, Some(reason));
-    });
 }
 
 fn run_confirm_action(app: &mut App, action: ConfirmAction) {
@@ -970,25 +727,16 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
 }
 
 fn delete_profile(app: &mut App, id: &str) {
-    if let Err(e) = crate::profiles::remove(&app.config_dir, id) {
-        app.toast_err(format!("Could not delete profile: {e}"));
+    if app.blocking_input {
+        app.toast_info("Profile operation already in progress");
         return;
     }
-    app.reload_profiles();
-    if app.profiles.is_empty() {
-        app.begin_new_profile();
-        app.toast_info("Profile deleted — set up a new wallet");
-    } else {
-        for (idx, profile) in app.profiles.clone().into_iter().enumerate() {
-            if app.switch_to_profile(&profile.id).is_ok() {
-                app.profile_sel = idx;
-                app.route = Route::ProfileSelect;
-                app.toast_ok("Profile deleted");
-                return;
-            }
-        }
-        app.toast_err("Profile deleted, but no remaining profile could be opened");
-        app.begin_new_profile();
+    if app.send_cmd(Command::DeleteProfile {
+        config_dir: app.config_dir.clone(),
+        id: id.to_string(),
+    }) {
+        app.blocking_input = true;
+        app.toast_info("Deleting profile…");
     }
 }
 
@@ -1059,24 +807,9 @@ fn settings_keys(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('u') => {
             let currency = app.currency.next();
-            let persisted = app.db.with_mut(|d| {
-                d.set_meta_audited(
-                    "currency",
-                    currency.code(),
-                    AuditEvent::SettingsChanged,
-                    &serde_json::json!({"currency": currency.code()}),
-                )
+            app.send_cmd(Command::PersistSetting {
+                change: crate::app::SettingChange::Currency(currency),
             });
-            match persisted {
-                Ok(()) => {
-                    app.currency = currency;
-                    app.price.clear();
-                    app.reset_price_baseline();
-                    app.send_cmd(Command::FetchPrice);
-                    app.toast_info(format!("Currency: {}", app.currency.label()));
-                }
-                Err(e) => app.toast_err(format!("Could not save currency: {e}")),
-            }
         }
         KeyCode::Char('L') => {
             app.lock();
@@ -1084,28 +817,9 @@ fn settings_keys(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('p') => {
             let priority = crate::money::next_priority_preset(app.priority_micro);
-            let priority_text = priority.to_string();
-            let persisted = app.db.with_mut(|d| {
-                d.set_meta_audited(
-                    "priority_fee_micro",
-                    &priority_text,
-                    AuditEvent::SettingsChanged,
-                    &serde_json::json!({"priority_fee_micro": priority}),
-                )
+            app.send_cmd(Command::PersistSetting {
+                change: crate::app::SettingChange::Priority(priority),
             });
-            match persisted {
-                Ok(()) => {
-                    app.priority_micro = priority;
-                    app.toast_info(format!(
-                        "Priority fee: {} (≈ {} SOL)",
-                        crate::money::priority_label(app.priority_micro),
-                        crate::money::format_lamports(crate::money::priority_fee_lamports(
-                            app.priority_micro
-                        ))
-                    ));
-                }
-                Err(e) => app.toast_err(format!("Could not save priority fee: {e}")),
-            }
         }
         KeyCode::Char('+') | KeyCode::Char('=') => {
             let m = app.auto_lock_after.as_secs() / 60;
@@ -1123,22 +837,9 @@ fn settings_keys(app: &mut App, key: KeyEvent) {
 }
 
 fn set_auto_lock_minutes(app: &mut App, mins: u64) {
-    let mins_text = mins.to_string();
-    let persisted = app.db.with_mut(|d| {
-        d.set_meta_audited(
-            "auto_lock_minutes",
-            &mins_text,
-            AuditEvent::SettingsChanged,
-            &serde_json::json!({"auto_lock_minutes": mins}),
-        )
+    app.send_cmd(Command::PersistSetting {
+        change: crate::app::SettingChange::AutoLock(mins),
     });
-    match persisted {
-        Ok(()) => {
-            app.auto_lock_after = std::time::Duration::from_secs(mins * 60);
-            app.toast_info(format!("Auto-lock after {mins} min"));
-        }
-        Err(e) => app.toast_err(format!("Could not save auto-lock: {e}")),
-    }
 }
 
 fn back_or_scroll(app: &mut App, key: KeyEvent) {
@@ -1290,42 +991,28 @@ fn apply_prompt(app: &mut App) {
     };
     match kind {
         Some(PromptKind::Label(id)) => {
-            let res = app.db.with_mut(|d| d.set_label(id, value.as_deref()));
-            match res {
-                Ok(()) => {
-                    app.reload_wallets();
-                    app.toast_ok("Label updated");
-                }
-                Err(e) => {
-                    app.toast_err(format!("Could not save label: {e}"));
-                    return;
-                }
-            }
+            app.send_cmd(Command::SetWalletText {
+                id,
+                field: crate::app::WalletTextField::Label,
+                value,
+            });
         }
         Some(PromptKind::Note(id)) => {
-            let res = app.db.with_mut(|d| d.set_note(id, value.as_deref()));
-            match res {
-                Ok(()) => {
-                    app.reload_wallets();
-                    app.toast_ok("Note updated");
-                }
-                Err(e) => {
-                    app.toast_err(format!("Could not save note: {e}"));
-                    return;
-                }
-            }
+            app.send_cmd(Command::SetWalletText {
+                id,
+                field: crate::app::WalletTextField::Note,
+                value,
+            });
         }
         Some(PromptKind::TxNote(id)) => {
-            let res = app.db.with_mut(|d| d.set_intent_note(id, value.as_deref()));
-            match res {
-                Ok(()) => {
-                    app.refresh_detail_intents();
-                    app.toast_ok("Transfer note updated");
-                }
-                Err(e) => {
-                    app.toast_err(format!("Could not save transfer note: {e}"));
-                    return;
-                }
+            if let Some(wallet_id) = app.focused_wallet {
+                app.send_cmd(Command::SetIntentNote {
+                    wallet_id,
+                    id,
+                    value,
+                });
+            } else {
+                app.toast_err("No wallet selected");
             }
         }
         Some(PromptKind::RpcUrl) => {
@@ -1344,16 +1031,11 @@ fn apply_prompt(app: &mut App) {
         }
         Some(PromptKind::ProfileName(id)) => {
             let name = value.unwrap_or_else(|| "Wallet".to_string());
-            match crate::profiles::rename(&app.config_dir, &id, &name) {
-                Ok(()) => {
-                    app.reload_profiles();
-                    app.toast_ok("Renamed");
-                }
-                Err(e) => {
-                    app.toast_err(format!("Could not rename profile: {e}"));
-                    return;
-                }
-            }
+            app.send_cmd(Command::RenameProfile {
+                config_dir: app.config_dir.clone(),
+                id,
+                name,
+            });
         }
         Some(PromptKind::DeleteProfile { id, challenge }) => {
             if text != challenge {
@@ -1526,7 +1208,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_send_persists_signed_intent_and_queues_broadcast() {
+    async fn execute_send_queues_signed_persistence_without_inline_storage() {
         let mut h = harness(true);
         let from_id = h.app.wallets[0].id;
         h.app.pending_send = Some(pending(from_id, 0, Instant::now()));
@@ -1535,25 +1217,22 @@ mod tests {
 
         let (_, cmd) = h.rx.recv().await.unwrap();
         match cmd {
-            Command::Broadcast { intent_id } => {
-                let list = intents(&h.app);
-                assert_eq!(list.len(), 1);
-                assert_eq!(intent_id, list[0].id);
-                assert_eq!(list[0].status, IntentStatus::Signed);
-                assert!(list[0].signature.as_ref().is_some_and(|s| !s.is_empty()));
-                let blockhash = bs58::encode([3u8; 32]).into_string();
-                assert_eq!(
-                    list[0].recent_blockhash.as_deref(),
-                    Some(blockhash.as_str())
-                );
-                assert_eq!(list[0].last_valid_block_height, Some(99_999));
-                assert_eq!(list[0].fee_lamports, Some(7_500));
-                assert!(list[0].signed_tx.as_ref().is_some_and(|w| w.len() > 64));
+            Command::PersistSignedSend {
+                pending,
+                from,
+                wire,
+                sig_b58,
+            } => {
+                assert_eq!(pending.from_id, from_id);
+                assert_eq!(from.id, from_id);
+                assert!(!sig_b58.is_empty());
+                assert!(wire.len() > 64);
+                assert!(intents(&h.app).is_empty());
             }
             other => panic!("unexpected command: {other:?}"),
         }
         assert!(h.rx.try_recv().is_err());
-        assert_eq!(h.app.route, Route::WalletDetail);
+        assert_eq!(h.app.route, Route::Send);
     }
 
     #[tokio::test]
@@ -1586,22 +1265,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_send_locked_marks_created_intent_failed_without_broadcast() {
+    async fn execute_send_locked_does_not_create_intent_or_broadcast() {
         let mut h = harness(false);
         let from_id = h.app.wallets[0].id;
         h.app.pending_send = Some(pending(from_id, 0, Instant::now()));
 
         execute_send(&mut h.app);
 
-        let list = intents(&h.app);
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].status, IntentStatus::Failed);
-        assert_eq!(list[0].error.as_deref(), Some("signing failed"));
+        assert!(intents(&h.app).is_empty());
         assert!(h.rx.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn execute_send_preserves_priority_fee_in_signed_wire_and_fee() {
+    async fn execute_send_preserves_priority_fee_in_persist_command() {
         let mut h = harness(true);
         let from_id = h.app.wallets[0].id;
         let priority_micro = 12_345;
@@ -1609,19 +1285,22 @@ mod tests {
 
         execute_send(&mut h.app);
 
-        let _ = h.rx.recv().await.unwrap();
-        let list = intents(&h.app);
-        let wire = list[0].signed_tx.as_ref().unwrap();
-        assert_eq!(list[0].fee_lamports, Some(7_500));
-        assert!(wire.windows(8).any(|w| w == priority_micro.to_le_bytes()));
-        assert!(
-            wire.windows(4)
-                .any(|w| w == crate::money::COMPUTE_UNIT_LIMIT.to_le_bytes())
-        );
+        let (_, cmd) = h.rx.recv().await.unwrap();
+        match cmd {
+            Command::PersistSignedSend { pending, wire, .. } => {
+                assert_eq!(pending.fee, 7_500);
+                assert!(wire.windows(8).any(|w| w == priority_micro.to_le_bytes()));
+                assert!(
+                    wire.windows(4)
+                        .any(|w| w == crate::money::COMPUTE_UNIT_LIMIT.to_le_bytes())
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]
-    fn execute_send_closed_broadcast_channel_reports_error_without_route_advance() {
+    fn execute_send_closed_persistence_channel_reports_error_without_storage() {
         let mut h = harness(true);
         drop(h.rx);
         let from_id = h.app.wallets[0].id;
@@ -1629,9 +1308,7 @@ mod tests {
 
         execute_send(&mut h.app);
 
-        let list = intents(&h.app);
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].status, IntentStatus::Signed);
+        assert!(intents(&h.app).is_empty());
         assert_eq!(h.app.route, Route::Send);
         assert!(
             h.app
@@ -1679,6 +1356,279 @@ mod tests {
             classify_route(&wallets, &master, "MASTER"),
             Err(RouteError::SelfSend),
             "master self-send must be blocked"
+        );
+    }
+
+    fn sub_address() -> String {
+        crypto::derive_address(
+            &crypto::seed_from_mnemonic(&crypto::parse_mnemonic(TEST_MNEMONIC).unwrap()),
+            1,
+        )
+    }
+
+    #[tokio::test]
+    async fn derive_subwallet_queues_command_without_inline_insert() {
+        let mut h = harness(true);
+        let before = h.app.db.with(|d| d.list_wallets()).unwrap().len();
+        derive_subwallet(&mut h.app);
+        assert!(matches!(
+            h.rx.try_recv().unwrap().1,
+            Command::DeriveSubwallet { .. }
+        ));
+        assert_eq!(h.app.db.with(|d| d.list_wallets()).unwrap().len(), before);
+    }
+
+    #[tokio::test]
+    async fn derive_subwallet_locked_does_not_queue() {
+        let mut h = harness(false);
+        derive_subwallet(&mut h.app);
+        assert!(h.rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn archive_selected_queues_command_without_inline_write() {
+        let mut h = harness(true);
+        let sub = h
+            .app
+            .db
+            .with_mut(|d| d.insert_wallet(1, Role::Sub, &sub_address(), None))
+            .unwrap();
+        h.app.wallets.push(sub.clone());
+        h.app.route = Route::WalletList;
+        h.app.list_state.select(Some(1));
+
+        archive_selected(&mut h.app);
+
+        match h.rx.try_recv().unwrap().1 {
+            Command::ArchiveWallet { id, want } => {
+                assert_eq!(id, sub.id);
+                assert!(want);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(
+            !h.app
+                .db
+                .with(|d| d.list_wallets())
+                .unwrap()
+                .iter()
+                .find(|w| w.id == sub.id)
+                .unwrap()
+                .archived
+        );
+    }
+
+    #[test]
+    fn set_auto_lock_minutes_queues_persist_setting_without_inline_write() {
+        let mut h = harness(true);
+        set_auto_lock_minutes(&mut h.app, 7);
+        match h.rx.try_recv().unwrap().1 {
+            Command::PersistSetting { change } => {
+                assert_eq!(change, crate::app::SettingChange::AutoLock(7));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert_eq!(
+            h.app.db.with(|d| d.get_meta("auto_lock_minutes")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn settings_currency_key_queues_persist_setting() {
+        let mut h = harness(true);
+        h.app.route = Route::Settings;
+        let next = h.app.currency.next();
+        settings_keys(
+            &mut h.app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+        );
+        match h.rx.try_recv().unwrap().1 {
+            Command::PersistSetting { change } => {
+                assert_eq!(change, crate::app::SettingChange::Currency(next));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_prompt_label_queues_set_wallet_text_and_closes_modal() {
+        let mut h = harness(true);
+        let id = h.app.wallets[0].id;
+        h.app.modal = Some(Modal::Prompt {
+            kind: PromptKind::Label(id),
+            title: "Set label".into(),
+        });
+        h.app.input.prompt_text = "cold".into();
+
+        apply_prompt(&mut h.app);
+
+        match h.rx.try_recv().unwrap().1 {
+            Command::SetWalletText {
+                id: cid,
+                field,
+                value,
+            } => {
+                assert_eq!(cid, id);
+                assert_eq!(field, crate::app::WalletTextField::Label);
+                assert_eq!(value.as_deref(), Some("cold"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(h.app.modal.is_none());
+        assert_eq!(
+            h.app
+                .db
+                .with(|d| d.list_wallets())
+                .unwrap()
+                .iter()
+                .find(|w| w.id == id)
+                .unwrap()
+                .label,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_prompt_tx_note_queues_set_intent_note() {
+        let mut h = harness(true);
+        let wallet_id = h.app.wallets[0].id;
+        h.app.focused_wallet = Some(wallet_id);
+        h.app.modal = Some(Modal::Prompt {
+            kind: PromptKind::TxNote(42),
+            title: "Transfer note".into(),
+        });
+        h.app.input.prompt_text = "memo".into();
+
+        apply_prompt(&mut h.app);
+
+        match h.rx.try_recv().unwrap().1 {
+            Command::SetIntentNote {
+                wallet_id: wid,
+                id,
+                value,
+            } => {
+                assert_eq!(wid, wallet_id);
+                assert_eq!(id, 42);
+                assert_eq!(value.as_deref(), Some("memo"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_unlock_twice_queues_single_command() {
+        let mut h = harness(true);
+        h.app.route = Route::Unlock;
+        h.app.blocking_input = false;
+        h.app.input.passphrase = Zeroizing::new("pw".to_string());
+
+        try_unlock(&mut h.app);
+        assert!(matches!(
+            h.rx.try_recv().unwrap().1,
+            Command::UnlockVault { .. }
+        ));
+        assert!(h.app.blocking_input);
+
+        h.app.input.passphrase = Zeroizing::new("pw".to_string());
+        try_unlock(&mut h.app);
+        assert!(h.rx.try_recv().is_err(), "duplicate unlock must not queue");
+        assert!(
+            h.app
+                .toasts
+                .iter()
+                .any(|t| t.text == "Unlock already in progress")
+        );
+    }
+
+    #[test]
+    fn create_vault_and_finish_twice_queues_single_command() {
+        let mut h = harness(false);
+        h.app.route = Route::Setup;
+        h.app.setup.creating = true;
+        h.app.setup.mnemonic_words = TEST_MNEMONIC.split_whitespace().map(String::from).collect();
+        h.app.input.passphrase = Zeroizing::new("pw".to_string());
+
+        create_vault_and_finish(&mut h.app);
+        assert!(matches!(
+            h.rx.try_recv().unwrap().1,
+            Command::FinishSetup { .. }
+        ));
+        assert!(h.app.blocking_input);
+
+        create_vault_and_finish(&mut h.app);
+        assert!(h.rx.try_recv().is_err(), "duplicate setup must not queue");
+        assert!(
+            h.app
+                .toasts
+                .iter()
+                .any(|t| t.text == "Setup already in progress")
+        );
+    }
+
+    #[test]
+    fn copy_text_queues_clipboard_copy() {
+        let mut h = harness(true);
+        assert!(copy_text(&mut h.app, "ADDR", "Copied address", true));
+        match h.rx.try_recv().unwrap().1 {
+            Command::ClipboardCopy {
+                text,
+                ok_label,
+                arm_hot_refresh,
+            } => {
+                assert_eq!(text, "ADDR");
+                assert_eq!(ok_label, "Copied address");
+                assert!(arm_hot_refresh);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn paste_into_focused_send_queues_clipboard_paste() {
+        let mut h = harness(true);
+        h.app.route = Route::Send;
+        h.app.input.focus = 0;
+        paste_into_focused_send(&mut h.app);
+        match h.rx.try_recv().unwrap().1 {
+            Command::ClipboardPaste { target } => {
+                assert_eq!(target, crate::app::PasteTarget::SendTo);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stale_wallet_text_event_is_ignored() {
+        let mut h = harness(true);
+        let original_len = h.app.wallets.len();
+        h.app
+            .generation
+            .store(5, std::sync::atomic::Ordering::SeqCst);
+        h.app.apply_app_event(crate::app::AppEvent::WalletTextSet {
+            field: crate::app::WalletTextField::Label,
+            result: Ok(vec![w(99, 9, Role::Sub, "GHOST")]),
+            generation: 0,
+        });
+        assert_eq!(h.app.wallets.len(), original_len);
+        assert!(h.app.wallets.iter().all(|x| x.pubkey != "GHOST"));
+    }
+
+    #[test]
+    fn current_setting_persisted_event_applies() {
+        let mut h = harness(true);
+        h.app
+            .generation
+            .store(3, std::sync::atomic::Ordering::SeqCst);
+        h.app
+            .apply_app_event(crate::app::AppEvent::SettingPersisted {
+                change: crate::app::SettingChange::AutoLock(7),
+                result: Ok(()),
+                generation: 3,
+            });
+        assert_eq!(
+            h.app.auto_lock_after,
+            std::time::Duration::from_secs(7 * 60)
         );
     }
 }

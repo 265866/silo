@@ -22,6 +22,7 @@ impl WordCount {
     }
 }
 
+#[derive(Clone)]
 pub struct Seed(Zeroizing<[u8; 64]>);
 
 impl Seed {
