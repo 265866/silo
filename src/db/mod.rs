@@ -83,6 +83,31 @@ const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("index", "ix_audit_ts"),
 ];
 
+fn verify_durability_pragmas(
+    path: &Path,
+    journal_mode: &str,
+    synchronous: i64,
+    foreign_keys: i64,
+) -> Result<()> {
+    if journal_mode.to_lowercase() != "wal" {
+        bail!(
+            "silo requires a filesystem that supports SQLite WAL for crash-safe \
+             money operations; got journal_mode='{journal_mode}' at {}",
+            path.display()
+        );
+    }
+    if synchronous != 2 {
+        bail!(
+            "PRAGMA synchronous=FULL did not take (got {synchronous}) at {}",
+            path.display()
+        );
+    }
+    if foreign_keys != 1 {
+        bail!("PRAGMA foreign_keys=ON did not take at {}", path.display());
+    }
+    Ok(())
+}
+
 pub struct Db {
     conn: Connection,
     audit_key: Option<[u8; 32]>,
@@ -102,28 +127,12 @@ impl Db {
         conn.busy_timeout(Duration::from_millis(5000))?;
 
         let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
-        if mode.to_lowercase() != "wal" {
-            bail!(
-                "silo requires a filesystem that supports SQLite WAL for crash-safe \
-                 money operations; got journal_mode='{mode}' at {}",
-                path.display()
-            );
-        }
         conn.execute_batch(
             "PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA wal_autocheckpoint=1000;",
         )?;
-
         let sync: i64 = conn.query_row("PRAGMA synchronous", [], |r| r.get(0))?;
-        if sync != 2 {
-            bail!(
-                "PRAGMA synchronous=FULL did not take (got {sync}) at {}",
-                path.display()
-            );
-        }
         let fk: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
-        if fk != 1 {
-            bail!("PRAGMA foreign_keys=ON did not take at {}", path.display());
-        }
+        verify_durability_pragmas(path, &mode, sync, fk)?;
 
         let mut db = Db {
             conn,
@@ -688,6 +697,46 @@ mod tests {
             .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
             .unwrap();
         assert_eq!(fk, 1, "foreign_keys ON");
+    }
+
+    #[test]
+    fn durability_guard_accepts_valid_pragmas() {
+        let path = Path::new("/tmp/silo-test.db");
+        assert!(verify_durability_pragmas(path, "wal", 2, 1).is_ok());
+        assert!(
+            verify_durability_pragmas(path, "WAL", 2, 1).is_ok(),
+            "the WAL comparison must be case-insensitive"
+        );
+    }
+
+    #[test]
+    fn durability_guard_rejects_non_wal() {
+        let path = Path::new("/tmp/silo-test.db");
+        let err = verify_durability_pragmas(path, "delete", 2, 1).unwrap_err();
+        assert!(
+            err.to_string().contains("WAL"),
+            "non-WAL journal mode must be refused with a WAL/crash-safe message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn durability_guard_rejects_non_full_synchronous() {
+        let path = Path::new("/tmp/silo-test.db");
+        let err = verify_durability_pragmas(path, "wal", 1, 1).unwrap_err();
+        assert!(
+            err.to_string().contains("synchronous"),
+            "synchronous != FULL must be refused, got: {err}"
+        );
+    }
+
+    #[test]
+    fn durability_guard_rejects_disabled_foreign_keys() {
+        let path = Path::new("/tmp/silo-test.db");
+        let err = verify_durability_pragmas(path, "wal", 2, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("foreign_keys"),
+            "foreign_keys OFF must be refused, got: {err}"
+        );
     }
 
     #[test]
