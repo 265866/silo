@@ -69,41 +69,7 @@ pub fn lamports_to_sol(l: u64) -> f64 {
 }
 
 pub fn parse_sol_to_lamports(s: &str) -> Result<u64, AmountError> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err(AmountError::Empty);
-    }
-    let (int_part, frac_part) = match s.split_once('.') {
-        Some((i, f)) => (i, f),
-        None => (s, ""),
-    };
-    if frac_part.len() > 9 {
-        return Err(AmountError::TooManyDecimals);
-    }
-    if !int_part.chars().all(|c| c.is_ascii_digit())
-        || !frac_part.chars().all(|c| c.is_ascii_digit())
-        || (int_part.is_empty() && frac_part.is_empty())
-    {
-        return Err(AmountError::NotANumber);
-    }
-    let int_val: u64 = if int_part.is_empty() {
-        0
-    } else {
-        int_part.parse().map_err(|_| AmountError::Overflow)?
-    };
-    let int_lamports = int_val
-        .checked_mul(LAMPORTS_PER_SOL)
-        .ok_or(AmountError::Overflow)?;
-
-    let mut frac_padded = String::from(frac_part);
-    while frac_padded.len() < 9 {
-        frac_padded.push('0');
-    }
-    let frac_lamports: u64 = frac_padded.parse().map_err(|_| AmountError::Overflow)?;
-
-    int_lamports
-        .checked_add(frac_lamports)
-        .ok_or(AmountError::Overflow)
+    u64::try_from(parse_decimal_scaled(s, 9)?).map_err(|_| AmountError::Overflow)
 }
 
 pub fn fiat_to_lamports(fiat: &str, price_per_sol: f64) -> Result<u64, AmountError> {
@@ -350,5 +316,51 @@ mod tests {
             prop_assert_eq!(priority_fee_lamports(price), expected);
             prop_assert_eq!(total_fee(price), BASE_FEE_PER_SIG.saturating_add(expected));
         }
+
+        #[test]
+        fn parse_sol_matches_original_parser(s in "[-+0-9. a]{0,13}") {
+            let got = parse_sol_to_lamports(&s);
+            let want = parse_sol_reference(&s);
+            prop_assert_eq!(got.is_ok(), want.is_ok(), "accept/reject diverged for {:?}", s);
+            if let (Ok(got), Ok(want)) = (got, want) {
+                prop_assert_eq!(got, want, "accepted value diverged for {:?}", s);
+            }
+        }
+    }
+
+    fn parse_sol_reference(s: &str) -> Result<u64, AmountError> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(AmountError::Empty);
+        }
+        let (int_part, frac_part) = match s.split_once('.') {
+            Some((i, f)) => (i, f),
+            None => (s, ""),
+        };
+        if frac_part.len() > 9 {
+            return Err(AmountError::TooManyDecimals);
+        }
+        if !int_part.chars().all(|c| c.is_ascii_digit())
+            || !frac_part.chars().all(|c| c.is_ascii_digit())
+            || (int_part.is_empty() && frac_part.is_empty())
+        {
+            return Err(AmountError::NotANumber);
+        }
+        let int_val: u64 = if int_part.is_empty() {
+            0
+        } else {
+            int_part.parse().map_err(|_| AmountError::Overflow)?
+        };
+        let int_lamports = int_val
+            .checked_mul(LAMPORTS_PER_SOL)
+            .ok_or(AmountError::Overflow)?;
+        let mut frac_padded = String::from(frac_part);
+        while frac_padded.len() < 9 {
+            frac_padded.push('0');
+        }
+        let frac_lamports: u64 = frac_padded.parse().map_err(|_| AmountError::Overflow)?;
+        int_lamports
+            .checked_add(frac_lamports)
+            .ok_or(AmountError::Overflow)
     }
 }
