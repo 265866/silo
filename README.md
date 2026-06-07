@@ -12,6 +12,11 @@ process being killed in any state, and an append-only HMAC-chained audit log. It
 the Solana network over plain JSON-RPC with a hand-rolled, ecosystem-interoperable
 transaction serializer.
 
+**Network:** silo currently operates on Solana **mainnet-beta only**. The default RPC
+endpoint is `https://api.mainnet-beta.solana.com`. Editing the RPC URL changes the
+endpoint/provider used for mainnet-beta access; it does not add a supported devnet or
+testnet mode for end users.
+
 ---
 
 ## What it does
@@ -110,7 +115,7 @@ cargo build --release --locked
 
 `silo` needs a TTY — run it in a real terminal.
 
-- **First run** opens a setup wizard that creates your first profile ("Wallet 1"). Choose create or import, record the generated recovery phrase or enter your existing one, confirm the generated phrase word-by-word if creating, choose and confirm a vault passphrase, then unlock and use the wallet.
+- **First run** opens a setup wizard that creates your first profile ("Wallet 1"). Choose create or import, record the generated recovery phrase or enter your existing one, confirm the generated phrase word-by-word if creating, choose and confirm a vault passphrase, then unlock and use the wallet. Funded wallets are mainnet-beta wallets: real SOL can be transferred.
 - **Later runs** open the profile picker.
 
 Before funding a wallet:
@@ -118,7 +123,7 @@ Before funding a wallet:
 - Make sure your recovery phrase is written down, stored offline, and never shared.
 - Make sure you know your vault passphrase and do not share it.
 - Check that you can unlock the vault and that the receive address is correct.
-- Send a small test amount first when using a new address or setup.
+- Send a tiny test amount first when using a new address or setup, before larger funding or sends.
 
 silo cannot recover lost recovery phrases or forgotten vault passphrases. The vault passphrase encrypts the recovery phrase on disk; use a strong, non-empty passphrase. The app allows an empty passphrase only after an explicit warning and confirmation, because anyone with access to your files could read the recovery phrase. For support, never include recovery phrases, passphrases, private keys, tokens, or live wallet secrets in issues, logs, screenshots, or diagnostics; see [Support and bug reports](#support-and-bug-reports) and [SECURITY.md](SECURITY.md).
 
