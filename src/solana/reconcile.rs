@@ -2,14 +2,15 @@ use anyhow::Result;
 use serde_json::json;
 
 use super::rpc::{Rpc, SignatureStatus};
-use crate::db::Storage;
+use crate::db::{IntentTransitionOutcome, Storage};
 use crate::types::{AuditEvent, IntentStatus};
 
 pub const EXPIRY_SLACK: u64 = 150;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Decision {
-    Confirm,
+    FinalizeSuccess,
+    WaitFinality,
     Fail(String),
     Expire,
     Rebroadcast,
@@ -20,8 +21,14 @@ fn decide(status: Option<&SignatureStatus>, current_height: u64, lvbh: u64) -> D
         if st.is_error() {
             return Decision::Fail("on-chain error".to_string());
         }
-        if st.is_confirmed_or_finalized() {
-            return Decision::Confirm;
+        if st.is_finalized() {
+            return Decision::FinalizeSuccess;
+        }
+        if st.is_confirmed() {
+            return Decision::WaitFinality;
+        }
+        if current_height > lvbh + EXPIRY_SLACK {
+            return Decision::Expire;
         }
         return Decision::Rebroadcast;
     }
@@ -30,6 +37,10 @@ fn decide(status: Option<&SignatureStatus>, current_height: u64, lvbh: u64) -> D
     } else {
         Decision::Rebroadcast
     }
+}
+
+fn applied(outcome: IntentTransitionOutcome) -> usize {
+    usize::from(matches!(outcome, IntentTransitionOutcome::Applied))
 }
 
 pub async fn reconcile_boot(
@@ -66,24 +77,28 @@ pub async fn reconcile_boot(
         };
     }
 
+    macro_rules! terminal {
+        ($id:expr, $status:expr, $error:expr $(,)?) => {{
+            resolved += applied(guarded!(|d| d.mark_terminal($id, $status, $error))?);
+        }};
+    }
+
     for intent in open {
         if intent.status == IntentStatus::Created {
-            guarded!(|d| d.mark_terminal(
+            terminal!(
                 intent.id,
                 IntentStatus::Failed,
                 Some("abandoned before signing"),
-            ))?;
-            resolved += 1;
+            );
             continue;
         }
 
         let Some(sig) = intent.signature else {
-            guarded!(|d| d.mark_terminal(
+            terminal!(
                 intent.id,
                 IntentStatus::Failed,
                 Some("signed intent missing signature"),
-            ))?;
-            resolved += 1;
+            );
             continue;
         };
         let lvbh = intent.last_valid_block_height.unwrap_or(0);
@@ -97,13 +112,12 @@ pub async fn reconcile_boot(
         let height = rpc.get_block_height().await?;
 
         match decide(status.as_ref(), height, lvbh) {
-            Decision::Confirm => {
-                guarded!(|d| d.mark_terminal(intent.id, IntentStatus::Confirmed, None))?;
-                resolved += 1;
+            Decision::FinalizeSuccess => {
+                terminal!(intent.id, IntentStatus::Confirmed, None);
             }
+            Decision::WaitFinality => {}
             Decision::Fail(reason) => {
-                guarded!(|d| d.mark_terminal(intent.id, IntentStatus::Failed, Some(&reason)))?;
-                resolved += 1;
+                terminal!(intent.id, IntentStatus::Failed, Some(&reason));
             }
             Decision::Expire => {
                 let recheck = rpc
@@ -114,57 +128,50 @@ pub async fn reconcile_boot(
                     .flatten();
                 if let Some(s2) = recheck {
                     if s2.is_error() {
-                        guarded!(|d| d.mark_terminal(
-                            intent.id,
-                            IntentStatus::Failed,
-                            Some("on-chain error"),
-                        ))?;
-                        resolved += 1;
+                        terminal!(intent.id, IntentStatus::Failed, Some("on-chain error"));
                         continue;
                     }
-                    if s2.is_confirmed_or_finalized() {
-                        guarded!(|d| d.mark_terminal(intent.id, IntentStatus::Confirmed, None))?;
-                        resolved += 1;
+                    if s2.is_finalized() {
+                        terminal!(intent.id, IntentStatus::Confirmed, None);
+                        continue;
+                    }
+                    if s2.is_confirmed() {
                         continue;
                     }
                 }
-                guarded!(|d| d.mark_terminal(
+                terminal!(
                     intent.id,
                     IntentStatus::Expired,
                     Some("blockhash expired before confirmation"),
-                ))?;
-                resolved += 1;
+                );
             }
             Decision::Rebroadcast => {
                 let Some(bytes) = intent.signed_tx else {
-                    guarded!(|d| d.mark_terminal(
+                    terminal!(
                         intent.id,
                         IntentStatus::Failed,
                         Some("signed intent missing wire bytes"),
-                    ))?;
-                    resolved += 1;
+                    );
                     continue;
                 };
                 match rpc.send_transaction(&bytes).await {
                     Ok(returned) if returned != sig => {
-                        guarded!(|d| -> Result<()> {
+                        let outcome = guarded!(|d| -> Result<_> {
                             d.audit(
                                 AuditEvent::IntegrityCheckFailed,
                                 &json!({"intent": intent.id, "expected_sig": sig, "got": returned}),
                             )?;
-                            d.mark_terminal(
+                            Ok(d.mark_terminal(
                                 intent.id,
                                 IntentStatus::Failed,
                                 Some("rpc returned mismatched signature"),
-                            )?;
-                            Ok(())
+                            )?)
                         })?;
-                        resolved += 1;
+                        resolved += applied(outcome);
                     }
                     Ok(_) => {
                         if intent.status == IntentStatus::Signed {
-                            guarded!(|d| d.mark_submitted(intent.id))?;
-                            resolved += 1;
+                            resolved += applied(guarded!(|d| d.mark_submitted(intent.id))?);
                         }
                     }
                     Err(_) => {}
@@ -410,12 +417,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submitted_confirmed_marks_confirmed() {
+    async fn submitted_confirmed_waits_for_finality() {
         let (db, id) = db_with_intent();
         signed(&db, id, "Sig", 1000);
         db.with_mut(|d| d.mark_submitted(id).unwrap());
         let server = MockServer::new(vec![
             json!({"context":{"slot":1},"value":[status_value(Value::Null, "confirmed")]}),
+            json!(1000),
+        ]);
+        assert_eq!(run(&db, &server.rpc()).await, 0);
+        assert_eq!(intent(&db, id).status, IntentStatus::Submitted);
+    }
+
+    #[tokio::test]
+    async fn submitted_finalized_marks_confirmed() {
+        let (db, id) = db_with_intent();
+        signed(&db, id, "Sig", 1000);
+        db.with_mut(|d| d.mark_submitted(id).unwrap());
+        let server = MockServer::new(vec![
+            json!({"context":{"slot":1},"value":[status_value(Value::Null, "finalized")]}),
             json!(1000),
         ]);
         assert_eq!(run(&db, &server.rpc()).await, 1);
@@ -493,14 +513,14 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_status_confirms() {
+    fn confirmed_status_waits_and_finalized_confirms() {
         assert_eq!(
             decide(Some(&status(false, Some("confirmed"))), 0, 0),
-            Decision::Confirm
+            Decision::WaitFinality
         );
         assert_eq!(
             decide(Some(&status(false, Some("finalized"))), 0, 0),
-            Decision::Confirm
+            Decision::FinalizeSuccess
         );
     }
 
@@ -513,10 +533,18 @@ mod tests {
     }
 
     #[test]
-    fn processed_is_in_flight_rebroadcast() {
+    fn processed_is_in_flight_until_expiry() {
         assert_eq!(
             decide(Some(&status(false, Some("processed"))), 0, 0),
             Decision::Rebroadcast
+        );
+        assert_eq!(
+            decide(
+                Some(&status(false, Some("processed"))),
+                1000 + EXPIRY_SLACK + 1,
+                1000,
+            ),
+            Decision::Expire
         );
     }
 

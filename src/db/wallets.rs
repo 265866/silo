@@ -22,7 +22,7 @@ fn row_to_wallet(r: &rusqlite::Row) -> rusqlite::Result<WalletRow> {
     })?;
     Ok(WalletRow {
         id: r.get(0)?,
-        account_index: r.get::<_, i64>(1)? as u32,
+        account_index: read_u32(r, 1, "account_index")?,
         role,
         pubkey: r.get(3)?,
         label: r.get(4)?,
@@ -32,6 +32,45 @@ fn row_to_wallet(r: &rusqlite::Row) -> rusqlite::Result<WalletRow> {
         balance_lamports: None,
         has_open_intent: has_open != 0,
     })
+}
+
+fn read_u32(r: &rusqlite::Row, column: usize, field: &'static str) -> rusqlite::Result<u32> {
+    let value = r.get::<_, i64>(column)?;
+    u32::try_from(value).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            Type::Integer,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{field} is outside u32 range: {value}"),
+            )),
+        )
+    })
+}
+
+fn read_next_account_index(max: i64) -> Result<u32> {
+    let max = u32::try_from(max).map_err(|_| anyhow::anyhow!("account_index is corrupt"))?;
+    max.checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("account_index is exhausted"))
+}
+
+fn reject_unchanged_wallet_update(
+    tx: &rusqlite::Transaction<'_>,
+    changed: usize,
+    id: i64,
+    field: &'static str,
+) -> Result<()> {
+    if changed > 0 {
+        return Ok(());
+    }
+    let exists = tx
+        .query_row("SELECT 1 FROM wallets WHERE id=?1", params![id], |_| Ok(()))
+        .optional()?
+        .is_some();
+    if exists {
+        bail!("{field} is unchanged");
+    }
+    bail!("wallet not found")
 }
 
 const SELECT_WALLET: &str = "
@@ -62,7 +101,7 @@ impl Db {
             .optional()?
             .flatten();
         Ok(match max {
-            Some(m) => (m as u32) + 1,
+            Some(m) => read_next_account_index(m)?,
             None => 0,
         })
     }
@@ -126,10 +165,11 @@ impl Db {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "UPDATE wallets SET label=?1 WHERE id=?2",
+        let n = tx.execute(
+            "UPDATE wallets SET label=?1 WHERE id=?2 AND label IS NOT ?1",
             params![label, id],
         )?;
+        reject_unchanged_wallet_update(&tx, n, id, "wallet label")?;
         append_audit(&tx, &key, AuditEvent::WalletLabeled, &json!({"id": id})).map(|_| ())?;
         tx.commit()?;
         Ok(())
@@ -140,7 +180,11 @@ impl Db {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute("UPDATE wallets SET note=?1 WHERE id=?2", params![note, id])?;
+        let n = tx.execute(
+            "UPDATE wallets SET note=?1 WHERE id=?2 AND note IS NOT ?1",
+            params![note, id],
+        )?;
+        reject_unchanged_wallet_update(&tx, n, id, "wallet note")?;
         append_audit(&tx, &key, AuditEvent::WalletNoted, &json!({"id": id}))?;
         tx.commit()?;
         Ok(())
@@ -154,10 +198,11 @@ impl Db {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "UPDATE wallets SET archived=?1 WHERE id=?2",
+        let n = tx.execute(
+            "UPDATE wallets SET archived=?1 WHERE id=?2 AND archived<>?1",
             params![archived as i64, id],
         )?;
+        reject_unchanged_wallet_update(&tx, n, id, "wallet archived state")?;
         append_audit(
             &tx,
             &key,
@@ -244,6 +289,17 @@ mod tests {
             d.insert_wallet(2, Role::Sub, PK1, None).is_err(),
             "dup pubkey"
         );
+    }
+
+    #[test]
+    fn unchanged_wallet_updates_are_rejected_without_audit() {
+        let mut d = db();
+        let m = d.insert_wallet(0, Role::Master, PK0, Some("Cold")).unwrap();
+        let before = d.list_audit(50).unwrap().len();
+        assert!(d.set_label(m.id, Some("Cold")).is_err());
+        assert!(d.set_note(m.id, None).is_err());
+        assert!(d.set_archived(m.id, false).is_err());
+        assert_eq!(d.list_audit(50).unwrap().len(), before);
     }
 
     #[test]

@@ -1,4 +1,22 @@
+#![allow(dead_code, unused_imports)]
+
 use std::sync::{Arc, Mutex};
+
+mod app;
+mod clipboard;
+mod crypto;
+mod db;
+mod input;
+mod money;
+mod platform;
+mod price;
+mod profiles;
+mod solana;
+mod sync;
+mod types;
+mod ui;
+mod vault;
+mod worker;
 
 use anyhow::Result;
 use futures_util::StreamExt;
@@ -6,32 +24,31 @@ use ratatui::crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, Eve
 use ratatui::crossterm::execute;
 use tokio::sync::mpsc;
 
-use silo::app::{App, AppEvent, Command};
-use silo::db::{Db, Storage};
-use silo::price::{PriceCache, SolPrice};
-use silo::solana::rpc::Rpc;
-use silo::types::{Currency, Network};
-use silo::{clipboard, input, ui, worker};
+use crate::app::{App, AppEvent, Command};
+use crate::db::{Db, Storage};
+use crate::price::{PriceCache, SolPrice};
+use crate::solana::rpc::Rpc;
+use crate::types::{Currency, Network};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     clipboard::maybe_run_clip_daemon();
 
-    let dir = silo::platform::config_dir();
-    silo::profiles::ensure_private_dir(&dir)?;
+    let dir = crate::platform::config_dir();
+    crate::profiles::ensure_private_dir(&dir)?;
 
-    let _instance_lock = silo::platform::acquire_single_instance(&dir)?;
+    let _instance_lock = crate::platform::acquire_single_instance(&dir)?;
 
-    let profiles = silo::profiles::load(&dir)?;
-    silo::profiles::cleanup_orphans(&dir, &profiles);
+    let profiles = crate::profiles::load(&dir)?;
+    crate::profiles::cleanup_orphans(&dir, &profiles);
     let first_run = profiles.is_empty();
     let active_id = if first_run {
-        silo::profiles::new_id()
+        crate::profiles::new_id()
     } else {
         profiles[0].id.clone()
     };
-    let profile_dir = silo::profiles::dir_for(&dir, &active_id);
-    silo::profiles::ensure_private_dir(&profile_dir)?;
+    let profile_dir = crate::profiles::dir_for(&dir, &active_id)?;
+    crate::profiles::ensure_private_dir(&profile_dir)?;
 
     let db = Db::open(&profile_dir.join("silo.db"))?;
     let rpc_url = db
@@ -44,19 +61,19 @@ async fn main() -> Result<()> {
     let priority_micro = db
         .get_meta("priority_fee_micro")?
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(silo::money::DEFAULT_PRIORITY_FEE_MICRO);
+        .unwrap_or(crate::money::DEFAULT_PRIORITY_FEE_MICRO);
     let last_price = db
         .get_meta("last_price")?
         .map(|s| SolPrice::from_meta_json(&s))
         .transpose()?
-        .filter(|p| p.currency == currency);
+        .filter(|p| p.currency == currency && !p.is_stale());
     let auto_lock_mins = db
         .get_meta("auto_lock_minutes")?
         .and_then(|s| s.parse::<u64>().ok())
         .map(|m| {
             m.clamp(
-                silo::app::AUTO_LOCK_MIN_MINUTES,
-                silo::app::AUTO_LOCK_MAX_MINUTES,
+                crate::app::AUTO_LOCK_MIN_MINUTES,
+                crate::app::AUTO_LOCK_MAX_MINUTES,
             )
         });
     let vault_path = profile_dir.join("vault.json");
@@ -93,6 +110,7 @@ async fn main() -> Result<()> {
         rpc_url,
         vault_path,
     );
+    drop(cmd_tx);
     app.restore_startup_state(
         currency,
         priority_micro,
@@ -118,9 +136,12 @@ async fn run(
 ) -> Result<()> {
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
+    let mut worker_done = false;
 
-    while app.is_running() {
-        terminal.draw(|f| ui::render(f, &mut app))?;
+    let loop_result = loop {
+        if let Err(e) = terminal.draw(|f| ui::render(f, &mut app)) {
+            break Err(e.into());
+        }
         tokio::select! {
             maybe_ev = events.next() => match maybe_ev {
                 Some(Ok(ev)) => {
@@ -133,15 +154,28 @@ async fn run(
                 Some(app_ev) => app.apply_app_event(app_ev),
                 None => app.stop(),
             },
-            _ = &mut workers => app.stop(),
+            worker_result = &mut workers => {
+                worker_done = true;
+                if let Err(e) = worker_result {
+                    break Err(anyhow::anyhow!("background worker task failed: {e}"));
+                }
+                app.stop();
+            },
             _ = ticker.tick() => {
                 app.tick();
                 app.maybe_auto_lock();
                 app.maybe_auto_refresh();
             }
         }
-    }
+        if !app.is_running() {
+            break Ok(());
+        }
+    };
 
     app.scrub_for_exit();
-    Ok(())
+    drop(app);
+    if !worker_done && let Err(e) = workers.await {
+        return Err(anyhow::anyhow!("background worker task failed: {e}"));
+    }
+    loop_result
 }

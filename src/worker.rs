@@ -1,12 +1,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, watch};
 
 use crate::app::{AppEvent, Command};
-use crate::db::Storage;
+use crate::db::{IntentTransitionOutcome, Storage};
 use crate::price::{
     COINGECKO_BACKOFF_SECS, PriceCache, SolPrice, fetch_price, fetch_price_backoff_aware,
 };
@@ -20,6 +20,7 @@ const PRICE_POLL_JITTER_MS: u64 = 10_000;
 
 const CONFIRM_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const CONFIRM_POLL_ATTEMPTS: usize = 45;
+const REBROADCAST_INTERVAL: Duration = Duration::from_secs(12);
 
 fn persist_last_price(db: &Storage, p: &SolPrice) {
     db.with(|d| {
@@ -59,98 +60,130 @@ pub fn spawn_workers(
     client: reqwest::Client,
     generation: Arc<AtomicU64>,
 ) -> tokio::task::JoinHandle<()> {
-    {
-        let price = price.clone();
-        let evt = evt_tx.clone();
-        let client = client.clone();
-        let db = db.clone();
-        let generation = generation.clone();
-        tokio::spawn(async move {
-            use std::time::Instant;
-            let mut cg_backoff_until: Option<Instant> = None;
-            loop {
-                let jitter = {
-                    let mut b = [0u8; 2];
-                    crate::crypto::random_bytes(&mut b);
-                    (u16::from_le_bytes(b) as u64) % PRICE_POLL_JITTER_MS
-                };
-                tokio::time::sleep(PRICE_POLL_BASE + Duration::from_millis(jitter)).await;
-
-                let event_generation = generation.load(Ordering::SeqCst);
-                let currency = current_currency(&db);
-                let skip_cg = cg_backoff_until.is_some_and(|u| Instant::now() < u);
-                let (result, rate_limited) =
-                    fetch_price_backoff_aware(&client, currency, skip_cg).await;
-                if generation.load(Ordering::SeqCst) != event_generation {
-                    continue;
-                }
-                if rate_limited {
-                    cg_backoff_until =
-                        Some(Instant::now() + Duration::from_secs(COINGECKO_BACKOFF_SECS));
-                } else if !skip_cg {
-                    cg_backoff_until = None;
-                }
-                if let Ok(p) = result {
-                    price.set(p);
-                    persist_last_price(&db, &p);
-                    let _ = evt
-                        .send(AppEvent::Price {
-                            price: p,
-                            generation: event_generation,
-                        })
-                        .await;
-                }
-            }
-        });
-    }
-
     tokio::spawn(async move {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let price_handle = {
+            let price = price.clone();
+            let evt = evt_tx.clone();
+            let client = client.clone();
+            let db = db.clone();
+            let generation = generation.clone();
+            let mut shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                let mut cg_backoff_until: Option<Instant> = None;
+                loop {
+                    let jitter = {
+                        let mut b = [0u8; 2];
+                        crate::crypto::random_bytes(&mut b);
+                        (u16::from_le_bytes(b) as u64) % PRICE_POLL_JITTER_MS
+                    };
+                    tokio::select! {
+                        _ = shutdown.changed() => break,
+                        _ = tokio::time::sleep(PRICE_POLL_BASE + Duration::from_millis(jitter)) => {}
+                    }
+
+                    let event_generation = generation.load(Ordering::SeqCst);
+                    let currency = current_currency(&db);
+                    let skip_cg = cg_backoff_until.is_some_and(|u| Instant::now() < u);
+                    let (result, rate_limited) =
+                        fetch_price_backoff_aware(&client, currency, skip_cg).await;
+                    if generation.load(Ordering::SeqCst) != event_generation {
+                        continue;
+                    }
+                    if rate_limited {
+                        cg_backoff_until =
+                            Some(Instant::now() + Duration::from_secs(COINGECKO_BACKOFF_SECS));
+                    } else if !skip_cg {
+                        cg_backoff_until = None;
+                    }
+                    if let Ok(p) = result {
+                        price.set(p);
+                        persist_last_price(&db, &p);
+                        let _ = evt
+                            .send(AppEvent::Price {
+                                price: p,
+                                generation: event_generation,
+                            })
+                            .await;
+                    }
+                }
+            })
+        };
+
         let (ordered_tx, mut ordered_rx) = mpsc::channel::<(u64, Command)>(64);
-        {
+        let ordered_handle = {
             let db = db.clone();
             let rpc = rpc.clone();
             let evt = evt_tx.clone();
             let price = price.clone();
             let client = client.clone();
             let generation = generation.clone();
+            let mut shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
-                while let Some((cmd_gen, cmd)) = ordered_rx.recv().await {
-                    handle_command(
-                        cmd_gen,
-                        cmd,
-                        db.clone(),
-                        rpc.clone(),
-                        evt.clone(),
-                        price.clone(),
-                        client.clone(),
-                        generation.clone(),
-                    )
-                    .await;
+                loop {
+                    tokio::select! {
+                        _ = shutdown.changed() => break,
+                        maybe = ordered_rx.recv() => {
+                            let Some((cmd_gen, cmd)) = maybe else {
+                                break;
+                            };
+                            handle_command(
+                                cmd_gen,
+                                cmd,
+                                db.clone(),
+                                rpc.clone(),
+                                evt.clone(),
+                                price.clone(),
+                                client.clone(),
+                                generation.clone(),
+                            )
+                            .await;
+                        }
+                    }
                 }
-            });
-        }
+            })
+        };
+
         let unordered_limit = Arc::new(Semaphore::new(4));
-        while let Some((cmd_gen, cmd)) = cmd_rx.recv().await {
-            if cmd.ordered() {
-                if ordered_tx.send((cmd_gen, cmd)).await.is_err() {
-                    break;
+        let mut unordered = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                joined = unordered.join_next(), if !unordered.is_empty() => {
+                    let _ = joined;
                 }
-                continue;
+                maybe = cmd_rx.recv() => {
+                    let Some((cmd_gen, cmd)) = maybe else {
+                        break;
+                    };
+                    if cmd.ordered() {
+                        if ordered_tx.send((cmd_gen, cmd)).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    let Ok(permit) = unordered_limit.clone().acquire_owned().await else {
+                        break;
+                    };
+                    let db = db.clone();
+                    let rpc = rpc.clone();
+                    let evt = evt_tx.clone();
+                    let price = price.clone();
+                    let client = client.clone();
+                    let generation = generation.clone();
+                    unordered.spawn(async move {
+                        let _permit = permit;
+                        handle_command(cmd_gen, cmd, db, rpc, evt, price, client, generation).await;
+                    });
+                }
             }
-            let Ok(permit) = unordered_limit.clone().acquire_owned().await else {
-                break;
-            };
-            let db = db.clone();
-            let rpc = rpc.clone();
-            let evt = evt_tx.clone();
-            let price = price.clone();
-            let client = client.clone();
-            let generation = generation.clone();
-            tokio::spawn(async move {
-                let _permit = permit;
-                handle_command(cmd_gen, cmd, db, rpc, evt, price, client, generation).await;
-            });
         }
+
+        let _ = shutdown_tx.send(true);
+        drop(ordered_tx);
+        while unordered.join_next().await.is_some() {}
+        let _ = ordered_handle.await;
+        let _ = price_handle.await;
     })
 }
 
@@ -354,8 +387,14 @@ async fn handle_command(
             }
             {
                 let mut g = rpc.lock_recover();
-                *g = Rpc::new(client.clone(), url);
+                *g = Rpc::new(client.clone(), url.clone());
             }
+            let _ = evt
+                .send(AppEvent::RpcChanged {
+                    url,
+                    generation: cmd_gen,
+                })
+                .await;
             let new_rpc = { rpc.lock_recover().clone() };
             match reconcile_boot(&db, &new_rpc, &generation, cmd_gen).await {
                 Ok(resolved) => {
@@ -389,12 +428,12 @@ async fn finalize(
     generation: &AtomicU64,
     cmd_gen: u64,
 ) {
-    let Some(changed) = db.with_current(generation, cmd_gen, |d| {
-        d.mark_terminal(intent_id, status, error).unwrap_or(false)
+    let Some(outcome) = db.with_current(generation, cmd_gen, |d| {
+        d.mark_terminal(intent_id, status, error)
     }) else {
         return;
     };
-    let final_status = if changed {
+    let final_status = if matches!(outcome, Ok(IntentTransitionOutcome::Applied)) {
         status
     } else {
         match db.with_current(generation, cmd_gen, |d| {
@@ -434,6 +473,7 @@ async fn sig_status(rpc: &Rpc, sig: &str) -> Option<crate::solana::rpc::Signatur
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PollDecision {
     Continue,
+    WaitFinality,
     Confirm,
     Fail,
     ExpireCandidate,
@@ -448,8 +488,14 @@ fn poll_decision(
         if st.is_error() {
             return PollDecision::Fail;
         }
-        if st.is_confirmed_or_finalized() {
+        if st.is_finalized() {
             return PollDecision::Confirm;
+        }
+        if st.is_confirmed() {
+            return PollDecision::WaitFinality;
+        }
+        if height.is_some_and(|h| h > lvbh + EXPIRY_SLACK) {
+            return PollDecision::ExpireCandidate;
         }
         return PollDecision::Continue;
     }
@@ -457,6 +503,29 @@ fn poll_decision(
         PollDecision::ExpireCandidate
     } else {
         PollDecision::Continue
+    }
+}
+
+async fn rebroadcast_if_due(
+    rpc: &Rpc,
+    bytes: &[u8],
+    sig: &str,
+    lvbh: u64,
+    last_rebroadcast: &mut Option<Instant>,
+) -> Result<(), String> {
+    if last_rebroadcast.is_some_and(|last| last.elapsed() < REBROADCAST_INTERVAL) {
+        return Ok(());
+    }
+    let Ok(height) = rpc.get_block_height().await else {
+        return Ok(());
+    };
+    if height > lvbh {
+        return Ok(());
+    }
+    *last_rebroadcast = Some(Instant::now());
+    match rpc.send_transaction(bytes).await {
+        Ok(returned) if returned != sig => Err(returned),
+        _ => Ok(()),
     }
 }
 
@@ -487,8 +556,8 @@ async fn broadcast_and_poll(
     let lvbh = intent.last_valid_block_height.unwrap_or(0);
 
     match db.with_current(&generation, cmd_gen, |d| d.mark_submitted(intent_id)) {
-        Some(Ok(true)) => {}
-        Some(Ok(false)) => {
+        Some(Ok(IntentTransitionOutcome::Applied)) => {}
+        Some(Ok(IntentTransitionOutcome::WrongState(_) | IntentTransitionOutcome::NotFound)) => {
             send_error(
                 &evt,
                 cmd_gen,
@@ -509,6 +578,7 @@ async fn broadcast_and_poll(
         None => return,
     }
 
+    let mut last_rebroadcast = None;
     let rpc = { rpc_arc.lock_recover().clone() };
     match rpc.send_transaction(&bytes).await {
         Ok(returned) if returned != sig => {
@@ -532,6 +602,7 @@ async fn broadcast_and_poll(
             return;
         }
         Ok(_) => {
+            last_rebroadcast = Some(Instant::now());
             let _ = evt
                 .send(AppEvent::TransferResult {
                     intent_id,
@@ -562,7 +633,10 @@ async fn broadcast_and_poll(
             let rpc = { rpc_arc.lock_recover().clone() };
 
             let status = sig_status(&rpc, &sig).await;
-            let height = if status.is_none() {
+            let height = if status
+                .as_ref()
+                .is_none_or(|st| !st.is_error() && !st.is_confirmed() && !st.is_finalized())
+            {
                 rpc.get_block_height().await.ok()
             } else {
                 None
@@ -596,7 +670,31 @@ async fn broadcast_and_poll(
                     .await;
                     return;
                 }
-                PollDecision::Continue => {}
+                PollDecision::Continue => {
+                    if let Err(returned) =
+                        rebroadcast_if_due(&rpc, &bytes, &sig, lvbh, &mut last_rebroadcast).await
+                    {
+                        let _ = db.with_current(&generation, cmd_gen, |d| {
+                            let _ = d.audit(
+                                AuditEvent::IntegrityCheckFailed,
+                                &json!({"intent": intent_id, "expected": sig, "got": returned}),
+                            );
+                        });
+                        finalize(
+                            &db,
+                            &evt,
+                            intent_id,
+                            &sig,
+                            IntentStatus::Failed,
+                            Some("rpc returned mismatched signature"),
+                            &generation,
+                            cmd_gen,
+                        )
+                        .await;
+                        return;
+                    }
+                }
+                PollDecision::WaitFinality => {}
                 PollDecision::ExpireCandidate => {
                     if let Some(s2) = sig_status(&rpc, &sig).await {
                         if s2.is_error() {
@@ -613,7 +711,7 @@ async fn broadcast_and_poll(
                             .await;
                             return;
                         }
-                        if s2.is_confirmed_or_finalized() {
+                        if s2.is_finalized() {
                             finalize(
                                 &db,
                                 &evt,
@@ -709,7 +807,7 @@ mod tests {
     fn poll_decision_covers_terminal_and_pending_states() {
         assert_eq!(
             poll_decision(Some(&status(false, Some("confirmed"))), None, 100),
-            PollDecision::Confirm
+            PollDecision::WaitFinality
         );
         assert_eq!(
             poll_decision(Some(&status(false, Some("finalized"))), None, 100),
@@ -722,6 +820,14 @@ mod tests {
         assert_eq!(
             poll_decision(Some(&status(false, Some("processed"))), None, 100),
             PollDecision::Continue
+        );
+        assert_eq!(
+            poll_decision(
+                Some(&status(false, Some("processed"))),
+                Some(100 + EXPIRY_SLACK + 1),
+                100,
+            ),
+            PollDecision::ExpireCandidate
         );
         assert_eq!(
             poll_decision(None, Some(100 + EXPIRY_SLACK), 100),

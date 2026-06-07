@@ -1,7 +1,7 @@
 mod intents;
 mod wallets;
 
-pub use intents::CreateIntentError;
+pub use intents::{CreateIntentError, IntentTransitionError, IntentTransitionOutcome};
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,6 +13,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::sync::MutexExt;
 use crate::types::{AuditEntry, AuditEvent, Network};
+
+const SCHEMA_VERSION: &str = "1";
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE meta (
@@ -38,12 +40,12 @@ CREATE TABLE tx_intents (
     from_wallet             INTEGER NOT NULL REFERENCES wallets(id),
     to_address              TEXT    NOT NULL,
     lamports                INTEGER NOT NULL CHECK (lamports > 0),
-    fee_lamports            INTEGER,
+    fee_lamports            INTEGER CHECK (fee_lamports IS NULL OR fee_lamports >= 0),
     status                  TEXT    NOT NULL CHECK (status IN
                                 ('created','signed','submitted','confirmed','failed','expired')),
     signature               TEXT,
     recent_blockhash        TEXT,
-    last_valid_block_height INTEGER,
+    last_valid_block_height INTEGER CHECK (last_valid_block_height IS NULL OR last_valid_block_height >= 0),
     signed_tx               BLOB,
     note                    TEXT,
     error                   TEXT,
@@ -67,6 +69,19 @@ CREATE TABLE audit_log (
 ) STRICT;
 CREATE INDEX ix_audit_ts ON audit_log(ts);
 "#;
+
+const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
+    ("table", "meta"),
+    ("table", "wallets"),
+    ("table", "tx_intents"),
+    ("table", "audit_log"),
+    ("index", "ux_wallets_single_master"),
+    ("index", "ux_tx_intents_signature"),
+    ("index", "ix_tx_intents_open"),
+    ("index", "ix_tx_intents_from_open"),
+    ("index", "ix_tx_intents_from"),
+    ("index", "ix_audit_ts"),
+];
 
 pub struct Db {
     conn: Connection,
@@ -157,8 +172,8 @@ impl Db {
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute_batch(SCHEMA_SQL)?;
             tx.execute(
-                "INSERT INTO meta (key,value) VALUES ('schema_version','1')",
-                [],
+                "INSERT INTO meta (key,value) VALUES ('schema_version',?1)",
+                params![SCHEMA_VERSION],
             )?;
             tx.execute(
                 "INSERT INTO meta (key,value) VALUES ('network','mainnet-beta')",
@@ -174,7 +189,30 @@ impl Db {
             )?;
             tx.commit()?;
         }
-        Ok(())
+        self.validate_schema()
+    }
+
+    fn validate_schema(&self) -> Result<()> {
+        for (kind, name) in REQUIRED_SCHEMA_OBJECTS {
+            let exists = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2",
+                    params![kind, name],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !exists {
+                bail!("database schema is missing required {kind} {name}");
+            }
+        }
+        let version = self.get_meta("schema_version")?;
+        match version.as_deref() {
+            Some(SCHEMA_VERSION) => Ok(()),
+            Some(v) => bail!("unsupported database schema_version {v}"),
+            None => bail!("database schema_version is missing"),
+        }
     }
 
     fn ensure_audit_salt(&mut self) -> Result<()> {
@@ -462,6 +500,29 @@ mod tests {
 
     fn db() -> Db {
         Db::open_memory().unwrap()
+    }
+
+    #[test]
+    fn schema_version_is_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("silo.db");
+        drop(Db::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("DELETE FROM meta WHERE key='schema_version'", [])
+            .unwrap();
+        drop(conn);
+        assert!(Db::open(&path).is_err());
+    }
+
+    #[test]
+    fn required_schema_objects_are_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("silo.db");
+        drop(Db::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("DROP INDEX ix_audit_ts", []).unwrap();
+        drop(conn);
+        assert!(Db::open(&path).is_err());
     }
 
     #[test]

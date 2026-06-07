@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
@@ -27,11 +26,14 @@ impl SignatureStatus {
     pub fn is_error(&self) -> bool {
         self.err.is_some()
     }
+    pub fn is_confirmed(&self) -> bool {
+        matches!(self.confirmation_status.as_deref(), Some("confirmed"))
+    }
+    pub fn is_finalized(&self) -> bool {
+        matches!(self.confirmation_status.as_deref(), Some("finalized"))
+    }
     pub fn is_confirmed_or_finalized(&self) -> bool {
-        matches!(
-            self.confirmation_status.as_deref(),
-            Some("confirmed") | Some("finalized")
-        )
+        self.is_confirmed() || self.is_finalized()
     }
 }
 
@@ -105,10 +107,59 @@ struct RpcEnvelope<T> {
     error: Option<RpcErr>,
 }
 
-#[derive(Deserialize)]
-struct RpcErr {
-    code: i64,
-    message: String,
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct JsonRpcError {
+    pub code: i64,
+    pub message: String,
+}
+
+type RpcErr = JsonRpcError;
+
+#[derive(Debug, thiserror::Error)]
+pub enum RpcError {
+    #[error("RPC {method} request failed: {source}")]
+    Transport {
+        method: &'static str,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("RPC {method} failed after retries: HTTP {status}")]
+    RetryExhaustedHttp {
+        method: &'static str,
+        status: reqwest::StatusCode,
+    },
+    #[error("RPC {method} HTTP {status}")]
+    NonRetryHttp {
+        method: &'static str,
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    #[error("RPC {method} error {code}: {message}")]
+    JsonRpc {
+        method: &'static str,
+        code: i64,
+        message: String,
+    },
+    #[error("RPC {method}: empty result")]
+    MissingResult { method: &'static str },
+    #[error("RPC {method} returned {actual} result(s) for {expected} request(s)")]
+    LengthMismatch {
+        method: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("RPC {method} response decode failed: {source}")]
+    Decode {
+        method: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("RPC {method} response body read failed: {source}")]
+    Body {
+        method: &'static str,
+        #[source]
+        source: reqwest::Error,
+    },
 }
 
 #[derive(Deserialize)]
@@ -143,9 +194,9 @@ impl Rpc {
 
     async fn call<T: DeserializeOwned>(
         &self,
-        method: &str,
+        method: &'static str,
         params: serde_json::Value,
-    ) -> Result<T> {
+    ) -> std::result::Result<T, RpcError> {
         let body = json!({"jsonrpc":"2.0","id":1,"method":method,"params":params});
         let mut attempt = 0u32;
         loop {
@@ -155,24 +206,42 @@ impl Rpc {
                     if status.as_u16() == 429 || status.as_u16() == 408 || status.is_server_error()
                     {
                         if attempt >= MAX_RETRIES {
-                            bail!("RPC {method} failed after retries: HTTP {status}");
+                            return Err(RpcError::RetryExhaustedHttp { method, status });
                         }
                         let wait = retry_after(&resp).unwrap_or_else(|| backoff(attempt));
                         attempt += 1;
                         tokio::time::sleep(wait).await;
                         continue;
                     }
-                    let env: RpcEnvelope<T> = resp.error_for_status()?.json().await?;
-                    if let Some(e) = env.error {
-                        bail!("RPC {method} error {}: {}", e.code, e.message);
+                    if !status.is_success() {
+                        let body = resp
+                            .text()
+                            .await
+                            .map_err(|source| RpcError::Body { method, source })?;
+                        return Err(RpcError::NonRetryHttp {
+                            method,
+                            status,
+                            body,
+                        });
                     }
-                    return env
-                        .result
-                        .ok_or_else(|| anyhow!("RPC {method}: empty result"));
+                    let body = resp
+                        .text()
+                        .await
+                        .map_err(|source| RpcError::Body { method, source })?;
+                    let env: RpcEnvelope<T> = serde_json::from_str(&body)
+                        .map_err(|source| RpcError::Decode { method, source })?;
+                    if let Some(e) = env.error {
+                        return Err(RpcError::JsonRpc {
+                            method,
+                            code: e.code,
+                            message: e.message,
+                        });
+                    }
+                    return env.result.ok_or(RpcError::MissingResult { method });
                 }
                 Err(e) => {
                     if attempt >= MAX_RETRIES {
-                        return Err(anyhow!("RPC {method} request failed: {e}"));
+                        return Err(RpcError::Transport { method, source: e });
                     }
                     let wait = backoff(attempt);
                     attempt += 1;
@@ -182,7 +251,7 @@ impl Rpc {
         }
     }
 
-    pub async fn get_balances(&self, pubkeys: &[&str]) -> Result<Vec<u64>> {
+    pub async fn get_balances(&self, pubkeys: &[&str]) -> std::result::Result<Vec<u64>, RpcError> {
         if pubkeys.is_empty() {
             return Ok(vec![]);
         }
@@ -196,6 +265,14 @@ impl Rpc {
             ]);
             let ctx: Ctx<Vec<Option<AccountInfo>>> =
                 self.call("getMultipleAccounts", params).await?;
+            let actual = ctx.value.len();
+            if actual != chunk.len() {
+                return Err(RpcError::LengthMismatch {
+                    method: "getMultipleAccounts",
+                    expected: chunk.len(),
+                    actual,
+                });
+            }
             out.extend(
                 ctx.value
                     .into_iter()
@@ -205,18 +282,18 @@ impl Rpc {
         Ok(out)
     }
 
-    pub async fn get_balance(&self, pubkey: &str) -> Result<u64> {
+    pub async fn get_balance(&self, pubkey: &str) -> std::result::Result<u64, RpcError> {
         let v = self.get_balances(&[pubkey]).await?;
         Ok(v.first().copied().unwrap_or(0))
     }
 
-    pub async fn get_latest_blockhash(&self) -> Result<(String, u64)> {
+    pub async fn get_latest_blockhash(&self) -> std::result::Result<(String, u64), RpcError> {
         let params = json!([{"commitment": self.commitment}]);
         let ctx: Ctx<BlockhashValue> = self.call("getLatestBlockhash", params).await?;
         Ok((ctx.value.blockhash, ctx.value.last_valid_block_height))
     }
 
-    pub async fn send_transaction(&self, wire: &[u8]) -> Result<String> {
+    pub async fn send_transaction(&self, wire: &[u8]) -> std::result::Result<String, RpcError> {
         let params = json!([
             base64_encode(wire),
             {"encoding": "base64", "skipPreflight": false,
@@ -229,7 +306,7 @@ impl Rpc {
         &self,
         signatures: &[&str],
         search_history: bool,
-    ) -> Result<Vec<Option<SignatureStatus>>> {
+    ) -> std::result::Result<Vec<Option<SignatureStatus>>, RpcError> {
         if signatures.is_empty() {
             return Ok(vec![]);
         }
@@ -239,17 +316,28 @@ impl Rpc {
             let params = json!([chunk, {"searchTransactionHistory": search_history}]);
             let ctx: Ctx<Vec<Option<SignatureStatus>>> =
                 self.call("getSignatureStatuses", params).await?;
+            let actual = ctx.value.len();
+            if actual != chunk.len() {
+                return Err(RpcError::LengthMismatch {
+                    method: "getSignatureStatuses",
+                    expected: chunk.len(),
+                    actual,
+                });
+            }
             out.extend(ctx.value);
         }
         Ok(out)
     }
 
-    pub async fn get_block_height(&self) -> Result<u64> {
+    pub async fn get_block_height(&self) -> std::result::Result<u64, RpcError> {
         self.call("getBlockHeight", json!([{"commitment": self.commitment}]))
             .await
     }
 
-    pub async fn get_min_balance_for_rent_exemption(&self, data_len: usize) -> Result<u64> {
+    pub async fn get_min_balance_for_rent_exemption(
+        &self,
+        data_len: usize,
+    ) -> std::result::Result<u64, RpcError> {
         self.call("getMinimumBalanceForRentExemption", json!([data_len]))
             .await
     }
@@ -536,9 +624,98 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32002,"message":"blockhash not found"}}"#,
         )]);
         let rpc = Rpc::new(reqwest::Client::new(), server.url());
-        let err = rpc.get_block_height().await.unwrap_err().to_string();
-        assert!(err.contains("RPC getBlockHeight error -32002"));
-        assert!(err.contains("blockhash not found"));
+        assert!(matches!(
+            rpc.get_block_height().await.unwrap_err(),
+            RpcError::JsonRpc {
+                method: "getBlockHeight",
+                code: -32002,
+                message
+            } if message == "blockhash not found"
+        ));
+    }
+
+    #[tokio::test]
+    async fn rpc_typed_http_errors_are_distinct() {
+        let server = MockServer::new(vec![MockResponse::new(401, "nope")]);
+        let rpc = Rpc::new(reqwest::Client::new(), server.url());
+        assert!(matches!(
+            rpc.get_block_height().await.unwrap_err(),
+            RpcError::NonRetryHttp {
+                method: "getBlockHeight",
+                status,
+                body
+            } if status.as_u16() == 401 && body == "nope"
+        ));
+
+        let server = MockServer::new(vec![
+            MockResponse::new(500, "").header("Retry-After", "0"),
+            MockResponse::new(500, "").header("Retry-After", "0"),
+            MockResponse::new(500, "").header("Retry-After", "0"),
+            MockResponse::new(500, "").header("Retry-After", "0"),
+            MockResponse::new(500, "").header("Retry-After", "0"),
+        ]);
+        let rpc = Rpc::new(reqwest::Client::new(), server.url());
+        assert!(matches!(
+            rpc.get_block_height().await.unwrap_err(),
+            RpcError::RetryExhaustedHttp {
+                method: "getBlockHeight",
+                status
+            } if status.as_u16() == 500
+        ));
+    }
+
+    #[tokio::test]
+    async fn rpc_rejects_mismatched_batch_lengths() {
+        let server = MockServer::new(vec![MockResponse::new(
+            200,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":[null]}}"#,
+        )]);
+        let rpc = Rpc::new(reqwest::Client::new(), server.url());
+        assert!(matches!(
+            rpc.get_balances(&["A", "B"]).await.unwrap_err(),
+            RpcError::LengthMismatch {
+                method: "getMultipleAccounts",
+                expected: 2,
+                actual: 1,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn rpc_typed_transport_error_is_distinct() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let rpc = Rpc::new(reqwest::Client::new(), url);
+        assert!(matches!(
+            rpc.get_block_height().await.unwrap_err(),
+            RpcError::Transport {
+                method: "getBlockHeight",
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn rpc_typed_body_shape_errors_are_distinct() {
+        let server = MockServer::new(vec![MockResponse::new(200, "not json")]);
+        let rpc = Rpc::new(reqwest::Client::new(), server.url());
+        assert!(matches!(
+            rpc.get_block_height().await.unwrap_err(),
+            RpcError::Decode {
+                method: "getBlockHeight",
+                ..
+            }
+        ));
+
+        let server = MockServer::new(vec![MockResponse::new(200, r#"{"jsonrpc":"2.0","id":1}"#)]);
+        let rpc = Rpc::new(reqwest::Client::new(), server.url());
+        assert!(matches!(
+            rpc.get_block_height().await.unwrap_err(),
+            RpcError::MissingResult {
+                method: "getBlockHeight"
+            }
+        ));
     }
 
     #[tokio::test]

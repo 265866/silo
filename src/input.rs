@@ -5,7 +5,7 @@ use crate::app::{App, Command, ConfirmAction, Modal, PromptKind, Route, SetupSta
 use crate::clipboard::validate_solana_pubkey;
 use crate::crypto;
 use crate::solana::tx;
-use crate::types::{AuditEvent, Role, RouteError, WalletRow};
+use crate::types::{AuditEvent, IntentStatus, Role, RouteError, WalletRow};
 
 const BLOCKHASH_REFRESH_AFTER: std::time::Duration = std::time::Duration::from_secs(45);
 
@@ -905,7 +905,7 @@ fn execute_send(app: &mut App) {
             app.toast_err("This wallet already has a transfer in progress");
             return;
         }
-        Err(crate::db::CreateIntentError::Db(e)) => {
+        Err(e) => {
             app.toast_err(format!("Could not record transfer: {e}"));
             return;
         }
@@ -932,7 +932,15 @@ fn execute_send(app: &mut App) {
         .db
         .with_mut(|d| d.mark_signed(intent.id, &sig_b58, &ps.blockhash, ps.lvbh, ps.fee, &wire));
     match signed {
-        Ok(()) => {}
+        Ok(crate::db::IntentTransitionOutcome::Applied) => {}
+        Ok(crate::db::IntentTransitionOutcome::NotFound) => {
+            app.toast_err("Transfer record vanished before signing");
+            return;
+        }
+        Ok(crate::db::IntentTransitionOutcome::WrongState(status)) => {
+            app.toast_err(format!("Transfer was already {}", status.as_str()));
+            return;
+        }
         Err(e) => {
             fail_intent(app, intent.id, "could not persist signed transfer");
             app.toast_err(format!("Could not persist signed transfer: {e}"));
@@ -951,14 +959,13 @@ fn execute_send(app: &mut App) {
 
 fn fail_intent(app: &App, intent_id: i64, reason: &str) {
     app.db.with_mut(|d| {
-        let _ = d.mark_terminal(intent_id, crate::types::IntentStatus::Failed, Some(reason));
+        let _ = d.mark_terminal(intent_id, IntentStatus::Failed, Some(reason));
     });
 }
 
 fn run_confirm_action(app: &mut App, action: ConfirmAction) {
     match action {
         ConfirmAction::CreateWithEmptyPassphrase => create_vault_and_finish(app),
-        ConfirmAction::DeleteProfile(id) => delete_profile(app, &id),
     }
 }
 
@@ -972,11 +979,16 @@ fn delete_profile(app: &mut App, id: &str) {
         app.begin_new_profile();
         app.toast_info("Profile deleted — set up a new wallet");
     } else {
-        let first = app.profiles[0].id.clone();
-        let _ = app.switch_to_profile(&first);
-        app.profile_sel = 0;
-        app.route = Route::ProfileSelect;
-        app.toast_ok("Profile deleted");
+        for (idx, profile) in app.profiles.clone().into_iter().enumerate() {
+            if app.switch_to_profile(&profile.id).is_ok() {
+                app.profile_sel = idx;
+                app.route = Route::ProfileSelect;
+                app.toast_ok("Profile deleted");
+                return;
+            }
+        }
+        app.toast_err("Profile deleted, but no remaining profile could be opened");
+        app.begin_new_profile();
     }
 }
 
@@ -1011,14 +1023,14 @@ fn profile_select_keys(app: &mut App, key: KeyEvent) {
         KeyCode::Char('n') => app.begin_new_profile(),
         KeyCode::Char('d') => {
             if let Some(p) = app.profiles.get(app.profile_sel) {
-                app.modal = Some(Modal::Confirm {
-                    title: "Delete profile".into(),
-                    body: format!(
-                        "Permanently delete \"{}\" — its wallet DB and encrypted recovery \
-                         phrase. This cannot be undone (recover only from your written phrase).",
-                        p.name
-                    ),
-                    action: ConfirmAction::DeleteProfile(p.id.clone()),
+                let challenge = format!("delete {}", p.id);
+                app.input.prompt_text.clear();
+                app.modal = Some(Modal::Prompt {
+                    kind: PromptKind::DeleteProfile {
+                        id: p.id.clone(),
+                        challenge: challenge.clone(),
+                    },
+                    title: format!("Type {challenge:?} to delete profile"),
                 });
             }
         }
@@ -1325,12 +1337,8 @@ fn apply_prompt(app: &mut App) {
                         return;
                     }
                 };
-                app.bump_generation_for_rpc_change();
-                if app.send_cmd(Command::ChangeRpc { url: url.clone() }) {
-                    app.rpc_url = url;
-                    app.net_status = crate::types::NetStatus::Syncing;
-                    app.reconcile_done = false;
-                    app.toast_info("RPC updated — reconciling");
+                if app.send_rpc_change_cmd(url) {
+                    app.toast_info("Saving RPC URL…");
                 }
             }
         }
@@ -1346,6 +1354,13 @@ fn apply_prompt(app: &mut App) {
                     return;
                 }
             }
+        }
+        Some(PromptKind::DeleteProfile { id, challenge }) => {
+            if text != challenge {
+                app.toast_err("Profile deletion challenge did not match");
+                return;
+            }
+            delete_profile(app, &id);
         }
         None => {}
     }
@@ -1388,7 +1403,7 @@ mod tests {
     use super::*;
     use crate::app::PendingSend;
     use crate::db::{Db, Storage};
-    use crate::price::PriceCache;
+    use crate::price::{PriceCache, PriceSource, SolPrice};
     use crate::solana::rpc::Rpc;
     use crate::types::IntentStatus;
 
@@ -1470,6 +1485,44 @@ mod tests {
             balance_lamports: None,
             has_open_intent: false,
         }
+    }
+
+    #[test]
+    fn stale_fiat_price_cannot_compose_send_amount() {
+        let mut h = harness(true);
+        h.app.input.send_in_fiat = true;
+        h.app.input.send_amount = "10".into();
+        h.app.price.set(SolPrice {
+            value: 100.0,
+            currency: crate::types::Currency::Usd,
+            fetched_at: 0,
+            source: PriceSource::CoinGecko,
+        });
+        assert!(h.app.compose_lamports().is_err());
+    }
+
+    #[tokio::test]
+    async fn rpc_prompt_invalidates_generation_before_worker_success() {
+        let mut h = harness(true);
+        h.app.modal = Some(Modal::Prompt {
+            kind: PromptKind::RpcUrl,
+            title: "RPC URL".into(),
+        });
+        h.app.input.prompt_text = "https://rpc.example.com".into();
+
+        apply_prompt(&mut h.app);
+
+        assert_eq!(
+            h.app.generation.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(h.app.rpc_url, "http://127.0.0.1:8899");
+        let (generation, cmd) = h.rx.recv().await.unwrap();
+        assert_eq!(generation, 1);
+        assert!(matches!(
+            cmd,
+            Command::ChangeRpc { url } if url == "https://rpc.example.com"
+        ));
     }
 
     #[tokio::test]
