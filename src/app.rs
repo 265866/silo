@@ -548,6 +548,7 @@ pub struct App {
     pub(crate) detail_intents: Vec<Intent>,
     pub(crate) audit: Vec<crate::types::AuditEntry>,
     pub(crate) pending_send: Option<PendingSend>,
+    pub(crate) preparing_send: bool,
     pub(crate) send_confirm_armed: bool,
     pub(crate) blocking_input: bool,
 
@@ -624,6 +625,7 @@ impl App {
             detail_intents: Vec::new(),
             audit: Vec::new(),
             pending_send: None,
+            preparing_send: false,
             send_confirm_armed: false,
             blocking_input: false,
             last_activity: Instant::now(),
@@ -1366,8 +1368,16 @@ impl App {
                 priority_micro,
                 generation,
             } => {
+                self.preparing_send = false;
                 if generation != self.generation.load(Ordering::SeqCst) || self.route != Route::Send
                 {
+                    return;
+                }
+                let duplicate = matches!(self.modal, Some(Modal::ConfirmSend))
+                    && self.pending_send.as_ref().is_some_and(|cur| {
+                        cur.from_id == from_id && cur.to == to && cur.lamports == lamports
+                    });
+                if duplicate {
                     return;
                 }
                 self.pending_send = Some(PendingSend {
@@ -1796,6 +1806,7 @@ impl App {
                 message,
                 generation,
             } => {
+                self.preparing_send = false;
                 if generation != self.generation.load(Ordering::SeqCst) {
                     return;
                 }
