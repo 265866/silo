@@ -1,0 +1,79 @@
+name: Install or runtime support
+description: Get help with installation, startup, terminal, config, RPC, or runtime problems
+title: "support: "
+labels: [question]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for non-security install and runtime support. If this may be a security vulnerability, do not file a public issue; use [SECURITY.md](https://github.com/265866/silo/blob/main/SECURITY.md) for private reporting.
+
+        Never include recovery phrases, private keys, passphrases, API tokens, RPC tokens, or live wallet secrets. Maintainers will not ask for secrets, cannot recover lost mnemonics or passphrases, cannot reverse transactions, and cannot guarantee third-party RPC/provider support.
+  - type: input
+    id: version
+    attributes:
+      label: silo version
+      description: Run `silo --version` if available, or provide the release/commit you installed.
+      placeholder: "silo 0.1.2"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "macOS 15, Ubuntu 24.04, Windows 11"
+    validations:
+      required: true
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: Install method
+      options:
+        - Homebrew
+        - Install script
+        - Prebuilt binary
+        - cargo install
+        - From source
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal and shell
+      placeholder: "Terminal.app + zsh, Windows Terminal + PowerShell, GNOME Terminal + bash, SSH with TTY"
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem description
+      description: What are you trying to do, and what happens instead?
+    validations:
+      required: true
+  - type: textarea
+    id: command-output
+    attributes:
+      label: Command and sanitized output
+      description: Include the command you ran and output after removing secrets, tokens, wallet data, and private paths if needed.
+      placeholder: |
+        Command:
+        ```sh
+        silo
+        ```
+
+        Output:
+        ```text
+        ...
+        ```
+  - type: textarea
+    id: config-context
+    attributes:
+      label: Runtime context
+      description: Include config directory override, terminal/TTY setup, RPC provider or endpoint type, and network conditions if relevant. Do not include tokenized URLs or secrets.
+      placeholder: "SILO_CONFIG_DIR set to a throwaway directory; default mainnet RPC; SSH session with TTY"
+  - type: textarea
+    id: tried
+    attributes:
+      label: What you tried
+      description: List troubleshooting steps already attempted.
