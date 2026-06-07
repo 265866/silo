@@ -67,6 +67,7 @@ pub async fn reconcile_boot(
     };
 
     let mut resolved = 0usize;
+    let mut deferred = 0usize;
 
     macro_rules! guarded {
         ($f:expr) => {
@@ -103,13 +104,20 @@ pub async fn reconcile_boot(
         };
         let lvbh = intent.last_valid_block_height.unwrap_or(0);
 
-        let status = rpc
-            .get_signature_statuses(&[sig.as_str()], true)
-            .await?
-            .into_iter()
-            .next()
-            .flatten();
-        let height = rpc.get_block_height().await?;
+        let status = match rpc.get_signature_statuses(&[sig.as_str()], true).await {
+            Ok(statuses) => statuses.into_iter().next().flatten(),
+            Err(_) => {
+                deferred += 1;
+                continue;
+            }
+        };
+        let height = match rpc.get_block_height().await {
+            Ok(height) => height,
+            Err(_) => {
+                deferred += 1;
+                continue;
+            }
+        };
 
         match decide(status.as_ref(), height, lvbh) {
             Decision::FinalizeSuccess => {
@@ -120,12 +128,13 @@ pub async fn reconcile_boot(
                 terminal!(intent.id, IntentStatus::Failed, Some(&reason));
             }
             Decision::Expire => {
-                let recheck = rpc
-                    .get_signature_statuses(&[sig.as_str()], true)
-                    .await?
-                    .into_iter()
-                    .next()
-                    .flatten();
+                let recheck = match rpc.get_signature_statuses(&[sig.as_str()], true).await {
+                    Ok(statuses) => statuses.into_iter().next().flatten(),
+                    Err(_) => {
+                        deferred += 1;
+                        continue;
+                    }
+                };
                 if let Some(s2) = recheck {
                     if s2.is_error() {
                         terminal!(intent.id, IntentStatus::Failed, Some("on-chain error"));
@@ -183,7 +192,7 @@ pub async fn reconcile_boot(
     if let Some(r) = db.with_current(generation, cmd_gen, |d| {
         d.audit(
             AuditEvent::ReconcileResolved,
-            &json!({"resolved": resolved}),
+            &json!({"resolved": resolved, "deferred": deferred}),
         )
     }) {
         r?;
@@ -232,10 +241,12 @@ mod tests {
                         .pop_front()
                         .unwrap_or_else(|| json!({"unexpected": true}));
                     let done = responses_for_thread.lock().unwrap().is_empty();
-                    write_response(
-                        &mut stream,
-                        &json!({"jsonrpc":"2.0","id":1,"result":result}).to_string(),
-                    );
+                    let envelope = if result.get("jsonrpc").is_some() {
+                        result.to_string()
+                    } else {
+                        json!({"jsonrpc":"2.0","id":1,"result":result}).to_string()
+                    };
+                    write_response(&mut stream, &envelope);
                     if done {
                         break;
                     }
@@ -324,6 +335,52 @@ mod tests {
             .id
         });
         (db, id)
+    }
+
+    fn db_with_two_intents() -> (Storage, i64, i64) {
+        let db = Storage::new(Db::open_memory().unwrap());
+        let (id1, id2) = db.with_mut(|d| {
+            let m = d
+                .insert_wallet(
+                    0,
+                    Role::Master,
+                    "M1111111111111111111111111111111111111111111",
+                    None,
+                )
+                .unwrap();
+            let s = d
+                .insert_wallet(
+                    1,
+                    Role::Sub,
+                    "S2222222222222222222222222222222222222222222",
+                    None,
+                )
+                .unwrap();
+            let i1 = d
+                .create_intent(
+                    m.id,
+                    "Dest1111111111111111111111111111111111111111",
+                    1000,
+                    None,
+                )
+                .unwrap()
+                .id;
+            let i2 = d
+                .create_intent(
+                    s.id,
+                    "Dest2222222222222222222222222222222222222222",
+                    1000,
+                    None,
+                )
+                .unwrap()
+                .id;
+            (i1, i2)
+        });
+        (db, id1, id2)
+    }
+
+    fn rpc_error() -> Value {
+        json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"boom"}})
     }
 
     fn signed(db: &Storage, id: i64, sig: &str, lvbh: u64) {
@@ -501,6 +558,57 @@ mod tests {
         let events = audit_events(&db);
         assert!(events.contains(&"integrity_check_failed".to_string()));
         assert!(events.contains(&"intent_failed".to_string()));
+    }
+
+    #[tokio::test]
+    async fn one_intent_status_probe_error_does_not_abort_the_batch() {
+        let (db, id1, id2) = db_with_two_intents();
+        signed(&db, id1, "Sig1", 1000);
+        signed(&db, id2, "Sig2", 1000);
+        let server = MockServer::new(vec![
+            json!({"context":{"slot":1},"value":[status_value(Value::Null, "finalized")]}),
+            json!(1000),
+            rpc_error(),
+        ]);
+        assert_eq!(run(&db, &server.rpc()).await, 1);
+        assert_eq!(intent(&db, id1).status, IntentStatus::Confirmed);
+        assert_eq!(intent(&db, id2).status, IntentStatus::Signed);
+        assert!(audit_events(&db).contains(&"reconcile_resolved".to_string()));
+    }
+
+    #[tokio::test]
+    async fn one_intent_block_height_error_does_not_abort_the_batch() {
+        let (db, id1, id2) = db_with_two_intents();
+        signed(&db, id1, "Sig1", 1000);
+        signed(&db, id2, "Sig2", 1000);
+        let server = MockServer::new(vec![
+            json!({"context":{"slot":1},"value":[null]}),
+            rpc_error(),
+            json!({"context":{"slot":1},"value":[status_value(Value::Null, "finalized")]}),
+            json!(1000),
+        ]);
+        assert_eq!(run(&db, &server.rpc()).await, 1);
+        assert_eq!(intent(&db, id1).status, IntentStatus::Signed);
+        assert_eq!(intent(&db, id2).status, IntentStatus::Confirmed);
+        assert!(audit_events(&db).contains(&"reconcile_resolved".to_string()));
+    }
+
+    #[tokio::test]
+    async fn expire_recheck_error_does_not_abort_the_batch() {
+        let (db, id1, id2) = db_with_two_intents();
+        signed(&db, id1, "Sig1", 1000);
+        signed(&db, id2, "Sig2", 1000);
+        let server = MockServer::new(vec![
+            json!({"context":{"slot":1},"value":[null]}),
+            json!(1151),
+            rpc_error(),
+            json!({"context":{"slot":1},"value":[status_value(Value::Null, "finalized")]}),
+            json!(1000),
+        ]);
+        assert_eq!(run(&db, &server.rpc()).await, 1);
+        assert_eq!(intent(&db, id1).status, IntentStatus::Signed);
+        assert_eq!(intent(&db, id2).status, IntentStatus::Confirmed);
+        assert!(audit_events(&db).contains(&"reconcile_resolved".to_string()));
     }
 
     fn status(err: bool, conf: Option<&str>) -> SignatureStatus {
