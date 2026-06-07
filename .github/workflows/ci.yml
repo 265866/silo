@@ -13,19 +13,19 @@ jobs:
     name: msrv (1.89)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Install clipboard build deps
         run: sudo apt-get update && sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
-      - uses: dtolnay/rust-toolchain@1.89.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@193d6aa1dbbc28bd2c0a6b0e327cfdce68baaf6e # 1.89.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo check --locked --all-targets
 
   dependency-policy:
     name: dependency policy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
         with:
           command: check advisories licenses bans sources
 
@@ -33,7 +33,7 @@ jobs:
     name: release workflow installer policy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Check release installer patterns
         run: |
           python3 - <<'PY'
@@ -55,17 +55,54 @@ jobs:
                   sys.exit(1)
           PY
 
+  github-actions-pin-policy:
+    name: GitHub Actions pin policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Check workflow action pins
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          workflow_dir = pathlib.Path('.github/workflows')
+          uses_pattern = re.compile(r'^\s*uses:\s*([^\s#]+)')
+          full_sha = re.compile(r'^[0-9a-fA-F]{40}$')
+          failures = []
+
+          for workflow in sorted(workflow_dir.glob('*.yml')):
+              for line_number, line in enumerate(workflow.read_text().splitlines(), 1):
+                  match = uses_pattern.match(line)
+                  if not match:
+                      continue
+                  reference = match.group(1)
+                  if reference.startswith('./'):
+                      continue
+                  if '@' not in reference:
+                      failures.append((workflow, line_number, reference, 'missing @ ref'))
+                      continue
+                  ref = reference.rsplit('@', 1)[1]
+                  if not full_sha.fullmatch(ref):
+                      failures.append((workflow, line_number, reference, 'ref is not a full 40-character SHA'))
+
+          for workflow, line_number, reference, reason in failures:
+              print(f'{workflow}:{line_number}: {reason}: {reference}')
+          sys.exit(1 if failures else 0)
+          PY
+
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Install clipboard build deps
         run: sudo apt-get update && sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
 
@@ -77,10 +114,10 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Install clipboard build deps
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo test
