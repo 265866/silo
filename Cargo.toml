@@ -59,6 +59,9 @@ solana-message = { version = "4.2.0", features = ["wincode"] }
 solana-system-interface = { version = "3.2.0", features = ["bincode"] }
 tempfile = "3.27.0"
 
+[profile.release]
+overflow-checks = true
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
