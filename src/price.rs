@@ -8,6 +8,11 @@ use crate::types::Currency;
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 pub const STALE_AFTER_SECS: u64 = 5 * 60;
 
+const MIN_SOL_PRICE: f64 = 0.01;
+const MAX_SOL_PRICE: f64 = 100_000.0;
+const MIN_FX_RATE: f64 = 0.0001;
+const MAX_FX_RATE: f64 = 10_000.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PriceSource {
     CoinGecko,
@@ -159,7 +164,7 @@ fn now_secs() -> u64 {
 }
 
 fn validate(value: f64, currency: Currency, source: PriceSource) -> Result<SolPrice, PriceError> {
-    if value.is_finite() && value > 0.0 {
+    if value.is_finite() && (MIN_SOL_PRICE..=MAX_SOL_PRICE).contains(&value) {
         Ok(SolPrice {
             value,
             currency,
@@ -269,7 +274,7 @@ async fn fetch_fx_rate(
     }
     let body: FxResp = resp.json().await.map_err(|_| PriceError::Parse)?;
     let rate = body.rates.get(&code).copied().ok_or(PriceError::Parse)?;
-    if rate.is_finite() && rate > 0.0 {
+    if rate.is_finite() && (MIN_FX_RATE..=MAX_FX_RATE).contains(&rate) {
         Ok(rate)
     } else {
         Err(PriceError::BadValue)
@@ -544,6 +549,68 @@ mod tests {
         assert!(validate(-5.0, c, PriceSource::CoinGecko).is_err());
         assert!(validate(f64::INFINITY, c, PriceSource::CoinGecko).is_err());
         assert!(validate(146.2, c, PriceSource::CoinGecko).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_out_of_band_prices() {
+        let c = Currency::Usd;
+        assert!(matches!(
+            validate(0.0001, c, PriceSource::CoinGecko),
+            Err(PriceError::BadValue)
+        ));
+        assert!(matches!(
+            validate(1_000_000.0, c, PriceSource::Jupiter),
+            Err(PriceError::BadValue)
+        ));
+        assert!(validate(150.0, c, PriceSource::CoinGecko).is_ok());
+        assert!(validate(MIN_SOL_PRICE, c, PriceSource::CoinGecko).is_ok());
+        assert!(validate(MAX_SOL_PRICE, c, PriceSource::CoinGecko).is_ok());
+    }
+
+    #[tokio::test]
+    async fn fx_rate_out_of_band_is_rejected() {
+        let server = MockServer::new(vec![MockResponse::new(
+            200,
+            r#"{"amount":1.0,"base":"USD","date":"2024-05-01","rates":{"EUR":100000.0}}"#,
+        )]);
+        let endpoints = server.endpoints();
+        let client = reqwest::Client::new();
+        let err = fetch_fx_rate(&client, Currency::Eur, &endpoints)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PriceError::BadValue));
+    }
+
+    #[tokio::test]
+    async fn fx_rate_realistic_is_accepted() {
+        let server = MockServer::new(vec![MockResponse::new(
+            200,
+            r#"{"amount":1.0,"base":"USD","date":"2024-05-01","rates":{"EUR":0.92}}"#,
+        )]);
+        let endpoints = server.endpoints();
+        let client = reqwest::Client::new();
+        let rate = fetch_fx_rate(&client, Currency::Eur, &endpoints)
+            .await
+            .unwrap();
+        assert_eq!(rate, 0.92);
+    }
+
+    #[tokio::test]
+    async fn fallback_rejects_out_of_band_product() {
+        let jupiter = format!(r#"{{"{SOL_MINT}":{{"usdPrice":150.0}}}}"#);
+        let server = MockServer::new(vec![
+            MockResponse::new(200, jupiter),
+            MockResponse::new(
+                200,
+                r#"{"amount":1.0,"base":"USD","date":"2024-05-01","rates":{"EUR":5000.0}}"#,
+            ),
+        ]);
+        let endpoints = server.endpoints();
+        let client = reqwest::Client::new();
+        let err = fetch_price_fallback_only_with_endpoints(&client, Currency::Eur, &endpoints)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PriceError::BadValue));
     }
 
     #[test]
