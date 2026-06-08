@@ -540,7 +540,7 @@ fn canonical_bytes(id: i64, ts: i64, event_type: &str, details: &str) -> Vec<u8>
 }
 
 fn hmac_hex(key: &[u8; 32], canonical: &[u8], prev: Option<&str>) -> String {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(canonical);
