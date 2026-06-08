@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/265866/silo/compare/v0.1.6...v0.1.7) - 2026-06-08
+
+### Added
+
+- *(db)* add forward migration runner and enforce one-open-intent-per-wallet ([#187](https://github.com/265866/silo/pull/187))
+
+### Fixed
+
+- *(security)* scrub mnemonic temporary and pre-size secret input buffers ([#188](https://github.com/265866/silo/pull/188))
+- *(worker)* keep confirmed-but-unfinalized transfers open instead of expiring them ([#186](https://github.com/265866/silo/pull/186))
+
 ## [0.1.6](https://github.com/265866/silo/compare/v0.1.5...v0.1.6) - 2026-06-08
 
 ### Fixed
