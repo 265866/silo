@@ -57,7 +57,7 @@ pub fn random_bytes(buf: &mut [u8]) {
 }
 
 pub fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8], okm: &mut [u8]) -> Result<()> {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     type H = Hmac<Sha256>;
 
