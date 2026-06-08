@@ -14,7 +14,20 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::sync::MutexExt;
 use crate::types::{AuditEntry, AuditEvent, Network};
 
-const SCHEMA_VERSION: &str = "1";
+const SCHEMA_VERSION: u32 = 2;
+
+struct Migration {
+    to: u32,
+    sql: &'static str,
+}
+
+const MIGRATIONS: &[Migration] = &[Migration {
+    to: 2,
+    sql: "DROP INDEX IF EXISTS ix_tx_intents_from_open;
+          CREATE UNIQUE INDEX ux_tx_intents_one_open_per_wallet
+              ON tx_intents(from_wallet)
+              WHERE status IN ('created','signed','submitted');",
+}];
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE meta (
@@ -78,7 +91,7 @@ const REQUIRED_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("index", "ux_wallets_single_master"),
     ("index", "ux_tx_intents_signature"),
     ("index", "ix_tx_intents_open"),
-    ("index", "ix_tx_intents_from_open"),
+    ("index", "ux_tx_intents_one_open_per_wallet"),
     ("index", "ix_tx_intents_from"),
     ("index", "ix_audit_ts"),
 ];
@@ -212,8 +225,8 @@ impl Db {
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute_batch(SCHEMA_SQL)?;
             tx.execute(
-                "INSERT INTO meta (key,value) VALUES ('schema_version',?1)",
-                params![SCHEMA_VERSION],
+                "INSERT INTO meta (key,value) VALUES ('schema_version','1')",
+                [],
             )?;
             tx.execute(
                 "INSERT INTO meta (key,value) VALUES ('network','mainnet-beta')",
@@ -229,7 +242,47 @@ impl Db {
             )?;
             tx.commit()?;
         }
+        self.run_migrations()?;
         self.validate_schema()
+    }
+
+    fn current_schema_version(&self) -> Result<u32> {
+        let raw = self
+            .get_meta("schema_version")?
+            .context("database schema_version is missing")?;
+        match raw.parse::<u32>() {
+            Ok(v) => Ok(v),
+            Err(_) => bail!("database schema_version {raw} is not a valid integer"),
+        }
+    }
+
+    fn run_migrations(&mut self) -> Result<()> {
+        let mut version = self.current_schema_version()?;
+        if version > SCHEMA_VERSION {
+            bail!(
+                "database schema_version {version} is newer than this build supports \
+                 (max {SCHEMA_VERSION}); upgrade silo to open it"
+            );
+        }
+        for migration in MIGRATIONS {
+            if migration.to <= version {
+                continue;
+            }
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(migration.sql)?;
+            tx.execute(
+                "UPDATE meta SET value=?1 WHERE key='schema_version'",
+                params![migration.to.to_string()],
+            )?;
+            tx.commit()?;
+            version = migration.to;
+        }
+        if version != SCHEMA_VERSION {
+            bail!("database reached schema_version {version}, expected {SCHEMA_VERSION}");
+        }
+        Ok(())
     }
 
     fn validate_schema(&self) -> Result<()> {
@@ -247,12 +300,11 @@ impl Db {
                 bail!("database schema is missing required {kind} {name}");
             }
         }
-        let version = self.get_meta("schema_version")?;
-        match version.as_deref() {
-            Some(SCHEMA_VERSION) => Ok(()),
-            Some(v) => bail!("unsupported database schema_version {v}"),
-            None => bail!("database schema_version is missing"),
+        let version = self.current_schema_version()?;
+        if version != SCHEMA_VERSION {
+            bail!("unsupported database schema_version {version}");
         }
+        Ok(())
     }
 
     fn ensure_audit_salt(&mut self) -> Result<()> {
@@ -709,10 +761,110 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("silo.db");
         let d1 = Db::open(&path).unwrap();
-        assert_eq!(d1.get_meta("schema_version").unwrap().as_deref(), Some("1"));
+        assert_eq!(d1.get_meta("schema_version").unwrap().as_deref(), Some("2"));
         drop(d1);
         let d2 = Db::open(&path).unwrap();
-        assert_eq!(d2.get_meta("schema_version").unwrap().as_deref(), Some("1"));
+        assert_eq!(d2.get_meta("schema_version").unwrap().as_deref(), Some("2"));
+    }
+
+    fn create_v1_database(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0))
+            .unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        conn.execute_batch(
+            "INSERT INTO meta (key,value) VALUES ('schema_version','1');
+             INSERT INTO meta (key,value) VALUES ('network','mainnet-beta');
+             INSERT INTO meta (key,value) VALUES ('rpc_url','https://api.mainnet-beta.solana.com');
+             INSERT INTO meta (key,value) VALUES ('commitment','confirmed');",
+        )
+        .unwrap();
+    }
+
+    fn index_exists(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1",
+            params![name],
+            |_| Ok(true),
+        )
+        .optional()
+        .unwrap()
+        .unwrap_or(false)
+    }
+
+    #[test]
+    fn open_migrates_v1_database_and_swaps_in_the_one_open_intent_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("silo.db");
+        create_v1_database(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            assert!(index_exists(&conn, "ix_tx_intents_from_open"));
+            assert!(!index_exists(&conn, "ux_tx_intents_one_open_per_wallet"));
+        }
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.get_meta("schema_version").unwrap().as_deref(), Some("2"));
+        drop(db);
+
+        let conn = Connection::open(&path).unwrap();
+        assert!(
+            index_exists(&conn, "ux_tx_intents_one_open_per_wallet"),
+            "migration must create the one-open-intent unique index"
+        );
+        assert!(
+            !index_exists(&conn, "ix_tx_intents_from_open"),
+            "migration must drop the redundant non-unique open index"
+        );
+    }
+
+    #[test]
+    fn database_newer_than_build_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("silo.db");
+        drop(Db::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("UPDATE meta SET value='999' WHERE key='schema_version'", [])
+            .unwrap();
+        drop(conn);
+        assert!(
+            Db::open(&path).is_err(),
+            "a database from a newer build must be refused, not silently downgraded"
+        );
+    }
+
+    #[test]
+    fn one_open_intent_per_wallet_is_enforced_by_a_unique_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("silo.db");
+        let db = Db::open(&path).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO wallets (account_index, role, pubkey, created_at)
+                 VALUES (0,'master','PK',0)",
+                [],
+            )
+            .unwrap();
+        let wid: i64 = db
+            .conn
+            .query_row("SELECT id FROM wallets", [], |r| r.get(0))
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO tx_intents (from_wallet,to_address,lamports,status,created_at,updated_at)
+                 VALUES (?1,'A',1,'submitted',0,0)",
+                params![wid],
+            )
+            .unwrap();
+        let second = db.conn.execute(
+            "INSERT INTO tx_intents (from_wallet,to_address,lamports,status,created_at,updated_at)
+             VALUES (?1,'B',1,'signed',0,0)",
+            params![wid],
+        );
+        assert!(
+            second.is_err(),
+            "a second open intent for the same wallet must violate the unique index"
+        );
     }
 
     #[test]
