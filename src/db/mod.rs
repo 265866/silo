@@ -405,43 +405,81 @@ impl Db {
     }
 }
 
+type Job = Box<dyn FnOnce(&mut Db) + Send>;
+
 #[derive(Clone)]
 pub struct Storage {
-    inner: Arc<Mutex<Db>>,
+    tx: std::sync::mpsc::Sender<Job>,
 }
 
 impl Storage {
     pub fn new(db: Db) -> Self {
-        Storage {
-            inner: Arc::new(Mutex::new(db)),
-        }
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("silo-db".to_string())
+            .spawn(move || {
+                let mut db = db;
+                while let Ok(job) = rx.recv() {
+                    job(&mut db);
+                }
+            })
+            .expect("spawn silo-db thread");
+        Storage { tx }
     }
 
-    pub fn with<R>(&self, f: impl FnOnce(&Db) -> R) -> R {
-        let guard = self.inner.lock_recover();
-        f(&guard)
+    pub async fn call<R, F>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut Db) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let job: Job = Box::new(move |db| {
+            let _ = reply_tx.send(f(db));
+        });
+        self.tx.send(job).expect("silo-db thread alive");
+        reply_rx.await.expect("silo-db thread replied")
     }
 
-    pub fn with_mut<R>(&self, f: impl FnOnce(&mut Db) -> R) -> R {
-        let mut guard = self.inner.lock_recover();
-        f(&mut guard)
+    pub fn call_blocking<R, F>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut Db) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let job: Job = Box::new(move |db| {
+            let _ = reply_tx.send(f(db));
+        });
+        self.tx.send(job).expect("silo-db thread alive");
+        reply_rx.recv().expect("silo-db thread replied")
+    }
+
+    pub async fn call_current<R, F>(
+        &self,
+        generation: Arc<AtomicU64>,
+        cmd_gen: u64,
+        f: F,
+    ) -> Option<R>
+    where
+        F: FnOnce(&mut Db) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let job: Job = Box::new(move |db| {
+            let reply = if generation.load(Ordering::SeqCst) == cmd_gen {
+                Some(f(db))
+            } else {
+                None
+            };
+            let _ = reply_tx.send(reply);
+        });
+        self.tx.send(job).expect("silo-db thread alive");
+        reply_rx.await.expect("silo-db thread replied")
     }
 
     pub fn replace(&self, db: Db) {
-        *self.inner.lock_recover() = db;
-    }
-
-    pub fn with_current<R>(
-        &self,
-        generation: &AtomicU64,
-        cmd_gen: u64,
-        f: impl FnOnce(&mut Db) -> R,
-    ) -> Option<R> {
-        let mut guard = self.inner.lock_recover();
-        if generation.load(Ordering::SeqCst) != cmd_gen {
-            return None;
-        }
-        Some(f(&mut guard))
+        self.call_blocking(move |slot| {
+            *slot = db;
+        });
     }
 }
 
@@ -963,5 +1001,72 @@ mod tests {
         let mut k = [0u8; 32];
         crate::crypto::random_bytes(&mut k);
         assert_eq!(from_hex32(&to_hex(&k)).unwrap(), k);
+    }
+
+    #[test]
+    fn actor_serializes_blocking_writes_and_async_reads() {
+        let storage = Storage::new(Db::open_memory().unwrap());
+        storage.call_blocking(|d| {
+            d.insert_wallet(
+                0,
+                Role::Master,
+                "M1111111111111111111111111111111111111111111",
+                None,
+            )
+            .unwrap();
+        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let count = rt.block_on(storage.call(|d| d.list_wallets().unwrap().len()));
+        assert_eq!(
+            count, 1,
+            "an async read must observe a prior blocking write"
+        );
+    }
+
+    #[test]
+    fn actor_call_current_skips_stale_generation() {
+        let storage = Storage::new(Db::open_memory().unwrap());
+        let generation = Arc::new(AtomicU64::new(5));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let ran = rt.block_on(storage.call_current(generation.clone(), 5, |_d| 42));
+        assert_eq!(ran, Some(42), "matching generation must run the job");
+        let skipped = rt.block_on(storage.call_current(generation.clone(), 4, |_d| 99));
+        assert_eq!(
+            skipped, None,
+            "a stale generation must skip the job entirely"
+        );
+    }
+
+    #[test]
+    fn actor_long_job_does_not_block_the_executor() {
+        let storage = Storage::new(Db::open_memory().unwrap());
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let ticks = Arc::new(AtomicU64::new(0));
+            let ticker_ticks = ticks.clone();
+            let ticker = tokio::spawn(async move {
+                for _ in 0..40 {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    ticker_ticks.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            storage
+                .call(|_d| std::thread::sleep(Duration::from_millis(60)))
+                .await;
+            assert!(
+                ticks.load(Ordering::SeqCst) >= 3,
+                "the single executor thread must keep advancing other tasks while a DB \
+                 job runs on the actor thread"
+            );
+            ticker.await.unwrap();
+        });
     }
 }

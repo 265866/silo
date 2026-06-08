@@ -46,7 +46,7 @@ fn applied(outcome: IntentTransitionOutcome) -> usize {
 pub async fn reconcile_boot(
     db: &Storage,
     rpc: &Rpc,
-    generation: &std::sync::atomic::AtomicU64,
+    generation: &std::sync::Arc<std::sync::atomic::AtomicU64>,
     cmd_gen: u64,
 ) -> Result<usize> {
     use std::sync::atomic::Ordering;
@@ -54,14 +54,17 @@ pub async fn reconcile_boot(
         return Ok(0);
     }
 
-    let open = match db.with_current(generation, cmd_gen, |d| -> Result<_> {
-        let open = d.get_open_intents()?;
-        d.audit(
-            AuditEvent::ReconcileStarted,
-            &json!({"open_count": open.len()}),
-        )?;
-        Ok(open)
-    }) {
+    let open = match db
+        .call_current(generation.clone(), cmd_gen, |d| -> Result<_> {
+            let open = d.get_open_intents()?;
+            d.audit(
+                AuditEvent::ReconcileStarted,
+                &json!({"open_count": open.len()}),
+            )?;
+            Ok(open)
+        })
+        .await
+    {
         Some(r) => r?,
         None => return Ok(0),
     };
@@ -71,7 +74,7 @@ pub async fn reconcile_boot(
 
     macro_rules! guarded {
         ($f:expr) => {
-            match db.with_current(generation, cmd_gen, $f) {
+            match db.call_current(generation.clone(), cmd_gen, $f).await {
                 Some(r) => r,
                 None => return Ok(resolved),
             }
@@ -80,7 +83,14 @@ pub async fn reconcile_boot(
 
     macro_rules! terminal {
         ($id:expr, $status:expr, $error:expr $(,)?) => {{
-            resolved += applied(guarded!(|d| d.mark_terminal($id, $status, $error))?);
+            let __id = $id;
+            let __status = $status;
+            let __error: Option<String> = $error.map(|s: &str| s.to_string());
+            resolved += applied(guarded!(move |d| d.mark_terminal(
+                __id,
+                __status,
+                __error.as_deref()
+            ))?);
         }};
     }
 
@@ -125,7 +135,7 @@ pub async fn reconcile_boot(
             }
             Decision::WaitFinality => {}
             Decision::Fail(reason) => {
-                terminal!(intent.id, IntentStatus::Failed, Some(&reason));
+                terminal!(intent.id, IntentStatus::Failed, Some(reason.as_str()));
             }
             Decision::Expire => {
                 let recheck = match rpc.get_signature_statuses(&[sig.as_str()], true).await {
@@ -165,13 +175,15 @@ pub async fn reconcile_boot(
                 };
                 match rpc.send_transaction(&bytes).await {
                     Ok(returned) if returned != sig => {
-                        let outcome = guarded!(|d| -> Result<_> {
+                        let intent_id = intent.id;
+                        let sig_for_audit = sig.clone();
+                        let outcome = guarded!(move |d| -> Result<_> {
                             d.audit(
                                 AuditEvent::IntegrityCheckFailed,
-                                &json!({"intent": intent.id, "expected_sig": sig, "got": returned}),
+                                &json!({"intent": intent_id, "expected_sig": sig_for_audit, "got": returned}),
                             )?;
                             Ok(d.mark_terminal(
-                                intent.id,
+                                intent_id,
                                 IntentStatus::Failed,
                                 Some("rpc returned mismatched signature"),
                             )?)
@@ -180,7 +192,8 @@ pub async fn reconcile_boot(
                     }
                     Ok(_) => {
                         if intent.status == IntentStatus::Signed {
-                            resolved += applied(guarded!(|d| d.mark_submitted(intent.id))?);
+                            let intent_id = intent.id;
+                            resolved += applied(guarded!(move |d| d.mark_submitted(intent_id))?);
                         }
                     }
                     Err(_) => {}
@@ -189,12 +202,15 @@ pub async fn reconcile_boot(
         }
     }
 
-    if let Some(r) = db.with_current(generation, cmd_gen, |d| {
-        d.audit(
-            AuditEvent::ReconcileResolved,
-            &json!({"resolved": resolved, "deferred": deferred}),
-        )
-    }) {
+    if let Some(r) = db
+        .call_current(generation.clone(), cmd_gen, move |d| {
+            d.audit(
+                AuditEvent::ReconcileResolved,
+                &json!({"resolved": resolved, "deferred": deferred}),
+            )
+        })
+        .await
+    {
         r?;
     }
     Ok(resolved)
@@ -316,7 +332,7 @@ mod tests {
 
     fn db_with_intent() -> (Storage, i64) {
         let db = Storage::new(Db::open_memory().unwrap());
-        let id = db.with_mut(|d| {
+        let id = db.call_blocking(|d| {
             let w = d
                 .insert_wallet(
                     0,
@@ -339,7 +355,7 @@ mod tests {
 
     fn db_with_two_intents() -> (Storage, i64, i64) {
         let db = Storage::new(Db::open_memory().unwrap());
-        let (id1, id2) = db.with_mut(|d| {
+        let (id1, id2) = db.call_blocking(|d| {
             let m = d
                 .insert_wallet(
                     0,
@@ -384,20 +400,21 @@ mod tests {
     }
 
     fn signed(db: &Storage, id: i64, sig: &str, lvbh: u64) {
-        db.with_mut(|d| d.mark_signed(id, sig, "bh", lvbh, 5000, b"wire").unwrap());
+        let sig = sig.to_string();
+        db.call_blocking(move |d| d.mark_signed(id, &sig, "bh", lvbh, 5000, b"wire").unwrap());
     }
 
     async fn run(db: &Storage, rpc: &Rpc) -> usize {
-        let generation = AtomicU64::new(1);
+        let generation = Arc::new(AtomicU64::new(1));
         reconcile_boot(db, rpc, &generation, 1).await.unwrap()
     }
 
     fn intent(db: &Storage, id: i64) -> crate::types::Intent {
-        db.with(|d| d.get_intent(id).unwrap().unwrap())
+        db.call_blocking(move |d| d.get_intent(id).unwrap().unwrap())
     }
 
     fn audit_events(db: &Storage) -> Vec<String> {
-        db.with(|d| {
+        db.call_blocking(|d| {
             assert!(d.verify_audit_chain().unwrap());
             d.list_audit(50)
                 .unwrap()
@@ -417,10 +434,10 @@ mod tests {
         let (db, id) = db_with_intent();
         signed(&db, id, "Sig", 100);
         let rpc = Rpc::new(reqwest::Client::new(), "http://127.0.0.1:0");
-        let generation = AtomicU64::new(7);
+        let generation = Arc::new(AtomicU64::new(7));
         let resolved = reconcile_boot(&db, &rpc, &generation, 6).await.unwrap();
         assert_eq!(resolved, 0);
-        assert_eq!(db.with(|d| d.get_open_intents().unwrap().len()), 1);
+        assert_eq!(db.call_blocking(|d| d.get_open_intents().unwrap().len()), 1);
     }
 
     #[tokio::test]
@@ -438,7 +455,7 @@ mod tests {
     async fn signed_intent_missing_wire_bytes_fails_after_status_probe() {
         let (db, id) = db_with_intent();
         signed(&db, id, "Sig", 1000);
-        db.with_mut(|d| d.clear_signed_tx_for_test(id).unwrap());
+        db.call_blocking(move |d| d.clear_signed_tx_for_test(id).unwrap());
         let server = MockServer::new(vec![
             json!({"context":{"slot":1},"value":[null]}),
             json!(1000),
@@ -477,7 +494,7 @@ mod tests {
     async fn submitted_confirmed_waits_for_finality() {
         let (db, id) = db_with_intent();
         signed(&db, id, "Sig", 1000);
-        db.with_mut(|d| d.mark_submitted(id).unwrap());
+        db.call_blocking(move |d| d.mark_submitted(id).unwrap());
         let server = MockServer::new(vec![
             json!({"context":{"slot":1},"value":[status_value(Value::Null, "confirmed")]}),
             json!(1000),
@@ -490,7 +507,7 @@ mod tests {
     async fn submitted_finalized_marks_confirmed() {
         let (db, id) = db_with_intent();
         signed(&db, id, "Sig", 1000);
-        db.with_mut(|d| d.mark_submitted(id).unwrap());
+        db.call_blocking(move |d| d.mark_submitted(id).unwrap());
         let server = MockServer::new(vec![
             json!({"context":{"slot":1},"value":[status_value(Value::Null, "finalized")]}),
             json!(1000),

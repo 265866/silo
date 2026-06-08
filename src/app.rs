@@ -148,6 +148,11 @@ pub enum Command {
         config_dir: std::path::PathBuf,
         id: String,
     },
+    LoadWallets,
+    LoadDetail {
+        wallet_id: i64,
+    },
+    LoadAudit,
 }
 
 impl Command {
@@ -189,6 +194,14 @@ impl std::fmt::Debug for ProfileOpenedPayload {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct OptimisticTransfer {
+    pub from_wallet: i64,
+    pub to_address: String,
+    pub lamports: u64,
+    pub fee_lamports: Option<u64>,
+}
+
 #[derive(Debug)]
 pub enum AppEvent {
     ReconcileComplete {
@@ -228,6 +241,20 @@ pub enum AppEvent {
     TransferResult {
         intent_id: i64,
         outcome: TransferOutcome,
+        transfer: Option<OptimisticTransfer>,
+        generation: u64,
+    },
+    WalletsLoaded {
+        wallets: Vec<WalletRow>,
+        generation: u64,
+    },
+    DetailLoaded {
+        intents: Vec<Intent>,
+        wallets: Vec<WalletRow>,
+        generation: u64,
+    },
+    AuditLoaded {
+        audit: Vec<crate::types::AuditEntry>,
         generation: u64,
     },
     SendPersisted {
@@ -312,6 +339,9 @@ impl AppEvent {
             | AppEvent::RentExempt { generation, .. }
             | AppEvent::SendPrepared { generation, .. }
             | AppEvent::TransferResult { generation, .. }
+            | AppEvent::WalletsLoaded { generation, .. }
+            | AppEvent::DetailLoaded { generation, .. }
+            | AppEvent::AuditLoaded { generation, .. }
             | AppEvent::SendPersisted { generation, .. }
             | AppEvent::UnlockComplete { generation, .. }
             | AppEvent::SetupComplete { generation, .. }
@@ -802,7 +832,7 @@ impl App {
     }
 
     fn load_profile_scoped_state(&mut self) -> anyhow::Result<()> {
-        let url = self.db.with(|d| -> anyhow::Result<_> {
+        let url = self.db.call_blocking(|d| -> anyhow::Result<_> {
             Ok(d.get_meta("rpc_url")?.unwrap_or_else(|| {
                 crate::types::Network::MainnetBeta
                     .default_rpc_url()
@@ -813,24 +843,24 @@ impl App {
         self.rpc_url = url;
         self.currency = self
             .db
-            .with(|d| d.get_meta("currency"))?
+            .call_blocking(|d| d.get_meta("currency"))?
             .and_then(|s| crate::types::Currency::from_code(&s))
             .unwrap_or(crate::types::Currency::Usd);
         self.priority_micro = self
             .db
-            .with(|d| d.get_meta("priority_fee_micro"))?
+            .call_blocking(|d| d.get_meta("priority_fee_micro"))?
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(crate::money::DEFAULT_PRIORITY_FEE_MICRO);
         self.auto_lock_after = self
             .db
-            .with(|d| d.get_meta("auto_lock_minutes"))?
+            .call_blocking(|d| d.get_meta("auto_lock_minutes"))?
             .and_then(|s| s.parse::<u64>().ok())
             .map(|m| m.clamp(AUTO_LOCK_MIN_MINUTES, AUTO_LOCK_MAX_MINUTES))
             .map(|m| Duration::from_secs(m * 60))
             .unwrap_or_else(|| Duration::from_secs(DEFAULT_AUTO_LOCK_MINUTES * 60));
         self.price.clear();
         self.reset_price_baseline();
-        if let Some(s) = self.db.with(|d| d.get_meta("last_price"))? {
+        if let Some(s) = self.db.call_blocking(|d| d.get_meta("last_price"))? {
             match crate::price::SolPrice::from_meta_json(&s) {
                 Ok(p) if p.currency == self.currency && !p.is_stale() => self.price.seed(p),
                 Ok(_) => {}
@@ -1004,7 +1034,7 @@ impl App {
         self.anim_balance.clear();
         self.hot_until = None;
         self.route = Route::Unlock;
-        self.db.with_mut(|d| {
+        self.db.call_blocking(|d| {
             let _ = d.audit(crate::types::AuditEvent::Locked, &serde_json::json!({}));
             d.lock_audit_key();
         });
@@ -1300,7 +1330,7 @@ impl App {
     }
 
     pub fn try_reload_wallets(&mut self) -> anyhow::Result<()> {
-        let rows = self.db.with(|d| d.list_wallets())?;
+        let rows = self.db.call_blocking(|d| d.list_wallets())?;
         self.apply_reloaded_wallets(rows);
         Ok(())
     }
@@ -1460,7 +1490,7 @@ impl App {
                 self.on_send_prepared();
             }
             AppEvent::TransferResult {
-                intent_id, outcome, ..
+                outcome, transfer, ..
             } => {
                 match &outcome {
                     TransferOutcome::Submitted { signature } => {
@@ -1472,7 +1502,9 @@ impl App {
                     TransferOutcome::Confirmed { .. } => {
                         self.toast_ok("Transfer confirmed ✓");
                         self.celebrate_center();
-                        self.apply_optimistic_transfer(intent_id);
+                        if let Some(t) = &transfer {
+                            self.apply_optimistic_transfer(t);
+                        }
                         self.request_balance_refresh();
                     }
                     TransferOutcome::Failed { reason } => {
@@ -1772,6 +1804,18 @@ impl App {
                 }
                 Err(e) => self.toast_err(format!("Could not save transfer note: {e}")),
             },
+            AppEvent::WalletsLoaded { wallets, .. } => {
+                self.apply_reloaded_wallets(wallets);
+            }
+            AppEvent::DetailLoaded {
+                intents, wallets, ..
+            } => {
+                self.detail_intents = intents;
+                self.apply_reloaded_wallets(wallets);
+            }
+            AppEvent::AuditLoaded { audit, .. } => {
+                self.audit = audit;
+            }
             AppEvent::ProfileRenamed { result, .. } => match result {
                 Ok(profiles) => {
                     self.profiles = profiles;
@@ -1875,29 +1919,47 @@ impl App {
         Ok(())
     }
 
-    fn apply_optimistic_transfer(&mut self, intent_id: i64) {
-        let intent = self.db.with(|d| d.get_intent(intent_id).ok().flatten());
-        let Some(i) = intent else {
-            return;
-        };
-        let spent = i
+    fn apply_optimistic_transfer(&mut self, t: &OptimisticTransfer) {
+        let spent = t
             .lamports
-            .saturating_add(i.fee_lamports.unwrap_or_else(|| self.send_fee()));
-        if let Some(w) = self.wallets.iter_mut().find(|w| w.id == i.from_wallet)
+            .saturating_add(t.fee_lamports.unwrap_or_else(|| self.send_fee()));
+        if let Some(w) = self.wallets.iter_mut().find(|w| w.id == t.from_wallet)
             && let Some(bal) = w.balance_lamports
         {
             w.balance_lamports = Some(bal.saturating_sub(spent));
         }
-        if let Some(w) = self.wallets.iter_mut().find(|w| w.pubkey == i.to_address)
+        if let Some(w) = self.wallets.iter_mut().find(|w| w.pubkey == t.to_address)
             && let Some(bal) = w.balance_lamports
         {
-            w.balance_lamports = Some(bal.saturating_add(i.lamports));
+            w.balance_lamports = Some(bal.saturating_add(t.lamports));
         }
     }
 
     pub fn refresh_detail_intents(&mut self) {
+        self.history_state.select(None);
         match self.focused_wallet {
-            Some(id) => match self.db.with(|d| d.list_intents_for_wallet(id, 50)) {
+            Some(id) => {
+                self.send_cmd(Command::LoadDetail { wallet_id: id });
+            }
+            None => {
+                self.detail_intents.clear();
+                self.send_cmd(Command::LoadWallets);
+            }
+        }
+    }
+
+    pub fn refresh_audit(&mut self) {
+        self.audit_state.select(None);
+        self.send_cmd(Command::LoadAudit);
+    }
+
+    #[cfg(test)]
+    pub fn refresh_detail_intents_blocking(&mut self) {
+        match self.focused_wallet {
+            Some(id) => match self
+                .db
+                .call_blocking(move |d| d.list_intents_for_wallet(id, 50))
+            {
                 Ok(v) => self.detail_intents = v,
                 Err(e) => {
                     self.detail_intents.clear();
@@ -1910,8 +1972,9 @@ impl App {
         self.reload_wallets();
     }
 
-    pub fn refresh_audit(&mut self) {
-        match self.db.with(|d| d.list_audit(200)) {
+    #[cfg(test)]
+    pub fn refresh_audit_blocking(&mut self) {
+        match self.db.call_blocking(|d| d.list_audit(200)) {
             Ok(v) => self.audit = v,
             Err(e) => {
                 self.audit.clear();
@@ -1934,8 +1997,9 @@ mod tests {
             &crate::crypto::parse_mnemonic(TEST_MNEMONIC).unwrap(),
         );
         let pubkey = crate::crypto::derive_address(&seed, 0);
+        let pk = pubkey.clone();
         let wallet = storage
-            .with_mut(|d| d.insert_wallet(0, crate::types::Role::Master, &pubkey, None))
+            .call_blocking(move |d| d.insert_wallet(0, crate::types::Role::Master, &pk, None))
             .unwrap();
         let (tx, _rx) = mpsc::channel::<(u64, Command)>(8);
         let config_dir =
@@ -1979,7 +2043,7 @@ mod tests {
         let rent_before = app.rent_exempt_min;
         let profile_before = app.current_profile.clone();
         let rpc_url_before = app.rpc_url.clone();
-        let db_wallets_before = app.db.with(|d| d.list_wallets().unwrap().len());
+        let db_wallets_before = app.db.call_blocking(|d| d.list_wallets().unwrap().len());
 
         let stale = 1;
         let events = vec![
@@ -2023,6 +2087,20 @@ mod tests {
             AppEvent::TransferResult {
                 intent_id: 1,
                 outcome: TransferOutcome::Failed { reason: "x".into() },
+                transfer: None,
+                generation: stale,
+            },
+            AppEvent::WalletsLoaded {
+                wallets: vec![],
+                generation: stale,
+            },
+            AppEvent::DetailLoaded {
+                intents: vec![],
+                wallets: vec![],
+                generation: stale,
+            },
+            AppEvent::AuditLoaded {
+                audit: vec![],
                 generation: stale,
             },
             AppEvent::SendPersisted {
@@ -2105,7 +2183,7 @@ mod tests {
         ];
         assert_eq!(
             events.len(),
-            24,
+            27,
             "the parametrized test must cover every AppEvent variant"
         );
 
@@ -2127,7 +2205,7 @@ mod tests {
         assert_eq!(app.current_profile, profile_before);
         assert_eq!(app.rpc_url, rpc_url_before);
         assert_eq!(
-            app.db.with(|d| d.list_wallets().unwrap().len()),
+            app.db.call_blocking(|d| d.list_wallets().unwrap().len()),
             db_wallets_before
         );
         assert!(!app.reconcile_done, "stale event flipped reconcile_done");
@@ -2135,6 +2213,36 @@ mod tests {
         assert!(
             app.toasts.is_empty(),
             "stale events must not surface any toast"
+        );
+    }
+
+    #[test]
+    fn ui_hot_reads_are_routed_through_load_commands() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let body = |sig: &str| -> String {
+            let after = src.split(sig).nth(1).expect("hot-read method not found");
+            let end = after.find("\n    }\n").expect("method end not found");
+            after[..end].to_string()
+        };
+
+        let detail = body("pub fn refresh_detail_intents(&mut self)");
+        assert!(
+            detail.contains("Command::LoadDetail") && detail.contains("Command::LoadWallets"),
+            "refresh_detail_intents must enqueue Load commands, not read the DB on the UI thread"
+        );
+        assert!(
+            !detail.contains("call_blocking"),
+            "refresh_detail_intents must never block the UI thread on the DB actor"
+        );
+
+        let audit = body("pub fn refresh_audit(&mut self)");
+        assert!(
+            audit.contains("Command::LoadAudit"),
+            "refresh_audit must enqueue a Load command, not read the DB on the UI thread"
+        );
+        assert!(
+            !audit.contains("call_blocking"),
+            "refresh_audit must never block the UI thread on the DB actor"
         );
     }
 
