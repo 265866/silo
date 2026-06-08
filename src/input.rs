@@ -224,7 +224,8 @@ fn start_create(app: &mut App) {
     match crypto::generate_mnemonic(crypto::WordCount::Twelve) {
         Ok(m) => {
             app.setup.creating = true;
-            app.setup.mnemonic_words = m.to_string().split_whitespace().map(String::from).collect();
+            let phrase = Zeroizing::new(m.to_string());
+            app.setup.mnemonic_words = phrase.split_whitespace().map(String::from).collect();
             app.setup.stage = SetupStage::ShowMnemonic;
         }
         Err(e) => app.toast_err(format!("could not generate phrase: {e}")),
