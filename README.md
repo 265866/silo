@@ -146,7 +146,7 @@ Download a build for your platform from the [latest release](https://github.com/
 
 ### From source
 
-Requires a Rust toolchain (edition 2024, **MSRV 1.89**).
+Requires a Rust toolchain (edition 2024, **MSRV 1.96**).
 
 ```sh
 cargo install --locked --git https://github.com/265866/silo
