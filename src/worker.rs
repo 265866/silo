@@ -1499,6 +1499,9 @@ async fn poll_confirmation(
                             .await;
                             return;
                         }
+                        if s2.is_confirmed() {
+                            continue;
+                        }
                     }
                     finalize(
                         &db,
@@ -1536,17 +1539,49 @@ async fn poll_confirmation(
     }
 
     if current() {
-        finalize(
-            &db,
-            &evt,
-            intent_id,
-            &sig,
-            IntentStatus::Expired,
-            Some("confirmation timed out before the network confirmed or rejected it"),
-            &generation,
-            cmd_gen,
-        )
-        .await;
+        let rpc = { rpc_arc.lock_recover().clone() };
+        match sig_status(&rpc, &sig).await {
+            Some(s) if s.is_error() => {
+                finalize(
+                    &db,
+                    &evt,
+                    intent_id,
+                    &sig,
+                    IntentStatus::Failed,
+                    Some("on-chain error"),
+                    &generation,
+                    cmd_gen,
+                )
+                .await;
+            }
+            Some(s) if s.is_finalized() => {
+                finalize(
+                    &db,
+                    &evt,
+                    intent_id,
+                    &sig,
+                    IntentStatus::Confirmed,
+                    None,
+                    &generation,
+                    cmd_gen,
+                )
+                .await;
+            }
+            Some(s) if s.is_confirmed() => {}
+            _ => {
+                finalize(
+                    &db,
+                    &evt,
+                    intent_id,
+                    &sig,
+                    IntentStatus::Expired,
+                    Some("confirmation timed out before the network confirmed or rejected it"),
+                    &generation,
+                    cmd_gen,
+                )
+                .await;
+            }
+        }
     }
 }
 
@@ -1773,16 +1808,13 @@ mod tests {
     }
 
     impl RawMockServer {
-        fn new(bodies: Vec<String>) -> Self {
-            use std::collections::VecDeque;
+        fn serve(
+            listener: std::net::TcpListener,
+            requests: Arc<Mutex<Vec<serde_json::Value>>>,
+            mut responder: impl FnMut(&str) -> String + Send + 'static,
+        ) -> std::thread::JoinHandle<()> {
             use std::io::{Read, Write};
-            use std::net::TcpListener;
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            let requests = Arc::new(Mutex::new(Vec::new()));
-            let requests_t = requests.clone();
-            let mut responses = VecDeque::from(bodies);
-            let worker = std::thread::spawn(move || {
+            std::thread::spawn(move || {
                 for stream in listener.incoming() {
                     let Ok(mut stream) = stream else { break };
                     let mut buf = Vec::new();
@@ -1811,10 +1843,15 @@ mod tests {
                     }
                     let req = String::from_utf8_lossy(&buf);
                     let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
-                        requests_t.lock().unwrap().push(v);
-                    }
-                    let resp_body = responses.pop_front().unwrap_or_else(|| "{}".to_string());
+                    let method = match serde_json::from_str::<serde_json::Value>(body) {
+                        Ok(v) => {
+                            let m = v["method"].as_str().unwrap_or("").to_string();
+                            requests.lock().unwrap().push(v);
+                            m
+                        }
+                        Err(_) => String::new(),
+                    };
+                    let resp_body = responder(&method);
                     let head = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         resp_body.len()
@@ -1822,6 +1859,39 @@ mod tests {
                     let _ = stream.write_all(head.as_bytes());
                     let _ = stream.write_all(resp_body.as_bytes());
                 }
+            })
+        }
+
+        fn new(bodies: Vec<String>) -> Self {
+            use std::collections::VecDeque;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let mut responses = VecDeque::from(bodies);
+            let worker = Self::serve(listener, requests.clone(), move |_method| {
+                responses.pop_front().unwrap_or_else(|| "{}".to_string())
+            });
+            RawMockServer {
+                url,
+                requests,
+                _worker: worker,
+            }
+        }
+
+        fn routed(routes: Vec<(&'static str, String)>) -> Self {
+            use std::collections::HashMap;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let table: HashMap<String, String> = routes
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect();
+            let worker = Self::serve(listener, requests.clone(), move |method| {
+                table
+                    .get(method)
+                    .cloned()
+                    .unwrap_or_else(|| "{}".to_string())
             });
             RawMockServer {
                 url,
@@ -2426,6 +2496,72 @@ mod tests {
         assert!(
             !db.call_blocking(move |d| d.has_open_intent(sub_id).unwrap()),
             "a bounded-out transfer must release the source wallet's open-intent guard"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn broadcast_confirmation_poll_keeps_confirmed_unfinalized_transfer_open() {
+        let (db, sub_id) = storage_with_wallets();
+        let to = crate::crypto::derive_address(&test_seed(), 0);
+        let intent = db
+            .call_blocking(move |d| d.create_intent(sub_id, &to, 1_000, None))
+            .unwrap();
+        let sig = "Sig1111111111111111111111111111111111111111111";
+        db.call_blocking(move |d| {
+            d.mark_signed(intent.id, sig, "bh", 1000, 5000, b"wire")
+                .unwrap()
+        });
+
+        let server = RawMockServer::routed(vec![
+            (
+                "sendTransaction",
+                json!({"jsonrpc":"2.0","id":1,"result": sig}).to_string(),
+            ),
+            (
+                "getSignatureStatuses",
+                json!({"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":[
+                    {"slot":1,"confirmations":null,"err":null,"confirmationStatus":"confirmed"}
+                ]}})
+                .to_string(),
+            ),
+        ]);
+        let rpc = Arc::new(Mutex::new(Rpc::new(
+            reqwest::Client::new(),
+            server.url.clone(),
+        )));
+        let (evt_tx, mut evt_rx) = mpsc::channel(64);
+        let generation = Arc::new(AtomicU64::new(0));
+
+        broadcast_and_poll(intent.id, db.clone(), rpc, evt_tx, generation, 0).await;
+
+        let mut outcomes = Vec::new();
+        while let Ok(ev) = evt_rx.try_recv() {
+            if let AppEvent::TransferResult { outcome, .. } = ev {
+                outcomes.push(outcome);
+            }
+        }
+        assert!(
+            !outcomes
+                .iter()
+                .any(|o| matches!(o, TransferOutcome::Expired)),
+            "a confirmed transfer must never be reported Expired (safe to retry), got {outcomes:?}"
+        );
+        assert!(
+            !outcomes
+                .iter()
+                .any(|o| matches!(o, TransferOutcome::Confirmed { .. })),
+            "a transfer that only reached confirmed must not be reported Confirmed, got {outcomes:?}"
+        );
+
+        let got = db.call_blocking(move |d| d.get_intent(intent.id).unwrap().unwrap());
+        assert_eq!(
+            got.status,
+            IntentStatus::Submitted,
+            "a confirmed-but-unfinalized transfer must stay submitted for reconcile to finalize"
+        );
+        assert!(
+            db.call_blocking(move |d| d.has_open_intent(sub_id).unwrap()),
+            "the source wallet's open-intent guard must stay held so the user cannot double-send"
         );
     }
 
