@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/265866/silo/compare/v0.1.5...v0.1.6) - 2026-06-08
+
+### Fixed
+
+- *(release)* pin Rust toolchain to 1.96.0 for cargo-dist builds ([#184](https://github.com/265866/silo/pull/184))
+
 ## [0.1.5](https://github.com/265866/silo/compare/v0.1.4...v0.1.5) - 2026-06-08
 
 ### Other
