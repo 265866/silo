@@ -2218,7 +2218,7 @@ mod tests {
 
     #[test]
     fn ui_hot_reads_are_routed_through_load_commands() {
-        let src = include_str!("app.rs");
+        let src = include_str!("app.rs").replace('\r', "");
         let body = |sig: &str| -> String {
             let after = src.split(sig).nth(1).expect("hot-read method not found");
             let end = after.find("\n    }\n").expect("method end not found");

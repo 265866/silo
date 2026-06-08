@@ -1821,9 +1821,6 @@ mod tests {
                     );
                     let _ = stream.write_all(head.as_bytes());
                     let _ = stream.write_all(resp_body.as_bytes());
-                    if responses.is_empty() {
-                        break;
-                    }
                 }
             });
             RawMockServer {
