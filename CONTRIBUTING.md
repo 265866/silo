@@ -5,7 +5,7 @@ correctness and safety come first — small, well-tested changes are the most we
 
 ## Development setup
 
-You'll need a Rust toolchain (edition 2024, **MSRV 1.89**).
+You'll need a Rust toolchain (edition 2024, **MSRV 1.96**).
 
 ```sh
 git clone https://github.com/265866/silo
