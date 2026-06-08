@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/265866/silo/compare/v0.1.4...v0.1.5) - 2026-06-08
+
+### Other
+
+- gitignore the whole .claude/ directory ([#183](https://github.com/265866/silo/pull/183))
+- untrack the local scheduled-tasks lock ([#182](https://github.com/265866/silo/pull/182))
+- *(deps)* bump rusqlite 0.40, sha2 0.11, hmac 0.13, ratatui 0.30.1 ([#180](https://github.com/265866/silo/pull/180))
+
 ## [0.1.4](https://github.com/265866/silo/compare/v0.1.3...v0.1.4) - 2026-06-08
 
 ### Added
