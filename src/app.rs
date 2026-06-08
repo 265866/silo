@@ -484,7 +484,8 @@ pub struct PendingSend {
     pub prepared_at: Instant,
 }
 
-#[derive(Default)]
+const SECRET_INPUT_CAPACITY: usize = 256;
+
 pub struct InputState {
     pub passphrase: Zeroizing<String>,
     pub passphrase2: Zeroizing<String>,
@@ -494,6 +495,21 @@ pub struct InputState {
     pub prompt_text: String,
     pub focus: usize,
     pub send_in_fiat: bool,
+}
+
+impl Default for InputState {
+    fn default() -> Self {
+        InputState {
+            passphrase: Zeroizing::new(String::with_capacity(SECRET_INPUT_CAPACITY)),
+            passphrase2: Zeroizing::new(String::with_capacity(SECRET_INPUT_CAPACITY)),
+            import_phrase: Zeroizing::new(String::with_capacity(SECRET_INPUT_CAPACITY)),
+            send_to: String::new(),
+            send_amount: String::new(),
+            prompt_text: String::new(),
+            focus: 0,
+            send_in_fiat: false,
+        }
+    }
 }
 
 impl InputState {
