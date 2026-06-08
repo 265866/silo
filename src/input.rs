@@ -1129,7 +1129,7 @@ mod tests {
         let seed_value = crypto::seed_from_mnemonic(&mnemonic);
         let from_pubkey = crypto::derive_address(&seed_value, 0);
         let wallet = storage
-            .with_mut(|d| d.insert_wallet(0, Role::Master, &from_pubkey, None))
+            .call_blocking(move |d| d.insert_wallet(0, Role::Master, &from_pubkey, None))
             .unwrap();
         let (tx, rx) = mpsc::channel::<(u64, Command)>(8);
         let config_dir = std::env::temp_dir().join(format!("silo-test-{}", std::process::id()));
@@ -1176,7 +1176,7 @@ mod tests {
     fn intents(app: &App) -> Vec<crate::types::Intent> {
         let wallet_id = app.wallets[0].id;
         app.db
-            .with(|d| d.list_intents_for_wallet(wallet_id, 10))
+            .call_blocking(move |d| d.list_intents_for_wallet(wallet_id, 10))
             .unwrap()
     }
 
@@ -1395,13 +1395,16 @@ mod tests {
     #[tokio::test]
     async fn derive_subwallet_queues_command_without_inline_insert() {
         let mut h = harness(true);
-        let before = h.app.db.with(|d| d.list_wallets()).unwrap().len();
+        let before = h.app.db.call_blocking(|d| d.list_wallets()).unwrap().len();
         derive_subwallet(&mut h.app);
         assert!(matches!(
             h.rx.try_recv().unwrap().1,
             Command::DeriveSubwallet { .. }
         ));
-        assert_eq!(h.app.db.with(|d| d.list_wallets()).unwrap().len(), before);
+        assert_eq!(
+            h.app.db.call_blocking(|d| d.list_wallets()).unwrap().len(),
+            before
+        );
     }
 
     #[tokio::test]
@@ -1438,12 +1441,15 @@ mod tests {
     #[tokio::test]
     async fn switch_to_profile_enqueues_open_without_inline_db_swap() {
         let mut h = harness(true);
-        let before = h.app.db.with(|d| d.list_wallets()).unwrap().len();
+        let before = h.app.db.call_blocking(|d| d.list_wallets()).unwrap().len();
         h.app.switch_to_profile("00000000000000a1").unwrap();
         let (g, cmd) = h.rx.try_recv().unwrap();
         assert_eq!(g, 1);
         assert!(matches!(cmd, Command::OpenProfile { id, .. } if id == "00000000000000a1"));
-        assert_eq!(h.app.db.with(|d| d.list_wallets()).unwrap().len(), before);
+        assert_eq!(
+            h.app.db.call_blocking(|d| d.list_wallets()).unwrap().len(),
+            before
+        );
         assert!(h.app.blocking_input);
     }
 
@@ -1485,7 +1491,10 @@ mod tests {
             generation: 1,
         });
         assert_eq!(h.app.current_profile.as_deref(), Some("00000000000000ab"));
-        assert_eq!(h.app.db.with(|d| d.list_wallets()).unwrap().len(), 2);
+        assert_eq!(
+            h.app.db.call_blocking(|d| d.list_wallets()).unwrap().len(),
+            2
+        );
         assert_eq!(h.app.wallets.len(), 2);
         assert!(!h.app.blocking_input);
         assert_eq!(h.app.route, Route::Setup);
@@ -1518,7 +1527,7 @@ mod tests {
         h.app.generation.store(2, Ordering::SeqCst);
         h.app.blocking_input = true;
         let before_profile = h.app.current_profile.clone();
-        let before_wallets = h.app.db.with(|d| d.list_wallets()).unwrap().len();
+        let before_wallets = h.app.db.call_blocking(|d| d.list_wallets()).unwrap().len();
         let payload = ProfileOpenedPayload {
             db: fresh_db(2),
             id: "00000000000000ef".to_string(),
@@ -1530,7 +1539,7 @@ mod tests {
         });
         assert_eq!(h.app.current_profile, before_profile);
         assert_eq!(
-            h.app.db.with(|d| d.list_wallets()).unwrap().len(),
+            h.app.db.call_blocking(|d| d.list_wallets()).unwrap().len(),
             before_wallets
         );
         assert!(h.app.blocking_input);
@@ -1706,7 +1715,7 @@ mod tests {
         let sub = h
             .app
             .db
-            .with_mut(|d| d.insert_wallet(1, Role::Sub, &sub_address(), None))
+            .call_blocking(|d| d.insert_wallet(1, Role::Sub, &sub_address(), None))
             .unwrap();
         h.app.wallets.push(sub.clone());
         h.app.route = Route::WalletList;
@@ -1724,7 +1733,7 @@ mod tests {
         assert!(
             !h.app
                 .db
-                .with(|d| d.list_wallets())
+                .call_blocking(|d| d.list_wallets())
                 .unwrap()
                 .iter()
                 .find(|w| w.id == sub.id)
@@ -1744,7 +1753,10 @@ mod tests {
             other => panic!("unexpected command: {other:?}"),
         }
         assert_eq!(
-            h.app.db.with(|d| d.get_meta("auto_lock_minutes")).unwrap(),
+            h.app
+                .db
+                .call_blocking(|d| d.get_meta("auto_lock_minutes"))
+                .unwrap(),
             None
         );
     }
@@ -1794,7 +1806,7 @@ mod tests {
         assert_eq!(
             h.app
                 .db
-                .with(|d| d.list_wallets())
+                .call_blocking(|d| d.list_wallets())
                 .unwrap()
                 .iter()
                 .find(|w| w.id == id)

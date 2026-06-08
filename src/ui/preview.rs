@@ -6,7 +6,9 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use tokio::sync::mpsc;
 
-use crate::app::{App, AppEvent, Command, Modal, PendingSend, PromptKind, Route, SetupStage};
+use crate::app::{
+    App, AppEvent, Command, Modal, OptimisticTransfer, PendingSend, PromptKind, Route, SetupStage,
+};
 use crate::db::{Db, Storage};
 use crate::price::{PriceCache, PriceSource, SolPrice};
 use crate::profiles::ProfileMeta;
@@ -102,7 +104,7 @@ fn test_app() -> App {
         .find(|w| w.account_index == 2)
         .map(|w| w.id);
     if let Some(id) = trading_id {
-        app.db.with_mut(|d| {
+        app.db.call_blocking(move |d| {
             let _ = d.set_note(
                 id,
                 Some(
@@ -155,7 +157,7 @@ fn preview_all_screens() {
     print!("{}", render(&mut app));
 
     app.focused_wallet = Some(app.wallets[2].id);
-    app.refresh_detail_intents();
+    app.refresh_detail_intents_blocking();
     app.route = Route::WalletDetail;
     banner("WALLET DETAIL (Trading) — multi-line note");
     print!("{}", render(&mut app));
@@ -163,7 +165,7 @@ fn preview_all_screens() {
     {
         let from = app.wallets[2].id;
         let to = app.wallets[0].pubkey.clone();
-        app.db.with_mut(|d| {
+        app.db.call_blocking(move |d| {
             let i = d.create_intent(from, &to, 1_500_000_000, None).unwrap();
             d.mark_signed(
                 i.id,
@@ -178,7 +180,7 @@ fn preview_all_screens() {
                 .unwrap();
         });
     }
-    app.refresh_detail_intents();
+    app.refresh_detail_intents_blocking();
     app.route = Route::History;
     app.history_state.select(Some(0));
     banner("HISTORY — TX column (c copies the selected transaction id)");
@@ -257,7 +259,7 @@ fn preview_all_screens() {
     print!("{}", render(&mut app));
 
     app.route = Route::AuditLog;
-    app.refresh_audit();
+    app.refresh_audit_blocking();
     banner("AUDIT LOG");
     print!("{}", render(&mut app));
 
@@ -320,15 +322,24 @@ fn optimistic_balance_bump_on_confirm() {
     let to_before = app.wallets[1].balance_lamports.unwrap();
 
     let amount = 5_000_000_000u64;
-    let intent_id = app
-        .db
-        .with_mut(|d| d.create_intent(from_id, &to_addr, amount, None).unwrap().id);
+    let to_for_intent = to_addr.clone();
+    let intent_id = app.db.call_blocking(move |d| {
+        d.create_intent(from_id, &to_for_intent, amount, None)
+            .unwrap()
+            .id
+    });
 
     app.apply_app_event(AppEvent::TransferResult {
         intent_id,
         outcome: TransferOutcome::Confirmed {
             signature: "Sig11111111111111111111111111111111111111111".into(),
         },
+        transfer: Some(OptimisticTransfer {
+            from_wallet: from_id,
+            to_address: to_addr,
+            lamports: amount,
+            fee_lamports: None,
+        }),
         generation: app.generation.load(std::sync::atomic::Ordering::SeqCst),
     });
 

@@ -6,8 +6,9 @@ use serde_json::json;
 use tokio::sync::{Semaphore, mpsc, watch};
 
 use crate::app::{
-    AppEvent, ClipboardCopyResult, Command, PasteTarget, ProfileDeleteResult, ProfileOpenedPayload,
-    SendPersistResult, SettingChange, SetupResult, UnlockResult, WalletTextField,
+    AppEvent, ClipboardCopyResult, Command, OptimisticTransfer, PasteTarget, ProfileDeleteResult,
+    ProfileOpenedPayload, SendPersistResult, SettingChange, SetupResult, UnlockResult,
+    WalletTextField,
 };
 use crate::db::{IntentTransitionOutcome, Storage};
 use crate::price::{
@@ -26,14 +27,17 @@ const CONFIRM_POLL_ATTEMPTS: usize = 45;
 const CONFIRM_MAX_ROUNDS: usize = 3;
 const REBROADCAST_INTERVAL: Duration = Duration::from_secs(12);
 
-fn persist_last_price(db: &Storage, p: &SolPrice) {
-    db.with(|d| {
-        let _ = d.set_meta("last_price", &p.to_meta_json());
-    });
+async fn persist_last_price(db: &Storage, p: &SolPrice) {
+    let json = p.to_meta_json();
+    db.call(move |d| {
+        let _ = d.set_meta("last_price", &json);
+    })
+    .await;
 }
 
-fn current_currency(db: &Storage) -> crate::types::Currency {
-    db.with(|d| d.get_meta("currency").ok().flatten())
+async fn current_currency(db: &Storage) -> crate::types::Currency {
+    db.call(|d| d.get_meta("currency").ok().flatten())
+        .await
         .and_then(|s| crate::types::Currency::from_code(&s))
         .unwrap_or(crate::types::Currency::Usd)
 }
@@ -108,7 +112,7 @@ pub fn spawn_workers(
                     }
 
                     let event_generation = generation.load(Ordering::SeqCst);
-                    let currency = current_currency(&db);
+                    let currency = current_currency(&db).await;
                     let skip_cg = cg_backoff_until.is_some_and(|u| Instant::now() < u);
                     let (result, rate_limited) =
                         fetch_price_backoff_aware(&client, currency, skip_cg).await;
@@ -123,7 +127,7 @@ pub fn spawn_workers(
                     }
                     if let Ok(p) = result {
                         price.set(p);
-                        persist_last_price(&db, &p);
+                        persist_last_price(&db, &p).await;
                         let _ = evt
                             .send(AppEvent::Price {
                                 price: p,
@@ -263,7 +267,9 @@ fn wallet_consistency(
     db: &Storage,
     seed: &crate::crypto::Seed,
 ) -> Result<Vec<crate::types::WalletRow>, String> {
-    let wallets = db.with(|d| d.list_wallets()).map_err(|e| e.to_string())?;
+    let wallets = db
+        .call_blocking(|d| d.list_wallets())
+        .map_err(|e| e.to_string())?;
     if wallets
         .iter()
         .all(|w| crate::crypto::derive_address(seed, w.account_index) == w.pubkey)
@@ -284,7 +290,7 @@ fn unlock_vault_blocking(
     let (mnemonic, vault_key) = match unlocked {
         Ok(v) => v,
         Err(_) => {
-            db.with_mut(|d| {
+            db.call_blocking(|d| {
                 let _ = d.audit(AuditEvent::VaultUnlockFailed, &serde_json::json!({}));
             });
             return UnlockResult::WrongPassphrase;
@@ -292,24 +298,23 @@ fn unlock_vault_blocking(
     };
     let seed = crate::crypto::seed_from_mnemonic(&mnemonic);
     drop(mnemonic);
-    let key_ok = db.with_mut(|d| d.unlock_audit_key(vault_key.as_bytes()).is_ok());
-    drop(vault_key);
+    let key_ok = db.call_blocking(move |d| d.unlock_audit_key(vault_key.as_bytes()).is_ok());
     if !key_ok {
         return UnlockResult::AuditKey;
     }
     let wallets = match wallet_consistency(&db, &seed) {
         Ok(wallets) => wallets,
         Err(e) if e == "wallet mismatch" => {
-            db.with_mut(|d| {
+            db.call_blocking(|d| {
                 let _ = d.audit(AuditEvent::IntegrityCheckFailed, &serde_json::json!({}));
             });
             return UnlockResult::WalletMismatch;
         }
         Err(e) => return UnlockResult::WalletRead(e),
     };
-    match db.with(|d| d.verify_audit_chain()) {
+    match db.call_blocking(|d| d.verify_audit_chain()) {
         Ok(true) => {
-            db.with_mut(|d| {
+            db.call_blocking(|d| {
                 let _ = d.audit(AuditEvent::VaultUnlocked, &serde_json::json!({}));
             });
             UnlockResult::Unlocked { seed, wallets }
@@ -337,7 +342,7 @@ fn finish_setup_blocking(
     match wallet_consistency(&db, &seed) {
         Ok(_) => {}
         Err(e) if e == "wallet mismatch" => {
-            db.with_mut(|d| {
+            db.call_blocking(|d| {
                 let _ = d.audit(AuditEvent::IntegrityCheckFailed, &serde_json::json!({}));
             });
             return SetupResult::Failed(
@@ -373,7 +378,7 @@ fn finish_setup_blocking(
 
     let master_ok = {
         let master_addr = crate::crypto::derive_address(&seed, 0);
-        db.with_mut(|d| {
+        db.call_blocking(move |d| {
             let key_ok = d.unlock_audit_key(vault_key.as_bytes()).is_ok();
             let _ = d.audit(AuditEvent::VaultCreated, &serde_json::json!({}));
             key_ok
@@ -386,7 +391,6 @@ fn finish_setup_blocking(
                 }
         })
     };
-    drop(vault_key);
     if !master_ok {
         return SetupResult::Failed(
             "Could not initialize the master wallet — please retry".to_string(),
@@ -411,7 +415,7 @@ fn finish_setup_blocking(
         }
     }
 
-    let wallets = match db.with(|d| d.list_wallets()) {
+    let wallets = match db.call_blocking(|d| d.list_wallets()) {
         Ok(wallets) => wallets,
         Err(e) => return SetupResult::Failed(format!("Could not load wallets: {e}")),
     };
@@ -434,7 +438,10 @@ fn persist_signed_send_blocking(
     wire: Vec<u8>,
     sig_b58: String,
 ) -> SendPersistResult {
-    let created = db.with_mut(|d| d.create_intent(from.id, &pending.to, pending.lamports, None));
+    let from_id = from.id;
+    let to = pending.to.clone();
+    let lamports = pending.lamports;
+    let created = db.call_blocking(move |d| d.create_intent(from_id, &to, lamports, None));
     let intent = match created {
         Ok(intent) => intent,
         Err(crate::db::CreateIntentError::WalletHasOpenIntent) => {
@@ -444,16 +451,12 @@ fn persist_signed_send_blocking(
         }
         Err(e) => return SendPersistResult::Failed(format!("Could not record transfer: {e}")),
     };
-    let signed = db.with_mut(|d| {
-        d.mark_signed(
-            intent.id,
-            &sig_b58,
-            &pending.blockhash,
-            pending.lvbh,
-            pending.fee,
-            &wire,
-        )
-    });
+    let intent_id = intent.id;
+    let blockhash = pending.blockhash.clone();
+    let lvbh = pending.lvbh;
+    let fee = pending.fee;
+    let signed =
+        db.call_blocking(move |d| d.mark_signed(intent_id, &sig_b58, &blockhash, lvbh, fee, &wire));
     match signed {
         Ok(IntentTransitionOutcome::Applied) => SendPersistResult::Signed {
             intent_id: intent.id,
@@ -465,9 +468,9 @@ fn persist_signed_send_blocking(
             SendPersistResult::Failed(format!("Transfer was already {}", status.as_str()))
         }
         Err(e) => {
-            let cleaned = db.with_mut(|d| {
+            let cleaned = db.call_blocking(move |d| {
                 d.mark_terminal(
-                    intent.id,
+                    intent_id,
                     IntentStatus::Failed,
                     Some("could not persist signed transfer"),
                 )
@@ -678,16 +681,12 @@ async fn handle_command(
         }
 
         Command::ArchiveWallet { id, want } => {
-            let db = db.clone();
-            let generation = generation.clone();
-            let outcome = tokio::task::spawn_blocking(move || {
-                db.with_current(&generation, cmd_gen, |d| -> anyhow::Result<_> {
+            let outcome = db
+                .call_current(generation.clone(), cmd_gen, move |d| -> anyhow::Result<_> {
                     d.set_archived(id, want)?;
                     d.list_wallets()
                 })
-            })
-            .await
-            .unwrap_or_else(|e| Some(Err(anyhow::anyhow!("archive task failed: {e}"))));
+                .await;
             if let Some(res) = outcome {
                 let _ = evt
                     .send(AppEvent::WalletArchived {
@@ -701,18 +700,14 @@ async fn handle_command(
         }
 
         Command::DeriveSubwallet { seed } => {
-            let db = db.clone();
-            let generation = generation.clone();
-            let outcome = tokio::task::spawn_blocking(move || {
-                db.with_current(&generation, cmd_gen, |d| -> anyhow::Result<_> {
+            let outcome = db
+                .call_current(generation.clone(), cmd_gen, move |d| -> anyhow::Result<_> {
                     let idx = d.next_account_index().unwrap_or(1).max(1);
                     let addr = crate::crypto::derive_address(&seed, idx);
                     d.insert_wallet(idx, crate::types::Role::Sub, &addr, None)?;
                     Ok((idx, d.list_wallets()?))
                 })
-            })
-            .await
-            .unwrap_or_else(|e| Some(Err(anyhow::anyhow!("derive task failed: {e}"))));
+                .await;
             if let Some(res) = outcome {
                 let _ = evt
                     .send(AppEvent::SubwalletDerived {
@@ -724,8 +719,6 @@ async fn handle_command(
         }
 
         Command::PersistSetting { change } => {
-            let db = db.clone();
-            let generation = generation.clone();
             let (key, value, details) = match change {
                 SettingChange::Currency(c) => (
                     "currency",
@@ -743,13 +736,11 @@ async fn handle_command(
                     json!({ "auto_lock_minutes": m }),
                 ),
             };
-            let outcome = tokio::task::spawn_blocking(move || {
-                db.with_current(&generation, cmd_gen, |d| {
+            let outcome = db
+                .call_current(generation.clone(), cmd_gen, move |d| {
                     d.set_meta_audited(key, &value, AuditEvent::SettingsChanged, &details)
                 })
-            })
-            .await
-            .unwrap_or_else(|e| Some(Err(anyhow::anyhow!("setting task failed: {e}"))));
+                .await;
             if let Some(res) = outcome {
                 let _ = evt
                     .send(AppEvent::SettingPersisted {
@@ -762,19 +753,15 @@ async fn handle_command(
         }
 
         Command::SetWalletText { id, field, value } => {
-            let db = db.clone();
-            let generation = generation.clone();
-            let outcome = tokio::task::spawn_blocking(move || {
-                db.with_current(&generation, cmd_gen, |d| -> anyhow::Result<_> {
+            let outcome = db
+                .call_current(generation.clone(), cmd_gen, move |d| -> anyhow::Result<_> {
                     match field {
                         WalletTextField::Label => d.set_label(id, value.as_deref())?,
                         WalletTextField::Note => d.set_note(id, value.as_deref())?,
                     }
                     d.list_wallets()
                 })
-            })
-            .await
-            .unwrap_or_else(|e| Some(Err(anyhow::anyhow!("wallet text task failed: {e}"))));
+                .await;
             if let Some(res) = outcome {
                 let _ = evt
                     .send(AppEvent::WalletTextSet {
@@ -791,16 +778,12 @@ async fn handle_command(
             id,
             value,
         } => {
-            let db = db.clone();
-            let generation = generation.clone();
-            let outcome = tokio::task::spawn_blocking(move || {
-                db.with_current(&generation, cmd_gen, |d| -> anyhow::Result<_> {
+            let outcome = db
+                .call_current(generation.clone(), cmd_gen, move |d| -> anyhow::Result<_> {
                     d.set_intent_note(id, value.as_deref())?;
                     d.list_intents_for_wallet(wallet_id, 50)
                 })
-            })
-            .await
-            .unwrap_or_else(|e| Some(Err(anyhow::anyhow!("intent note task failed: {e}"))));
+                .await;
             if let Some(res) = outcome {
                 let _ = evt
                     .send(AppEvent::IntentNoteSet {
@@ -851,9 +834,11 @@ async fn handle_command(
 
         Command::FetchRentExempt => match rpc_now.get_min_balance_for_rent_exemption(0).await {
             Ok(v) => {
-                let _ = db.with_current(&generation, cmd_gen, |d| {
-                    let _ = d.set_meta("rent_exempt_min_0", &v.to_string());
-                });
+                let _ = db
+                    .call_current(generation.clone(), cmd_gen, move |d| {
+                        let _ = d.set_meta("rent_exempt_min_0", &v.to_string());
+                    })
+                    .await;
                 let _ = evt
                     .send(AppEvent::RentExempt {
                         lamports: v,
@@ -867,14 +852,14 @@ async fn handle_command(
         },
 
         Command::FetchPrice => {
-            let currency = current_currency(&db);
+            let currency = current_currency(&db).await;
             match fetch_price(&client, currency).await {
                 Ok(p) => {
                     if generation.load(Ordering::SeqCst) != cmd_gen {
                         return;
                     }
                     price.set(p);
-                    persist_last_price(&db, &p);
+                    persist_last_price(&db, &p).await;
                     let _ = evt
                         .send(AppEvent::Price {
                             price: p,
@@ -889,7 +874,7 @@ async fn handle_command(
         }
 
         Command::RefreshBalances { include_archived } => {
-            let wallets: Vec<(i64, String)> = match db.with(|d| d.list_wallets()) {
+            let wallets: Vec<(i64, String)> = match db.call(|d| d.list_wallets()).await {
                 Ok(ws) => ws
                     .into_iter()
                     .filter(|w| include_archived || !w.archived)
@@ -999,14 +984,17 @@ async fn handle_command(
                 }
             };
             let redacted = crate::solana::rpc::redact_rpc_url(&url);
-            let wrote = db.with_current(&generation, cmd_gen, |d| {
-                d.set_meta_audited(
-                    "rpc_url",
-                    &url,
-                    AuditEvent::RpcChanged,
-                    &json!({ "url": redacted }),
-                )
-            });
+            let url_for_db = url.clone();
+            let wrote = db
+                .call_current(generation.clone(), cmd_gen, move |d| {
+                    d.set_meta_audited(
+                        "rpc_url",
+                        &url_for_db,
+                        AuditEvent::RpcChanged,
+                        &json!({ "url": redacted }),
+                    )
+                })
+                .await;
             match wrote {
                 Some(Ok(())) => {}
                 Some(Err(e)) => {
@@ -1044,6 +1032,59 @@ async fn handle_command(
                 }
             }
         }
+
+        Command::LoadWallets => match db.call(|d| d.list_wallets()).await {
+            Ok(wallets) => {
+                let _ = evt
+                    .send(AppEvent::WalletsLoaded {
+                        wallets,
+                        generation: cmd_gen,
+                    })
+                    .await;
+            }
+            Err(e) => send_error(&evt, cmd_gen, format!("could not load wallets: {e}")).await,
+        },
+
+        Command::LoadDetail { wallet_id } => {
+            let loaded = db
+                .call(move |d| {
+                    let intents = d.list_intents_for_wallet(wallet_id, 50)?;
+                    let wallets = d.list_wallets()?;
+                    Ok::<_, anyhow::Error>((intents, wallets))
+                })
+                .await;
+            match loaded {
+                Ok((intents, wallets)) => {
+                    let _ = evt
+                        .send(AppEvent::DetailLoaded {
+                            intents,
+                            wallets,
+                            generation: cmd_gen,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    send_error(
+                        &evt,
+                        cmd_gen,
+                        format!("could not load transfer history: {e}"),
+                    )
+                    .await
+                }
+            }
+        }
+
+        Command::LoadAudit => match db.call(|d| d.list_audit(200)).await {
+            Ok(audit) => {
+                let _ = evt
+                    .send(AppEvent::AuditLoaded {
+                        audit,
+                        generation: cmd_gen,
+                    })
+                    .await;
+            }
+            Err(e) => send_error(&evt, cmd_gen, format!("could not load audit log: {e}")).await,
+        },
     }
 }
 
@@ -1055,12 +1096,16 @@ async fn finalize(
     sig: &str,
     status: IntentStatus,
     error: Option<&str>,
-    generation: &AtomicU64,
+    generation: &Arc<AtomicU64>,
     cmd_gen: u64,
 ) {
-    let Some(outcome) = db.with_current(generation, cmd_gen, |d| {
-        d.mark_terminal(intent_id, status, error)
-    }) else {
+    let error_owned = error.map(|s| s.to_string());
+    let Some(outcome) = db
+        .call_current(generation.clone(), cmd_gen, move |d| {
+            d.mark_terminal(intent_id, status, error_owned.as_deref())
+        })
+        .await
+    else {
         return;
     };
     let final_status = match outcome {
@@ -1077,28 +1122,54 @@ async fn finalize(
             .await;
             status
         }
-        Ok(_) => match db.with_current(generation, cmd_gen, |d| {
-            d.get_intent(intent_id).ok().flatten().map(|i| i.status)
-        }) {
+        Ok(_) => match db
+            .call_current(generation.clone(), cmd_gen, move |d| {
+                d.get_intent(intent_id).ok().flatten().map(|i| i.status)
+            })
+            .await
+        {
             Some(Some(s)) => s,
             Some(None) => status,
             None => return,
         },
     };
-    let outcome = match final_status {
-        IntentStatus::Confirmed => TransferOutcome::Confirmed {
-            signature: sig.to_string(),
-        },
-        IntentStatus::Failed => TransferOutcome::Failed {
-            reason: error.unwrap_or("failed").to_string(),
-        },
-        IntentStatus::Expired => TransferOutcome::Expired,
+    let (outcome, transfer) = match final_status {
+        IntentStatus::Confirmed => {
+            let transfer = db
+                .call_current(generation.clone(), cmd_gen, move |d| {
+                    d.get_intent(intent_id)
+                        .ok()
+                        .flatten()
+                        .map(|i| OptimisticTransfer {
+                            from_wallet: i.from_wallet,
+                            to_address: i.to_address,
+                            lamports: i.lamports,
+                            fee_lamports: i.fee_lamports,
+                        })
+                })
+                .await
+                .flatten();
+            (
+                TransferOutcome::Confirmed {
+                    signature: sig.to_string(),
+                },
+                transfer,
+            )
+        }
+        IntentStatus::Failed => (
+            TransferOutcome::Failed {
+                reason: error.unwrap_or("failed").to_string(),
+            },
+            None,
+        ),
+        IntentStatus::Expired => (TransferOutcome::Expired, None),
         _ => return,
     };
     let _ = evt
         .send(AppEvent::TransferResult {
             intent_id,
             outcome,
+            transfer,
             generation: cmd_gen,
         })
         .await;
@@ -1186,9 +1257,12 @@ async fn broadcast_submit(
     generation: &Arc<AtomicU64>,
     cmd_gen: u64,
 ) -> Option<PollContext> {
-    let intent = match db.with_current(generation, cmd_gen, |d| {
-        d.get_intent(intent_id).ok().flatten()
-    }) {
+    let intent = match db
+        .call_current(generation.clone(), cmd_gen, move |d| {
+            d.get_intent(intent_id).ok().flatten()
+        })
+        .await
+    {
         None => return None,
         Some(intent) => intent,
     };
@@ -1202,7 +1276,12 @@ async fn broadcast_submit(
     };
     let lvbh = intent.last_valid_block_height.unwrap_or(0);
 
-    match db.with_current(generation, cmd_gen, |d| d.mark_submitted(intent_id)) {
+    match db
+        .call_current(generation.clone(), cmd_gen, move |d| {
+            d.mark_submitted(intent_id)
+        })
+        .await
+    {
         Some(Ok(IntentTransitionOutcome::Applied)) => {}
         Some(Ok(IntentTransitionOutcome::WrongState(_) | IntentTransitionOutcome::NotFound)) => {
             send_error(
@@ -1229,12 +1308,15 @@ async fn broadcast_submit(
     let rpc = { rpc_arc.lock_recover().clone() };
     match rpc.send_transaction(&bytes).await {
         Ok(returned) if returned != sig => {
-            let _ = db.with_current(generation, cmd_gen, |d| {
-                let _ = d.audit(
-                    AuditEvent::IntegrityCheckFailed,
-                    &json!({"intent": intent_id, "expected": sig, "got": returned}),
-                );
-            });
+            let sig_for_audit = sig.clone();
+            let _ = db
+                .call_current(generation.clone(), cmd_gen, move |d| {
+                    let _ = d.audit(
+                        AuditEvent::IntegrityCheckFailed,
+                        &json!({"intent": intent_id, "expected": sig_for_audit, "got": returned}),
+                    );
+                })
+                .await;
             finalize(
                 db,
                 evt,
@@ -1256,6 +1338,7 @@ async fn broadcast_submit(
                     outcome: TransferOutcome::Submitted {
                         signature: sig.clone(),
                     },
+                    transfer: None,
                     generation: cmd_gen,
                 })
                 .await;
@@ -1362,12 +1445,15 @@ async fn poll_confirmation(
                     if let Err(returned) =
                         rebroadcast_if_due(&rpc, &bytes, &sig, lvbh, &mut last_rebroadcast).await
                     {
-                        let _ = db.with_current(&generation, cmd_gen, |d| {
-                            let _ = d.audit(
-                                AuditEvent::IntegrityCheckFailed,
-                                &json!({"intent": intent_id, "expected": sig, "got": returned}),
-                            );
-                        });
+                        let sig_for_audit = sig.clone();
+                        let _ = db
+                            .call_current(generation.clone(), cmd_gen, move |d| {
+                                let _ = d.audit(
+                                    AuditEvent::IntegrityCheckFailed,
+                                    &json!({"intent": intent_id, "expected": sig_for_audit, "got": returned}),
+                                );
+                            })
+                            .await;
                         finalize(
                             &db,
                             &evt,
@@ -1441,6 +1527,7 @@ async fn poll_confirmation(
                     outcome: TransferOutcome::StillPending {
                         signature: sig.clone(),
                     },
+                    transfer: None,
                     generation: cmd_gen,
                 })
                 .await;
@@ -1655,9 +1742,9 @@ mod tests {
             "a wedged wallet (both writes failed) must tell the user to restart to reconcile, got: {msg}"
         );
 
-        let blocked = storage.with_mut(|d| {
-            d.create_intent(sub_id, &crate::crypto::derive_address(&s, 2), 1_000, None)
-        });
+        let blocked_to = crate::crypto::derive_address(&s, 2);
+        let blocked =
+            storage.call_blocking(move |d| d.create_intent(sub_id, &blocked_to, 1_000, None));
         assert!(
             matches!(
                 blocked,
@@ -1767,7 +1854,7 @@ mod tests {
             std::env::temp_dir().join(format!("silo-open-test-{}-{id}", std::process::id()));
         let dir = crate::profiles::dir_for(&config_dir, &id).unwrap();
         crate::profiles::ensure_private_dir(&dir).unwrap();
-        let shared_before = db.with(|d| d.list_wallets().unwrap().len());
+        let shared_before = db.call_blocking(|d| d.list_wallets().unwrap().len());
 
         handle_command(
             1,
@@ -1794,7 +1881,10 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
-        assert_eq!(db.with(|d| d.list_wallets().unwrap().len()), shared_before);
+        assert_eq!(
+            db.call_blocking(|d| d.list_wallets().unwrap().len()),
+            shared_before
+        );
         let _ = std::fs::remove_dir_all(&config_dir);
     }
 
@@ -1808,7 +1898,7 @@ mod tests {
         let config_dir =
             std::env::temp_dir().join(format!("silo-create-test-{}-{id}", std::process::id()));
         let dir = crate::profiles::dir_for(&config_dir, &id).unwrap();
-        let shared_before = db.with(|d| d.list_wallets().unwrap().len());
+        let shared_before = db.call_blocking(|d| d.list_wallets().unwrap().len());
 
         handle_command(
             2,
@@ -1836,7 +1926,10 @@ mod tests {
             other => panic!("unexpected event: {other:?}"),
         }
         assert!(dir.join("silo.db").exists());
-        assert_eq!(db.with(|d| d.list_wallets().unwrap().len()), shared_before);
+        assert_eq!(
+            db.call_blocking(|d| d.list_wallets().unwrap().len()),
+            shared_before
+        );
         let _ = std::fs::remove_dir_all(&config_dir);
     }
 
@@ -1872,7 +1965,7 @@ mod tests {
             other => panic!("unexpected event: {other:?}"),
         }
         assert!(
-            db.with(|d| d.list_wallets())
+            db.call_blocking(|d| d.list_wallets())
                 .unwrap()
                 .iter()
                 .find(|w| w.id == sub_id)
@@ -1903,7 +1996,7 @@ mod tests {
         .await;
         assert!(evt_rx.try_recv().is_err(), "stale command must not emit");
         assert!(
-            !db.with(|d| d.list_wallets())
+            !db.call_blocking(|d| d.list_wallets())
                 .unwrap()
                 .iter()
                 .find(|w| w.id == sub_id)
@@ -1916,7 +2009,7 @@ mod tests {
     #[tokio::test]
     async fn derive_subwallet_command_inserts_next_index() {
         let (db, _sub_id) = storage_with_wallets();
-        let before = db.with(|d| d.list_wallets()).unwrap().len();
+        let before = db.call_blocking(|d| d.list_wallets()).unwrap().len();
         let (rpc, price, client) = worker_deps();
         let (evt_tx, mut evt_rx) = mpsc::channel(8);
         let generation = Arc::new(AtomicU64::new(0));
@@ -1973,7 +2066,8 @@ mod tests {
             other => panic!("unexpected event: {other:?}"),
         }
         assert_eq!(
-            db.with(|d| d.get_meta("auto_lock_minutes")).unwrap(),
+            db.call_blocking(|d| d.get_meta("auto_lock_minutes"))
+                .unwrap(),
             Some("9".to_string())
         );
     }
@@ -2022,7 +2116,7 @@ mod tests {
         let (db, sub_id) = storage_with_wallets();
         let to = crate::crypto::derive_address(&test_seed(), 0);
         let intent = db
-            .with_mut(|d| d.create_intent(sub_id, &to, 1_000, None))
+            .call_blocking(move |d| d.create_intent(sub_id, &to, 1_000, None))
             .unwrap();
         let (rpc, price, client) = worker_deps();
         let (evt_tx, mut evt_rx) = mpsc::channel(8);
@@ -2064,9 +2158,9 @@ mod tests {
         let (db, sub_id) = storage_with_wallets();
         let to = crate::crypto::derive_address(&test_seed(), 0);
         let intent = db
-            .with_mut(|d| d.create_intent(sub_id, &to, 1_000, None))
+            .call_blocking(move |d| d.create_intent(sub_id, &to, 1_000, None))
             .unwrap();
-        db.with_mut(|d| d.lock_audit_key());
+        db.call_blocking(|d| d.lock_audit_key());
         let (evt_tx, mut evt_rx) = mpsc::channel(8);
         let generation = Arc::new(AtomicU64::new(0));
 
@@ -2166,14 +2260,14 @@ mod tests {
         let (db, sub_id) = storage_with_wallets();
         let to = crate::crypto::derive_address(&test_seed(), 0);
         let intent = db
-            .with_mut(|d| d.create_intent(sub_id, &to, 1_000, None))
+            .call_blocking(move |d| d.create_intent(sub_id, &to, 1_000, None))
             .unwrap();
         let sig = "Sig1111111111111111111111111111111111111111111";
-        db.with_mut(|d| {
+        db.call_blocking(move |d| {
             d.mark_signed(intent.id, sig, "bh", 1000, 5000, b"wire")
                 .unwrap()
         });
-        assert!(db.with(|d| d.has_open_intent(sub_id).unwrap()));
+        assert!(db.call_blocking(move |d| d.has_open_intent(sub_id).unwrap()));
 
         let server = RawMockServer::new(vec![
             json!({"jsonrpc":"2.0","id":1,"error":{"code":-32002,"message":"Transaction simulation failed: insufficient funds"}})
@@ -2202,10 +2296,10 @@ mod tests {
         assert!(reason.contains("transfer rejected by network"), "{reason}");
         assert!(reason.contains("insufficient funds"), "{reason}");
 
-        let got = db.with(|d| d.get_intent(intent.id).unwrap().unwrap());
+        let got = db.call_blocking(move |d| d.get_intent(intent.id).unwrap().unwrap());
         assert_eq!(got.status, IntentStatus::Failed);
         assert!(
-            !db.with(|d| d.has_open_intent(sub_id).unwrap()),
+            !db.call_blocking(move |d| d.has_open_intent(sub_id).unwrap()),
             "the source wallet's open-intent guard must be released"
         );
         assert_eq!(
@@ -2220,10 +2314,10 @@ mod tests {
         let (db, sub_id) = storage_with_wallets();
         let to = crate::crypto::derive_address(&test_seed(), 0);
         let intent = db
-            .with_mut(|d| d.create_intent(sub_id, &to, 1_000, None))
+            .call_blocking(move |d| d.create_intent(sub_id, &to, 1_000, None))
             .unwrap();
         let sig = "Sig1111111111111111111111111111111111111111111";
-        db.with_mut(|d| {
+        db.call_blocking(move |d| {
             d.mark_signed(intent.id, sig, "bh", 1000, 5000, b"wire")
                 .unwrap()
         });
@@ -2288,14 +2382,14 @@ mod tests {
         let (db, sub_id) = storage_with_wallets();
         let to = crate::crypto::derive_address(&test_seed(), 0);
         let intent = db
-            .with_mut(|d| d.create_intent(sub_id, &to, 1_000, None))
+            .call_blocking(move |d| d.create_intent(sub_id, &to, 1_000, None))
             .unwrap();
         let sig = "Sig1111111111111111111111111111111111111111111";
-        db.with_mut(|d| {
+        db.call_blocking(move |d| {
             d.mark_signed(intent.id, sig, "bh", 1000, 5000, b"wire")
                 .unwrap()
         });
-        assert!(db.with(|d| d.has_open_intent(sub_id).unwrap()));
+        assert!(db.call_blocking(move |d| d.has_open_intent(sub_id).unwrap()));
 
         let server = RawMockServer::new(vec![
             json!({"jsonrpc":"2.0","id":1,"result": sig}).to_string(),
@@ -2330,10 +2424,10 @@ mod tests {
             "the poll must finalize Expired once the round bound is hit, got {outcomes:?}"
         );
 
-        let got = db.with(|d| d.get_intent(intent.id).unwrap().unwrap());
+        let got = db.call_blocking(move |d| d.get_intent(intent.id).unwrap().unwrap());
         assert_eq!(got.status, IntentStatus::Expired);
         assert!(
-            !db.with(|d| d.has_open_intent(sub_id).unwrap()),
+            !db.call_blocking(move |d| d.has_open_intent(sub_id).unwrap()),
             "a bounded-out transfer must release the source wallet's open-intent guard"
         );
     }
