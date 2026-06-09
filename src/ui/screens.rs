@@ -354,6 +354,19 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme;
     let price = app.price_now();
 
+    if app.wallets.is_empty() {
+        let p = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  No wallets yet — press n to add a subwallet",
+                Style::default().fg(theme.text_muted),
+            )),
+        ])
+        .block(panel("Wallets", true, &theme));
+        f.render_widget(p, area);
+        return;
+    }
+
     let show_addr = area.width >= 62;
     let show_usd = area.width >= 76;
 
@@ -383,7 +396,7 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
                     Cell::from(Line::from(vec![
                         Span::raw("  "),
                         Span::styled(
-                            format!("{caret} Archived ({archived_count})"),
+                            format!("{caret} archived ({archived_count})"),
                             Style::default()
                                 .fg(theme.text_muted)
                                 .add_modifier(Modifier::BOLD),
@@ -486,7 +499,7 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .filter(|w| w.role == Role::Sub && !w.archived)
         .count();
-    let title = format!("Wallets ({master_count} master · {sub_count} sub)");
+    let title = format!("Wallets ({master_count} master · {sub_count} subwallet)");
 
     let mut widths = vec![Constraint::Length(4), Constraint::Min(18)];
     if show_addr {
@@ -518,11 +531,7 @@ pub(super) fn wallet_detail(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let price = app.price_now();
 
-    let role = if w.role == Role::Master {
-        "master"
-    } else {
-        "subwallet"
-    };
+    let is_master = w.role == Role::Master;
     let bal = app.shown_balance(w);
     const BASE_HEADER: u16 = 9;
     const MAX_NOTE_LINES: usize = 6;
@@ -584,17 +593,31 @@ pub(super) fn wallet_detail(f: &mut Frame, app: &mut App, area: Rect) {
                 Style::default().fg(theme.usd),
             ),
         ]),
-        Line::from(vec![
-            Span::styled(
+        {
+            let mut spans = vec![Span::styled(
                 format!("  {:<w$}", "type", w = LABEL_TEXT_W),
                 Style::default().fg(theme.text_muted),
-            ),
-            Span::styled(role, Style::default().fg(theme.text)),
-            Span::styled(
-                format!("   index {}", w.account_index),
-                Style::default().fg(theme.text_muted),
-            ),
-        ]),
+            )];
+            if is_master {
+                spans.push(Span::styled(
+                    "★ master",
+                    Style::default()
+                        .fg(theme.master)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(
+                    "  funds subwallets · cannot be archived",
+                    Style::default().fg(theme.text_muted),
+                ));
+            } else {
+                spans.push(Span::styled("subwallet", Style::default().fg(theme.text)));
+                spans.push(Span::styled(
+                    format!("   index {}", w.account_index),
+                    Style::default().fg(theme.text_muted),
+                ));
+            }
+            Line::from(spans)
+        },
     ];
     for (idx, line) in display.into_iter().enumerate() {
         let label = if idx == 0 {
