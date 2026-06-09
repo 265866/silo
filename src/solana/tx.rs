@@ -129,6 +129,7 @@ pub fn assemble_tx(message: &[u8], sig_bytes: &[u8; 64]) -> Vec<u8> {
     tx
 }
 
+#[allow(dead_code)]
 pub fn sign_and_serialize(message: &[u8], sk: &SigningKey) -> (Vec<u8>, [u8; 64]) {
     let sig_bytes = sk.sign(message).to_bytes();
     let tx = assemble_tx(message, &sig_bytes);

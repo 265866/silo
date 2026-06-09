@@ -1,5 +1,6 @@
 use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+#[allow(dead_code)]
 pub trait MutexExt<T> {
     fn lock_recover(&self) -> MutexGuard<'_, T>;
 }

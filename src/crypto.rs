@@ -7,21 +7,6 @@ use zeroize::{Zeroize, Zeroizing};
 const PURPOSE: u32 = 44;
 const SOLANA_COIN_TYPE: u32 = 501;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WordCount {
-    Twelve,
-    TwentyFour,
-}
-
-impl WordCount {
-    fn words(self) -> usize {
-        match self {
-            WordCount::Twelve => 12,
-            WordCount::TwentyFour => 24,
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct Seed(Zeroizing<[u8; 64]>);
 
@@ -42,8 +27,8 @@ impl std::fmt::Debug for Seed {
     }
 }
 
-pub fn generate_mnemonic(word_count: WordCount) -> Result<Mnemonic> {
-    Mnemonic::generate(word_count.words()).context("failed to generate mnemonic")
+pub fn generate_mnemonic() -> Result<Mnemonic> {
+    Mnemonic::generate(12).context("failed to generate mnemonic")
 }
 
 pub fn parse_mnemonic(phrase: &str) -> Result<Mnemonic> {
@@ -157,13 +142,10 @@ mod tests {
 
     #[test]
     fn generate_and_parse_roundtrip() {
-        let m = generate_mnemonic(WordCount::Twelve).unwrap();
+        let m = generate_mnemonic().unwrap();
         assert_eq!(m.to_string().split_whitespace().count(), 12);
         let reparsed = parse_mnemonic(&m.to_string()).unwrap();
         assert_eq!(m.to_string(), reparsed.to_string());
-
-        let m24 = generate_mnemonic(WordCount::TwentyFour).unwrap();
-        assert_eq!(m24.to_string().split_whitespace().count(), 24);
     }
 
     #[test]
