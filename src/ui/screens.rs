@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Cell, Paragraph, Row, Table};
 
 use super::{LABEL_TEXT_W, LABEL_W, format, panel};
 use crate::app::{App, SetupStage};
@@ -276,10 +276,9 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(theme.text_muted)
             };
             let inner_w = super::SETUP_WIDTH.saturating_sub(2) as usize;
-            let phrase_lines = format::wrap_lines(app.input.import_phrase.as_str(), inner_w)
-                .len()
-                .max(1);
-            let lines = vec![
+            let phrase_lines =
+                import_phrase_lines(app.input.import_phrase.as_str(), inner_w, theme);
+            let mut lines = vec![
                 Line::from(""),
                 Line::from(Span::styled(
                     "  Type or paste your 12/24-word recovery phrase, then Enter.",
@@ -290,26 +289,16 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(theme.text_muted),
                 )),
                 Line::from(""),
-                Line::from(vec![
-                    Span::styled("  ", Style::default()),
-                    Span::styled(
-                        app.input.import_phrase.as_str().to_string(),
-                        Style::default().fg(theme.text),
-                    ),
-                    Span::styled("▏", Style::default().fg(theme.accent)),
-                ]),
-                Line::from(""),
-                Line::from(Span::styled(
-                    format!("  words: {count}/{target}"),
-                    counter_style,
-                )),
             ];
-            let height = lines.len() as u16 + phrase_lines.saturating_sub(1) as u16 + 2;
+            lines.extend(phrase_lines);
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("  words: {count}/{target}"),
+                counter_style,
+            )));
+            let height = lines.len() as u16 + 2;
             let rect = super::setup_panel(area, height);
-            f.render_widget(
-                Paragraph::new(lines).wrap(Wrap { trim: true }).block(block),
-                rect,
-            );
+            f.render_widget(Paragraph::new(lines).block(block), rect);
         }
         SetupStage::SetPassphrase => {
             let block = panel("Set a passphrase", true, theme);
@@ -371,6 +360,66 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
             f.render_widget(Paragraph::new(lines).block(block), rect);
         }
     }
+}
+
+fn import_word_color(
+    word: &str,
+    is_last: bool,
+    theme: &super::theme::Theme,
+) -> ratatui::style::Color {
+    if crate::crypto::word_is_valid(word) {
+        if is_last { theme.text } else { theme.usd }
+    } else if crate::crypto::word_suggestions(word).is_empty() {
+        theme.danger
+    } else {
+        theme.text
+    }
+}
+
+fn import_phrase_lines<'a>(
+    phrase: &str,
+    inner_w: usize,
+    theme: &super::theme::Theme,
+) -> Vec<Line<'a>> {
+    const INDENT: &str = "  ";
+    let avail = inner_w.saturating_sub(INDENT.chars().count()).max(1);
+    let cursor = Span::styled("▏", Style::default().fg(theme.accent));
+
+    let words: Vec<&str> = phrase.split_whitespace().collect();
+    if words.is_empty() {
+        return vec![Line::from(vec![Span::raw(INDENT), cursor])];
+    }
+
+    let last = words.len() - 1;
+    let mut lines: Vec<Line<'a>> = Vec::new();
+    let mut spans: Vec<Span<'a>> = vec![Span::raw(INDENT)];
+    let mut col = 0usize;
+
+    for (idx, word) in words.iter().enumerate() {
+        let wlen = word.chars().count();
+        let sep = usize::from(col > 0);
+        if col > 0 && col + sep + wlen > avail {
+            lines.push(Line::from(std::mem::replace(
+                &mut spans,
+                vec![Span::raw(INDENT)],
+            )));
+            col = 0;
+        }
+        if col > 0 {
+            spans.push(Span::raw(" "));
+            col += 1;
+        }
+        let color = import_word_color(word, idx == last, theme);
+        spans.push(Span::styled(
+            (*word).to_string(),
+            Style::default().fg(color),
+        ));
+        col += wlen;
+    }
+
+    spans.push(cursor);
+    lines.push(Line::from(spans));
+    lines
 }
 
 pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
