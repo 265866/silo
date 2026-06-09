@@ -15,6 +15,7 @@ mod solana;
 mod sync;
 mod types;
 mod ui;
+mod update;
 mod vault;
 mod worker;
 
@@ -33,6 +34,23 @@ use crate::types::{Currency, Network};
 #[tokio::main]
 async fn main() -> Result<()> {
     clipboard::maybe_run_clip_daemon();
+
+    if let Some(arg) = std::env::args().nth(1) {
+        match arg.as_str() {
+            "--version" | "-V" => {
+                println!("silo {}", crate::update::CURRENT_VERSION);
+                return Ok(());
+            }
+            "--help" | "-h" => {
+                print_help();
+                return Ok(());
+            }
+            other => {
+                eprintln!("silo: unknown argument '{other}' (try --help)");
+                std::process::exit(2);
+            }
+        }
+    }
 
     let dir = crate::platform::config_dir();
     crate::profiles::ensure_private_dir(&dir)?;
@@ -76,6 +94,8 @@ async fn main() -> Result<()> {
                 crate::app::AUTO_LOCK_MAX_MINUTES,
             )
         });
+    let update_latest_seen = db.get_meta("update_latest_seen")?;
+    let update_check_due = update_check_due(&db)?;
     let vault_path = profile_dir.join("vault.json");
 
     let db = Storage::new(db);
@@ -119,6 +139,7 @@ async fn main() -> Result<()> {
         active_id,
         first_run,
     );
+    app.init_update_check(update_latest_seen, update_check_due);
 
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -136,6 +157,35 @@ async fn main() -> Result<()> {
 
 fn disable_bracketed_paste(w: &mut impl std::io::Write) {
     let _ = execute!(w, DisableBracketedPaste);
+}
+
+fn update_check_due(db: &Db) -> Result<bool> {
+    let last = db
+        .get_meta("update_last_check")?
+        .and_then(|s| s.parse::<u64>().ok());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Ok(match last {
+        Some(ts) => now.saturating_sub(ts) >= crate::update::CHECK_INTERVAL_SECS,
+        None => true,
+    })
+}
+
+fn print_help() {
+    println!(
+        "silo {} — SOL-only Solana wallet manager",
+        update::CURRENT_VERSION
+    );
+    println!();
+    println!("USAGE:");
+    println!("    silo             launch the wallet (requires a TTY)");
+    println!("    silo --version   print the version and exit");
+    println!("    silo --help      show this help and exit");
+    println!();
+    println!("On launch silo checks GitHub for a newer release and shows an in-app");
+    println!("banner with how to upgrade. Toggle the check in Settings.");
 }
 
 struct Shutdown {
@@ -195,7 +245,7 @@ async fn run(
 ) -> Result<()> {
     let mut events = EventStream::new();
     let active_tick = std::time::Duration::from_millis(50);
-    let idle_tick = std::time::Duration::from_secs(1);
+    let ambient_tick = std::time::Duration::from_millis(100);
     let tick = tokio::time::sleep(active_tick);
     tokio::pin!(tick);
     let mut shutdown = Shutdown::new();
@@ -233,13 +283,11 @@ async fn run(
                 app.stop();
             },
             _ = &mut tick => {
-                let tick_redrew = app.tick();
+                app.tick();
                 app.maybe_auto_lock();
                 app.maybe_auto_refresh();
-                if tick_redrew || app.animations_active() {
-                    app.request_redraw();
-                }
-                let period = if app.animations_active() { active_tick } else { idle_tick };
+                app.request_redraw();
+                let period = if app.animations_active() { active_tick } else { ambient_tick };
                 tick.as_mut().reset(tokio::time::Instant::now() + period);
             }
             _ = shutdown.recv() => {

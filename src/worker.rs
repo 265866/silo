@@ -79,6 +79,29 @@ pub fn build_client() -> anyhow::Result<reqwest::Client> {
         .map_err(|e| anyhow::anyhow!("failed to build HTTP client: {e}"))
 }
 
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+async fn fetch_latest_release(client: &reqwest::Client) -> anyhow::Result<String> {
+    let resp = client
+        .get(crate::update::releases_api_url())
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await?
+        .error_for_status()?;
+    let json: serde_json::Value = resp.json().await?;
+    let tag = json
+        .get("tag_name")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| anyhow::anyhow!("release response missing tag_name"))?;
+    Ok(tag.trim_start_matches('v').to_string())
+}
+
 pub fn spawn_workers(
     mut cmd_rx: mpsc::Receiver<(u64, Command)>,
     evt_tx: mpsc::Sender<AppEvent>,
@@ -870,6 +893,19 @@ async fn handle_command(
                 Err(e) => {
                     send_error(&evt, cmd_gen, format!("price fetch failed: {e}")).await;
                 }
+            }
+        }
+
+        Command::CheckForUpdate => {
+            if let Ok(latest) = fetch_latest_release(&client).await {
+                let now = unix_now_secs();
+                let seen = latest.clone();
+                db.call(move |d| {
+                    let _ = d.set_meta("update_last_check", &now.to_string());
+                    let _ = d.set_meta("update_latest_seen", &seen);
+                })
+                .await;
+                let _ = evt.send(AppEvent::UpdateStatus { latest }).await;
             }
         }
 

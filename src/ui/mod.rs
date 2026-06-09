@@ -145,20 +145,28 @@ fn shimmer_line(
 
 fn status_bar(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
-    let (mut dot_color, net_label) = match app.net_status {
-        NetStatus::Online => (theme.accent, "mainnet"),
-        NetStatus::Syncing => (theme.warn, "syncing"),
-        NetStatus::Offline => (theme.danger, "offline"),
+    let mut dot_color = match app.net_status {
+        NetStatus::Online => theme.accent,
+        NetStatus::Syncing => theme.warn,
+        NetStatus::Offline => theme.danger,
     };
     if app.net_status == NetStatus::Syncing || !app.reconcile_done {
         dot_color = blend(dot_color, theme.bg, 0.55 * (1.0 - pulse(app.spinner_frame)));
     }
 
-    let mut left = vec![
-        Span::styled("● ", Style::default().fg(dot_color)),
-        Span::styled(net_label, Style::default().fg(theme.text)),
-        Span::styled(" · confirmed", Style::default().fg(theme.text_muted)),
-    ];
+    let mut left = vec![Span::styled("● ", Style::default().fg(dot_color))];
+    if app.update_available().is_some() {
+        left.push(Span::styled(
+            "Update available! ",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+        left.push(Span::styled(
+            app.install_method.upgrade_hint().to_string(),
+            Style::default().fg(theme.text),
+        ));
+    }
     if !app.reconcile_done {
         left.push(Span::styled(
             format!("  {} reconciling", app.spinner()),
@@ -186,16 +194,16 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
     let price_color = blend(theme.text_muted, flash_to, app.price_flash);
     let right = Span::styled(format!("{price}{arrow}"), Style::default().fg(price_color));
 
+    let mut title = shimmer_line("silo", app.anim_frame(), theme.text, theme.accent);
+    title.spans.push(Span::styled(
+        format!("v{}  ", crate::update::CURRENT_VERSION),
+        Style::default().fg(theme.text_muted),
+    ));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.border_idle))
-        .title(shimmer_line(
-            "silo",
-            app.anim_frame(),
-            theme.text,
-            theme.accent,
-        ))
+        .title(title)
         .style(Style::default().bg(theme.bg));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -232,6 +240,12 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
             "e edit RPC · u currency · p priority · +/- auto-lock · L lock now · esc back"
         }
     };
+    let mut hints = hints.to_string();
+    if app.update_available().is_some()
+        && matches!(app.route, Route::WalletList | Route::WalletDetail)
+    {
+        hints.push_str(" · U changelog");
+    }
     let p = Paragraph::new(Line::from(Span::styled(
         format!(" {hints}"),
         Style::default().fg(app.theme.text_muted),
