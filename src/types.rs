@@ -326,11 +326,11 @@ impl std::fmt::Display for SendGuardError {
             ),
             SendGuardError::RecipientRentFloor { min_first_deposit } => write!(
                 f,
-                "first deposit to a new address must be ≥ {} SOL (rent-exempt minimum)",
+                "first deposit to a new address must be at least {} SOL",
                 format_lamports(*min_first_deposit)
             ),
             SendGuardError::SenderRentFloor => {
-                f.write_str("this would drop the source below the rent-exempt minimum")
+                f.write_str("would leave this wallet below the minimum balance")
             }
             SendGuardError::ZeroAmount => f.write_str("amount must be greater than zero"),
             SendGuardError::WalletHasOpenIntent => {

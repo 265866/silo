@@ -552,8 +552,8 @@ pub(super) fn wallet_detail(f: &mut Frame, app: &mut App, area: Rect) {
 
 pub(super) fn send(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
-    let rect = super::centered_rect(72, 13, area);
-    let inner_w = rect.width.saturating_sub(2) as usize;
+    let width = 72u16;
+    let inner_w = width.min(area.width).saturating_sub(2) as usize;
     let field_w = inner_w.saturating_sub(LABEL_W + 1).max(1);
     let note_w = inner_w.saturating_sub(LABEL_W).max(1);
     let from = app.focused_wallet();
@@ -562,19 +562,17 @@ pub(super) fn send(f: &mut Frame, app: &App, area: Rect) {
     let avail = from.and_then(|w| w.balance_lamports);
 
     let to_ok = crate::clipboard::validate_solana_pubkey(&app.input.send_to).is_ok();
+    let dest = app
+        .wallets
+        .iter()
+        .find(|w| w.pubkey == app.input.send_to.trim());
     let route_note = match (from, to_ok) {
         (Some(fw), true) => {
             match crate::input::classify_route(&app.wallets, fw, &app.input.send_to) {
-                Ok(()) => {
-                    let dest = app
-                        .wallets
-                        .iter()
-                        .find(|w| w.pubkey == app.input.send_to.trim());
-                    match dest {
-                        Some(d) => (format!("✓ valid ({})", d.display_name()), theme.usd),
-                        None => ("✓ valid (external)".to_string(), theme.usd),
-                    }
-                }
+                Ok(()) => match dest {
+                    Some(d) => (format!("✓ valid ({})", d.display_name()), theme.usd),
+                    None => ("✓ valid (external)".to_string(), theme.usd),
+                },
                 Err(e) => (format!("⚠ {e}"), theme.danger),
             }
         }
@@ -609,22 +607,85 @@ pub(super) fn send(f: &mut Frame, app: &App, area: Rect) {
         _ => String::new(),
     };
 
-    let after = match (avail, lamports) {
-        (Some(a), Some(amt)) => {
-            let spent = amt.saturating_add(app.send_fee());
-            format!(
-                "after send ≈ {} SOL",
-                format::fmt_sol(a.saturating_sub(spent))
-            )
+    let min = app.rent_exempt_min;
+    let fee = app.send_fee();
+    let floor_note = match lamports {
+        Some(amt) if to_ok && amt > 0 => {
+            let recipient_under = dest
+                .and_then(|d| d.balance_lamports)
+                .unwrap_or(0)
+                .saturating_add(amt)
+                < min;
+            let new_recipient = dest.is_none() || dest.and_then(|d| d.balance_lamports) == Some(0);
+            let source_under = avail
+                .map(|a| {
+                    let after = a.saturating_sub(amt.saturating_add(fee));
+                    after > 0 && after < min
+                })
+                .unwrap_or(false);
+            if source_under {
+                Some(format!(
+                    "⚠ would leave this wallet below the minimum balance (keep ≥ {} SOL)",
+                    format::fmt_sol_exact(min)
+                ))
+            } else if recipient_under && new_recipient {
+                Some(format!(
+                    "⚠ first deposit to a new address must be at least {} SOL",
+                    format::fmt_sol_exact(min)
+                ))
+            } else {
+                None
+            }
         }
-        _ => String::new(),
+        _ => None,
     };
 
-    let lines = vec![
+    let (active_unit, other_unit) = if fiat {
+        (denom_label, "sol")
+    } else {
+        ("SOL", "usd")
+    };
+    let switch_hint = if app.input.focus == 1 {
+        format!(" {other_unit} · c to switch")
+    } else {
+        format!(" {other_unit}")
+    };
+    let switch = Line::from(vec![
+        Span::styled(format!("{:>w$}", "", w = LABEL_W), Style::default()),
+        Span::styled(
+            format!("[{active_unit}]"),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(switch_hint, Style::default().fg(theme.text_muted)),
+    ]);
+
+    let after = match (avail, lamports) {
+        (Some(a), Some(amt)) => {
+            let spent = amt.saturating_add(fee);
+            Some(format!(
+                "after send ≈ {} SOL (fee subtracted)",
+                format::fmt_sol(a.saturating_sub(spent))
+            ))
+        }
+        _ => None,
+    };
+
+    let avail_fee = match avail {
+        Some(a) => format!(
+            "available {} SOL · fee ≈ {} SOL",
+            format::fmt_sol(a),
+            format::fmt_sol(fee)
+        ),
+        None => format!("available … · fee ≈ {} SOL", format::fmt_sol(fee)),
+    };
+
+    let mut lines = vec![
         Line::from(""),
         Line::from(vec![
             Span::styled(
-                format!("  {:<w$}", "To", w = LABEL_TEXT_W),
+                format!("  {:<w$}", "to", w = LABEL_TEXT_W),
                 Style::default().fg(theme.text_muted),
             ),
             Span::styled(
@@ -645,38 +706,44 @@ pub(super) fn send(f: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from(vec![
             Span::styled(
-                format!("  {:<w$}", "Amount", w = LABEL_TEXT_W),
-                Style::default().fg(theme.text_muted),
+                format!("  {:<w$}", "amount", w = LABEL_TEXT_W),
+                Style::default().fg(theme.accent),
             ),
             Span::styled(
                 app.input.send_amount.clone(),
                 Style::default().fg(theme.text),
             ),
             cur(1),
-            Span::styled(
-                format!(" {denom_label}"),
-                Style::default().fg(theme.text_muted),
-            ),
             Span::styled(equiv, Style::default().fg(theme.usd)),
         ]),
-        Line::from(""),
-        Line::from(Span::styled(
+        switch,
+    ];
+    if let Some(note) = floor_note {
+        lines.push(Line::from(Span::styled(
             format!(
-                "{:>w$}{}  ·  fee ≈ {} SOL",
+                "{:>w$}{}",
                 "",
-                avail
-                    .map(|a| format!("available {} SOL", format::fmt_sol(a)))
-                    .unwrap_or_default(),
-                format::fmt_sol(app.send_fee()),
+                format::truncate_end(&note, note_w),
                 w = LABEL_W
             ),
-            Style::default().fg(theme.text_muted),
-        )),
-        Line::from(Span::styled(
+            Style::default().fg(theme.danger),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("{:>w$}{avail_fee}", "", w = LABEL_W),
+        Style::default().fg(theme.text_muted),
+    )));
+    if let Some(after) = after {
+        lines.push(Line::from(Span::styled(
             format!("{:>w$}{after}", "", w = LABEL_W),
             Style::default().fg(theme.text_muted),
-        )),
-    ];
+        )));
+    }
+
+    let want = (lines.len() as u16).saturating_add(2);
+    let height = want.min(area.height).max(3);
+    let rect = super::centered_rect(width, height, area);
     let title = format!("Send SOL — from {} (#{})", from_name, from_id.0);
     f.render_widget(Paragraph::new(lines).block(panel(title, true, theme)), rect);
 }
