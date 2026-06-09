@@ -357,3 +357,175 @@ fn optimistic_balance_bump_on_confirm() {
         "tracked recipient credited the amount immediately"
     );
 }
+
+fn render_sized(app: &mut App, w: u16, h: u16) -> String {
+    let backend = TestBackend::new(w, h);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| crate::ui::render(f, app)).unwrap();
+    buffer_to_string(terminal.backend().buffer())
+}
+
+const ALL_ROUTES: [Route; 9] = [
+    Route::ProfileSelect,
+    Route::Unlock,
+    Route::Setup,
+    Route::WalletList,
+    Route::WalletDetail,
+    Route::Send,
+    Route::History,
+    Route::AuditLog,
+    Route::Settings,
+];
+
+fn fuzz_app() -> App {
+    let mut app = test_app();
+    app.latest_version = Some("9.9.9".into());
+    app.focused_wallet = Some(app.wallets[2].id);
+    app.refresh_detail_intents_blocking();
+    app.list_state.select(Some(0));
+    app.input.send_to = "9aFh2mRcoldStorageXXXXXXXXXXXXXXXXXXXXXXXXXX".into();
+    app.input.send_amount = "2.5".into();
+    app.refresh_audit_blocking();
+    app.toast_info("a toast that should not blank live rows");
+    app
+}
+
+#[test]
+fn renders_every_size_without_panicking() {
+    let setups = [
+        SetupStage::Choose,
+        SetupStage::ShowMnemonic,
+        SetupStage::ConfirmMnemonic,
+    ];
+    for w in (20u16..=120).step_by(7) {
+        for h in (6u16..=30).step_by(3) {
+            for route in ALL_ROUTES {
+                let mut app = fuzz_app();
+                app.route = route;
+                if route == Route::Setup {
+                    for stage in setups {
+                        app.setup.stage = stage;
+                        app.setup.mnemonic_words =
+                            "legal winner thank year wave sausage worth useful legal winner \
+                             thank yellow"
+                                .split_whitespace()
+                                .map(String::from)
+                                .collect();
+                        if stage == SetupStage::ConfirmMnemonic {
+                            let n = app.setup.mnemonic_words.len();
+                            app.setup.begin_confirm(n);
+                        }
+                        let _ = render_sized(&mut app, w, h);
+                    }
+                }
+                let _ = render_sized(&mut app, w, h);
+            }
+
+            let mut app = fuzz_app();
+            app.route = Route::WalletList;
+            app.modal = Some(Modal::Error {
+                title: "Send failed".into(),
+                body: "the network rejected this transaction for a long winded reason that wraps"
+                    .into(),
+            });
+            let _ = render_sized(&mut app, w, h);
+
+            app.modal = Some(Modal::Confirm {
+                title: "Empty passphrase".into(),
+                body: "create the vault with no passphrase?".into(),
+                action: crate::app::ConfirmAction::CreateWithEmptyPassphrase,
+            });
+            let _ = render_sized(&mut app, w, h);
+
+            app.modal = Some(Modal::Prompt {
+                kind: PromptKind::Label(app.wallets[0].id),
+                title: "Rename".into(),
+            });
+            let _ = render_sized(&mut app, w, h);
+
+            app.input.prompt_text = "a multi line note\nsecond line here".into();
+            app.modal = Some(Modal::Prompt {
+                kind: PromptKind::Note(app.wallets[0].id),
+                title: "Set note".into(),
+            });
+            let _ = render_sized(&mut app, w, h);
+
+            app.pending_send = Some(PendingSend {
+                from_id: app.wallets[2].id,
+                to: "9aFh2mRcoldStorageXXXXXXXXXXXXXXXXXXXXXXXXXX".into(),
+                lamports: 2_500_000_000,
+                blockhash: "BhAsHxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into(),
+                lvbh: 1000,
+                fee: 5000,
+                dest_balance: 1_000_000_000,
+                priority_micro: 0,
+                prepared_at: std::time::Instant::now(),
+            });
+            app.modal = Some(Modal::ConfirmSend);
+            let _ = render_sized(&mut app, w, h);
+        }
+    }
+}
+
+#[test]
+fn below_floor_shows_resize_notice_and_hides_screen() {
+    for (w, h) in [(50u16, 10u16), (59, 20), (80, 12)] {
+        let mut app = fuzz_app();
+        app.route = Route::WalletList;
+        let out = render_sized(&mut app, w, h);
+        assert!(
+            out.contains("please resize"),
+            "expected resize notice at {w}x{h}, got:\n{out}"
+        );
+        assert!(
+            !out.contains("Wallets ("),
+            "wallet-list panel must not render below the floor at {w}x{h}"
+        );
+    }
+}
+
+#[test]
+fn at_floor_renders_normal_screen_not_resize_notice() {
+    let mut app = fuzz_app();
+    app.route = Route::WalletList;
+    let out = render_sized(&mut app, 60, 16);
+    assert!(
+        !out.contains("please resize"),
+        "60x16 is at the floor and should render the screen"
+    );
+    assert!(
+        out.contains("Wallets ("),
+        "wallet-list panel should render at the floor"
+    );
+}
+
+#[test]
+fn wallet_list_footer_keeps_lock_and_quit() {
+    for w in [80u16, 60] {
+        let mut app = fuzz_app();
+        app.latest_version = None;
+        app.toasts.clear();
+        app.route = Route::WalletList;
+        let out = render_sized(&mut app, w, 24);
+        assert!(out.contains("lock"), "footer must keep lock at width {w}");
+        assert!(out.contains("quit"), "footer must keep quit at width {w}");
+    }
+}
+
+#[test]
+fn wallet_list_drops_fiat_column_when_narrow() {
+    let mut app = fuzz_app();
+    app.route = Route::WalletList;
+
+    let narrow = render_sized(&mut app, 70, 24);
+    assert!(
+        !narrow.contains("USD"),
+        "USD column should be dropped at width 70:\n{narrow}"
+    );
+
+    let wide = render_sized(&mut app, 90, 24);
+    assert!(
+        wide.contains("USD"),
+        "USD column should be present at width 90:\n{wide}"
+    );
+}
