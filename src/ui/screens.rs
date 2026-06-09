@@ -50,9 +50,20 @@ pub(super) fn profile_select(f: &mut Frame, app: &App, area: Rect) {
 
 pub(super) fn unlock(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
-    let rect = super::centered_rect(64, 9, area);
-    let block = panel("Unlock silo", true, theme);
+    let title = match app.current_profile_name() {
+        Some(name) => format!("Unlock — {}", format::truncate_end(name, 48)),
+        None => "Unlock silo".to_string(),
+    };
+    let block = panel(title, true, theme);
     let masked = format::input_tail(&"•".repeat(app.input.passphrase.chars().count()), 47);
+    let error_line = if app.unlock_failed {
+        Line::from(Span::styled(
+            "  Incorrect passphrase — try again",
+            Style::default().fg(theme.danger),
+        ))
+    } else {
+        Line::from("")
+    };
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -68,7 +79,15 @@ pub(super) fn unlock(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(masked, Style::default().fg(theme.accent)),
             Span::styled("▏", Style::default().fg(theme.accent)),
         ]),
+        error_line,
+        Line::from(""),
+        Line::from(Span::styled(
+            "  A forgotten passphrase can't be recovered — only the recovery phrase can.",
+            Style::default().fg(theme.text_muted),
+        )),
     ];
+    let height = lines.len() as u16 + 2;
+    let rect = super::centered_rect(78, height, area);
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 

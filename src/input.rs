@@ -66,7 +66,9 @@ fn unlock_keys(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Enter => try_unlock(app),
         _ => {
-            edit_text(&mut app.input.passphrase, &key);
+            if edit_text(&mut app.input.passphrase, &key) {
+                app.unlock_failed = false;
+            }
         }
     }
 }
