@@ -1591,10 +1591,10 @@ fn authenticated_footers_wrap_to_at_most_two_lines_at_width_80() {
         app.input.focus = 1;
         app.route = route;
         let hints = super::footer_hints(&app);
-        let lines = super::footer_height(&hints, 80);
+        let lines = super::hint_height(&hints, 80);
         assert!(
             lines <= 2,
-            "{route:?} footer must wrap to at most 2 lines at width 80, got {lines}: {hints}"
+            "{route:?} hints must wrap to at most 2 lines at width 80, got {lines}: {hints}"
         );
     }
 }
@@ -1681,21 +1681,39 @@ fn syncing_status_avoids_reconciling_jargon() {
 }
 
 #[test]
-fn update_footer_suffix_reads_upgrade_not_changelog() {
+fn update_notice_renders_in_footer_right_on_all_routes() {
     let mut app = test_app();
     app.toasts.clear();
-    app.route = Route::WalletList;
+    app.route = Route::Settings;
     app.latest_version = Some("9.9.9".into());
 
     let hints = super::footer_hints(&app);
     assert!(
-        hints.contains("U upgrade"),
-        "update footer suffix must read 'U upgrade': {hints}"
+        !hints.to_lowercase().contains("upgrade"),
+        "footer hints must no longer carry an upgrade suffix: {hints}"
     );
-    assert!(
-        !hints.contains("U changelog"),
-        "update footer suffix must drop the 'U changelog' mislabel: {hints}"
-    );
+
+    for route in [Route::Settings, Route::History] {
+        let mut app = test_app();
+        app.toasts.clear();
+        app.route = route;
+        app.latest_version = Some("9.9.9".into());
+        let out = render(&mut app);
+        assert!(
+            out.contains("v9.9.9 · "),
+            "{route:?} footer must show the versioned upgrade line:\n{out}"
+        );
+
+        let mut app = test_app();
+        app.toasts.clear();
+        app.route = route;
+        app.latest_version = None;
+        let out = render(&mut app);
+        assert!(
+            !out.contains("v9.9.9"),
+            "{route:?} footer must hide the notice with no update:\n{out}"
+        );
+    }
 }
 
 #[test]

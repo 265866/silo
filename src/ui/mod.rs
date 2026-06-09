@@ -39,7 +39,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     }
 
     let footer_text = footer_hints(app);
-    let footer_h = footer_height(&footer_text, area.width);
+    let footer_h = footer_height(app, &footer_text, area.width);
 
     let chunks = Layout::vertical([
         Constraint::Length(3),
@@ -207,18 +207,6 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(theme.danger),
         ));
     }
-    if app.update_available().is_some() {
-        left.push(Span::styled(
-            "update available ",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ));
-        left.push(Span::styled(
-            "· press U to copy upgrade command",
-            Style::default().fg(theme.text_muted),
-        ));
-    }
     if app.seed.is_some() {
         if !app.reconcile_done {
             left.push(Span::styled(
@@ -313,28 +301,71 @@ fn footer_hints(app: &App) -> String {
     if app.route == Route::WalletList && app.wallets.iter().any(|w| w.has_open_intent) {
         hints.push_str(" · ⏳ transfer in progress");
     }
-    if app.update_available().is_some()
-        && matches!(app.route, Route::WalletList | Route::WalletDetail)
-    {
-        hints.push_str(" · U upgrade");
-    }
     hints
 }
 
-fn footer_height(hints: &str, width: u16) -> u16 {
+fn hint_height(hints: &str, width: u16) -> u16 {
     let avail = (width as usize).saturating_sub(1).max(1);
     let lines = format::wrap_lines(hints, avail).len() as u16;
-    lines.clamp(1, 3)
+    lines.clamp(1, 2)
+}
+
+fn upgrade_line_text(app: &App) -> Option<String> {
+    let latest = app.update_available()?;
+    Some(format!(
+        "↑ v{latest} · {}",
+        app.install_method.upgrade_command()
+    ))
+}
+
+fn footer_height(app: &App, hints: &str, width: u16) -> u16 {
+    let mut h = hint_height(hints, width);
+    if let Some(line) = upgrade_line_text(app) {
+        let avail = (width as usize).saturating_sub(1).max(1);
+        h += format::wrap_lines(&line, avail).len() as u16;
+    }
+    h.clamp(1, 4)
 }
 
 fn footer(f: &mut Frame, app: &App, hints: &str, area: Rect) {
-    let p = Paragraph::new(Line::from(Span::styled(
+    let theme = &app.theme;
+    let hints_p = Paragraph::new(Line::from(Span::styled(
         format!(" {hints}"),
-        Style::default().fg(app.theme.text_muted),
+        Style::default().fg(theme.text_muted),
     )))
     .wrap(Wrap { trim: true })
-    .style(Style::default().bg(app.theme.surface));
-    f.render_widget(p, area);
+    .style(Style::default().bg(theme.surface));
+
+    let Some(latest) = app.update_available() else {
+        f.render_widget(hints_p, area);
+        return;
+    };
+
+    let avail = (area.width as usize).saturating_sub(1).max(1);
+    let upgrade_text = upgrade_line_text(app).unwrap_or_default();
+    let upgrade_h = (format::wrap_lines(&upgrade_text, avail).len() as u16).min(area.height);
+    let hints_h = area.height.saturating_sub(upgrade_h);
+
+    let rows =
+        Layout::vertical([Constraint::Length(hints_h), Constraint::Length(upgrade_h)]).split(area);
+    f.render_widget(hints_p, rows[0]);
+
+    let notice = Paragraph::new(Line::from(vec![
+        Span::styled(
+            format!("↑ v{latest} · "),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            app.install_method.upgrade_command(),
+            Style::default().fg(theme.accent),
+        ),
+    ]))
+    .alignment(Alignment::Right)
+    .wrap(Wrap { trim: true })
+    .style(Style::default().bg(theme.surface));
+    f.render_widget(notice, rows[1]);
 }
 
 fn render_toasts(f: &mut Frame, app: &App, footer_area: Rect) {

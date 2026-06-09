@@ -21,16 +21,14 @@ impl InstallMethod {
         )
     }
 
-    pub fn upgrade_hint(self) -> &'static str {
+    pub fn upgrade_command(self) -> &'static str {
         match self {
-            InstallMethod::Homebrew => "Run: brew upgrade 265866/silo/silo",
-            InstallMethod::Installer => "Re-run the silo install script",
+            InstallMethod::Homebrew => "brew upgrade 265866/silo/silo",
+            InstallMethod::Installer => "re-run the silo install script",
             InstallMethod::Cargo => {
-                "Run: cargo install --locked --git https://github.com/265866/silo --force"
+                "cargo install --locked --git https://github.com/265866/silo --force"
             }
-            InstallMethod::Manual => {
-                "Download the latest from github.com/265866/silo/releases/latest"
-            }
+            InstallMethod::Manual => "download from github.com/265866/silo/releases/latest",
         }
     }
 }
