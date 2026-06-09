@@ -283,8 +283,7 @@ fn footer_hints(app: &App) -> String {
             crate::app::SetupStage::ConfirmMnemonic => "esc back",
         },
         Route::WalletList => {
-            "enter open · s send · n new subwallet · c copy address · ⏳ transfer in progress · ^L \
-             lock · q quit"
+            "enter open · s send · n new subwallet · c copy address · ^L lock · q quit"
         }
         Route::WalletDetail => {
             "s send · M to master · F fund · c copy address · h transfers · q back · ^L lock"
@@ -303,6 +302,9 @@ fn footer_hints(app: &App) -> String {
         }
     };
     let mut hints = hints.to_string();
+    if app.route == Route::WalletList && app.wallets.iter().any(|w| w.has_open_intent) {
+        hints.push_str(" · ⏳ transfer in progress");
+    }
     if app.update_available().is_some()
         && matches!(app.route, Route::WalletList | Route::WalletDetail)
     {

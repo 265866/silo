@@ -1233,10 +1233,21 @@ fn wallet_list_footer_carries_pending_legend() {
     app.toasts.clear();
     app.latest_version = None;
     app.route = Route::WalletList;
-    let out = render_sized(&mut app, 96, 24);
+
+    for w in &mut app.wallets {
+        w.has_open_intent = false;
+    }
+    let out = render_sized(&mut app, 130, 24);
+    assert!(
+        !out.contains("transfer in progress"),
+        "wallet-list footer must omit the pending legend with no open intent:\n{out}"
+    );
+
+    app.wallets[0].has_open_intent = true;
+    let out = render_sized(&mut app, 130, 24);
     assert!(
         out.contains('⏳') && out.contains("transfer in progress"),
-        "wallet-list footer must legend the pending glyph:\n{out}"
+        "wallet-list footer must legend the pending glyph when an intent is open:\n{out}"
     );
 }
 
