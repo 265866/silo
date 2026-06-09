@@ -218,7 +218,7 @@ fn preview_all_screens() {
                 b"wire",
             )
             .unwrap();
-            d.mark_terminal(i.id, crate::types::IntentStatus::Confirmed, None)
+            d.mark_terminal(i.id, crate::types::TerminalStatus::Confirmed, None)
                 .unwrap();
         });
     }

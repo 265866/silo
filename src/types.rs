@@ -181,11 +181,28 @@ impl IntentStatus {
             _ => return None,
         })
     }
-    pub fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            IntentStatus::Confirmed | IntentStatus::Failed | IntentStatus::Expired
-        )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalStatus {
+    Confirmed,
+    Failed,
+    Expired,
+}
+impl TerminalStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TerminalStatus::Confirmed => "confirmed",
+            TerminalStatus::Failed => "failed",
+            TerminalStatus::Expired => "expired",
+        }
+    }
+    pub fn to_intent_status(self) -> IntentStatus {
+        match self {
+            TerminalStatus::Confirmed => IntentStatus::Confirmed,
+            TerminalStatus::Failed => IntentStatus::Failed,
+            TerminalStatus::Expired => IntentStatus::Expired,
+        }
     }
 }
 

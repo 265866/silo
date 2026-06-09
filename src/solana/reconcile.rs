@@ -3,7 +3,7 @@ use serde_json::json;
 
 use super::rpc::{Rpc, SignatureStatus};
 use crate::db::{IntentTransitionOutcome, Storage};
-use crate::types::{AuditEvent, IntentStatus};
+use crate::types::{AuditEvent, IntentStatus, TerminalStatus};
 
 pub const EXPIRY_SLACK: u64 = 150;
 
@@ -126,7 +126,7 @@ pub async fn reconcile_boot(
         if intent.status == IntentStatus::Created {
             terminal!(
                 intent.id,
-                IntentStatus::Failed,
+                TerminalStatus::Failed,
                 Some("abandoned before signing"),
             );
             continue;
@@ -135,7 +135,7 @@ pub async fn reconcile_boot(
         let Some(sig) = intent.signature else {
             terminal!(
                 intent.id,
-                IntentStatus::Failed,
+                TerminalStatus::Failed,
                 Some("signed intent missing signature"),
             );
             continue;
@@ -159,11 +159,11 @@ pub async fn reconcile_boot(
 
         match decide(status.as_ref(), Some(height), lvbh) {
             Decision::FinalizeSuccess => {
-                terminal!(intent.id, IntentStatus::Confirmed, None);
+                terminal!(intent.id, TerminalStatus::Confirmed, None);
             }
             Decision::WaitFinality => {}
             Decision::Fail => {
-                terminal!(intent.id, IntentStatus::Failed, Some(ON_CHAIN_ERROR));
+                terminal!(intent.id, TerminalStatus::Failed, Some(ON_CHAIN_ERROR));
             }
             Decision::Expire => {
                 let recheck = match rpc.get_signature_statuses(&[sig.as_str()], true).await {
@@ -175,16 +175,16 @@ pub async fn reconcile_boot(
                 };
                 match recheck_outcome(recheck.as_ref()) {
                     RecheckOutcome::Fail => {
-                        terminal!(intent.id, IntentStatus::Failed, Some(ON_CHAIN_ERROR));
+                        terminal!(intent.id, TerminalStatus::Failed, Some(ON_CHAIN_ERROR));
                         continue;
                     }
                     RecheckOutcome::Confirmed => {
-                        terminal!(intent.id, IntentStatus::Confirmed, None);
+                        terminal!(intent.id, TerminalStatus::Confirmed, None);
                         continue;
                     }
                     RecheckOutcome::KeepOpen => continue,
                     RecheckOutcome::Expire => {
-                        terminal!(intent.id, IntentStatus::Expired, Some(BLOCKHASH_EXPIRED));
+                        terminal!(intent.id, TerminalStatus::Expired, Some(BLOCKHASH_EXPIRED));
                     }
                 }
             }
@@ -192,7 +192,7 @@ pub async fn reconcile_boot(
                 let Some(bytes) = intent.signed_tx else {
                     terminal!(
                         intent.id,
-                        IntentStatus::Failed,
+                        TerminalStatus::Failed,
                         Some("signed intent missing wire bytes"),
                     );
                     continue;
@@ -208,7 +208,7 @@ pub async fn reconcile_boot(
                             )?;
                             Ok(d.mark_terminal(
                                 intent_id,
-                                IntentStatus::Failed,
+                                TerminalStatus::Failed,
                                 Some("rpc returned mismatched signature"),
                             )?)
                         })?;

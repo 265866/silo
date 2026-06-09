@@ -20,7 +20,7 @@ use crate::solana::reconcile::{
 };
 use crate::solana::rpc::Rpc;
 use crate::sync::MutexExt;
-use crate::types::{AuditEvent, IntentStatus, NetStatus, TransferOutcome};
+use crate::types::{AuditEvent, IntentStatus, NetStatus, TerminalStatus, TransferOutcome};
 
 const PRICE_POLL_BASE: Duration = Duration::from_secs(60);
 const PRICE_POLL_JITTER_MS: u64 = 10_000;
@@ -490,7 +490,7 @@ fn persist_signed_send_blocking(
             let cleaned = db.call_blocking(move |d| {
                 d.mark_terminal(
                     intent_id,
-                    IntentStatus::Failed,
+                    TerminalStatus::Failed,
                     Some("couldn't persist signed transfer"),
                 )
             });
@@ -1124,7 +1124,7 @@ async fn finalize(
     evt: &mpsc::Sender<AppEvent>,
     intent_id: i64,
     sig: &str,
-    status: IntentStatus,
+    status: TerminalStatus,
     error: Option<&str>,
     generation: &Arc<AtomicU64>,
     cmd_gen: u64,
@@ -1139,7 +1139,7 @@ async fn finalize(
         return;
     };
     let final_status = match outcome {
-        Ok(IntentTransitionOutcome::Applied) => status,
+        Ok(IntentTransitionOutcome::Applied) => status.to_intent_status(),
         Err(e) => {
             send_error(
                 evt,
@@ -1150,7 +1150,7 @@ async fn finalize(
                 ),
             )
             .await;
-            status
+            status.to_intent_status()
         }
         Ok(_) => match db
             .call_current(generation.clone(), cmd_gen, move |d| {
@@ -1159,7 +1159,7 @@ async fn finalize(
             .await
         {
             Some(Some(s)) => s,
-            Some(None) => status,
+            Some(None) => status.to_intent_status(),
             None => return,
         },
     };
@@ -1316,7 +1316,7 @@ async fn broadcast_submit(
                 evt,
                 intent_id,
                 &sig,
-                IntentStatus::Failed,
+                TerminalStatus::Failed,
                 Some("rpc returned mismatched signature"),
                 generation,
                 cmd_gen,
@@ -1344,7 +1344,7 @@ async fn broadcast_submit(
                     evt,
                     intent_id,
                     &sig,
-                    IntentStatus::Failed,
+                    TerminalStatus::Failed,
                     Some(&reason),
                     generation,
                     cmd_gen,
@@ -1413,7 +1413,7 @@ async fn poll_confirmation(
                         &evt,
                         intent_id,
                         &sig,
-                        IntentStatus::Failed,
+                        TerminalStatus::Failed,
                         Some(ON_CHAIN_ERROR),
                         &generation,
                         cmd_gen,
@@ -1427,7 +1427,7 @@ async fn poll_confirmation(
                         &evt,
                         intent_id,
                         &sig,
-                        IntentStatus::Confirmed,
+                        TerminalStatus::Confirmed,
                         None,
                         &generation,
                         cmd_gen,
@@ -1453,7 +1453,7 @@ async fn poll_confirmation(
                             &evt,
                             intent_id,
                             &sig,
-                            IntentStatus::Failed,
+                            TerminalStatus::Failed,
                             Some("rpc returned mismatched signature"),
                             &generation,
                             cmd_gen,
@@ -1470,7 +1470,7 @@ async fn poll_confirmation(
                             &evt,
                             intent_id,
                             &sig,
-                            IntentStatus::Failed,
+                            TerminalStatus::Failed,
                             Some(ON_CHAIN_ERROR),
                             &generation,
                             cmd_gen,
@@ -1484,7 +1484,7 @@ async fn poll_confirmation(
                             &evt,
                             intent_id,
                             &sig,
-                            IntentStatus::Confirmed,
+                            TerminalStatus::Confirmed,
                             None,
                             &generation,
                             cmd_gen,
@@ -1499,7 +1499,7 @@ async fn poll_confirmation(
                             &evt,
                             intent_id,
                             &sig,
-                            IntentStatus::Expired,
+                            TerminalStatus::Expired,
                             Some(BLOCKHASH_EXPIRED),
                             &generation,
                             cmd_gen,
@@ -1539,7 +1539,7 @@ async fn poll_confirmation(
                     &evt,
                     intent_id,
                     &sig,
-                    IntentStatus::Failed,
+                    TerminalStatus::Failed,
                     Some("on-chain error"),
                     &generation,
                     cmd_gen,
@@ -1552,7 +1552,7 @@ async fn poll_confirmation(
                     &evt,
                     intent_id,
                     &sig,
-                    IntentStatus::Confirmed,
+                    TerminalStatus::Confirmed,
                     None,
                     &generation,
                     cmd_gen,
@@ -1566,7 +1566,7 @@ async fn poll_confirmation(
                     &evt,
                     intent_id,
                     &sig,
-                    IntentStatus::Expired,
+                    TerminalStatus::Expired,
                     Some("confirmation timed out before the network confirmed or rejected it"),
                     &generation,
                     cmd_gen,
@@ -2226,7 +2226,7 @@ mod tests {
             &evt_tx,
             intent.id,
             "sig-finalize-err",
-            IntentStatus::Confirmed,
+            TerminalStatus::Confirmed,
             None,
             &generation,
             0,
