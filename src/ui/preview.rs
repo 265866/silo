@@ -463,6 +463,21 @@ fn renders_every_size_without_panicking() {
             });
             app.modal = Some(Modal::ConfirmSend);
             let _ = render_sized(&mut app, w, h);
+
+            app.pending_send = Some(PendingSend {
+                from_id: app.wallets[2].id,
+                to: "ZzExternalWalletNotOursXXXXXXXXXXXXXXXXXXXXXX".into(),
+                lamports: 12_000_000_000,
+                blockhash: "BhAsHxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into(),
+                lvbh: 1000,
+                fee: 5000,
+                dest_balance: 0,
+                priority_micro: 0,
+                prepared_at: std::time::Instant::now(),
+            });
+            app.send_confirm_armed = true;
+            let _ = render_sized(&mut app, w, h);
+            app.send_confirm_armed = false;
         }
     }
 }
@@ -496,6 +511,77 @@ fn at_floor_renders_normal_screen_not_resize_notice() {
     assert!(
         out.contains("Wallets ("),
         "wallet-list panel should render at the floor"
+    );
+}
+
+#[test]
+fn confirm_send_flags_external_recipient_and_shows_total() {
+    let mut app = test_app();
+    app.route = Route::Send;
+    app.pending_send = Some(PendingSend {
+        from_id: app.wallets[2].id,
+        to: "ZzExternalWalletNotOursXXXXXXXXXXXXXXXXXXXXXX".into(),
+        lamports: 2_500_000_000,
+        blockhash: "BhAsHxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into(),
+        lvbh: 1000,
+        fee: 5000,
+        dest_balance: 0,
+        priority_micro: 0,
+        prepared_at: std::time::Instant::now(),
+    });
+    app.modal = Some(Modal::ConfirmSend);
+    let out = render(&mut app);
+    assert!(
+        out.contains("leaving your wallets"),
+        "external send must warn that funds leave your wallets:\n{out}"
+    );
+    assert!(
+        out.contains("(external)"),
+        "external send must mark the recipient external:\n{out}"
+    );
+    assert!(
+        out.contains("total") && out.contains("2.500005 SOL"),
+        "total row must show amount + fee:\n{out}"
+    );
+    assert!(
+        out.contains("Send now"),
+        "normal send shows the plain send verb:\n{out}"
+    );
+    assert!(
+        !out.contains("blockhash") && !out.contains("re-fetched"),
+        "blockhash jargon must not appear:\n{out}"
+    );
+}
+
+#[test]
+fn confirm_send_shows_large_send_banner_when_armed() {
+    let mut app = test_app();
+    app.route = Route::Send;
+    app.pending_send = Some(PendingSend {
+        from_id: app.wallets[2].id,
+        to: "9aFh2mRcoldStorageXXXXXXXXXXXXXXXXXXXXXXXXXX".into(),
+        lamports: 12_000_000_000,
+        blockhash: "BhAsHxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into(),
+        lvbh: 1000,
+        fee: 5000,
+        dest_balance: 0,
+        priority_micro: 0,
+        prepared_at: std::time::Instant::now(),
+    });
+    app.send_confirm_armed = true;
+    app.modal = Some(Modal::ConfirmSend);
+    assert!(
+        app.pending_send_is_large(),
+        "fixture must be a large send for the banner to apply"
+    );
+    let out = render(&mut app);
+    assert!(
+        out.contains("% of this wallet's balance"),
+        "armed large send must show the percent-of-balance banner:\n{out}"
+    );
+    assert!(
+        out.contains("confirm large send"),
+        "armed large send must relabel the action button:\n{out}"
     );
 }
 
