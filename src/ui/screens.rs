@@ -4,7 +4,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 
-use super::{format, panel};
+use super::{LABEL_TEXT_W, LABEL_W, format, panel};
 use crate::app::{App, SetupStage};
 use crate::types::{IntentStatus, Role};
 
@@ -61,7 +61,10 @@ pub(super) fn unlock(f: &mut Frame, app: &App, area: Rect) {
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  passphrase  ", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                format!("  {:<w$}", "passphrase", w = LABEL_TEXT_W),
+                Style::default().fg(theme.text_muted),
+            ),
             Span::styled(masked, Style::default().fg(theme.accent)),
             Span::styled("▏", Style::default().fg(theme.accent)),
         ]),
@@ -253,12 +256,18 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
                 )),
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled("  passphrase  ", Style::default().fg(theme.text_muted)),
+                    Span::styled(
+                        format!("  {:<w$}", "passphrase", w = LABEL_TEXT_W),
+                        Style::default().fg(theme.text_muted),
+                    ),
                     Span::styled(p1, Style::default().fg(theme.accent)),
                     cur(0),
                 ]),
                 Line::from(vec![
-                    Span::styled("  confirm     ", Style::default().fg(theme.text_muted)),
+                    Span::styled(
+                        format!("  {:<w$}", "confirm", w = LABEL_TEXT_W),
+                        Style::default().fg(theme.text_muted),
+                    ),
                     Span::styled(p2, Style::default().fg(theme.accent)),
                     cur(1),
                 ]),
@@ -299,12 +308,15 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
                 let caret = if app.archived_expanded { "▾" } else { "▸" };
                 Row::new(vec![
                     Cell::from(""),
-                    Cell::from(Span::styled(
-                        format!("{caret} Archived ({archived_count})"),
-                        Style::default()
-                            .fg(theme.text_muted)
-                            .add_modifier(Modifier::BOLD),
-                    )),
+                    Cell::from(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(
+                            format!("{caret} Archived ({archived_count})"),
+                            Style::default()
+                                .fg(theme.text_muted)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ])),
                     Cell::from(""),
                     Cell::from(""),
                     Cell::from(""),
@@ -332,8 +344,6 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
                             tw,
                         )),
                     )
-                } else if archived {
-                    Span::raw("    ")
                 } else {
                     Span::raw("  ")
                 };
@@ -431,7 +441,7 @@ pub(super) fn wallet_detail(f: &mut Frame, app: &mut App, area: Rect) {
     const BASE_HEADER: u16 = 9;
     const MAX_NOTE_LINES: usize = 6;
     const MIN_TABLE_H: u16 = 7;
-    let field_w = (area.width.saturating_sub(2 + 11) as usize).max(1);
+    let field_w = (area.width.saturating_sub(2 + super::LABEL_W as u16) as usize).max(1);
     let note_raw = w.note.clone().unwrap_or_else(|| "—".into());
     let note_lines = format::wrap_lines(&note_raw, field_w);
     let want = note_lines.len().clamp(1, MAX_NOTE_LINES);
@@ -456,17 +466,31 @@ pub(super) fn wallet_detail(f: &mut Frame, app: &mut App, area: Rect) {
     let mut info = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("  address  ", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                format!("  {:<w$}", "address", w = LABEL_TEXT_W),
+                Style::default().fg(theme.text_muted),
+            ),
             Span::styled(addr_str, Style::default().fg(theme.text)),
         ]),
         Line::from(vec![
-            Span::styled("  balance  ", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                format!("  {:<w$}", "balance", w = LABEL_TEXT_W),
+                Style::default().fg(theme.text_muted),
+            ),
             Span::styled(
                 bal.map(|l| format!("{} SOL", format::fmt_sol(l)))
-                    .unwrap_or_else(|| "…".into()),
+                    .unwrap_or_else(|| "loading…".into()),
                 Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
+                    .fg(if bal.is_some() {
+                        theme.accent
+                    } else {
+                        theme.text_muted
+                    })
+                    .add_modifier(if bal.is_some() {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
             ),
             Span::styled(
                 bal.map(|l| format!("   ≈ {}", format::fmt_usd(price, l)))
@@ -475,7 +499,10 @@ pub(super) fn wallet_detail(f: &mut Frame, app: &mut App, area: Rect) {
             ),
         ]),
         Line::from(vec![
-            Span::styled("  type     ", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                format!("  {:<w$}", "type", w = LABEL_TEXT_W),
+                Style::default().fg(theme.text_muted),
+            ),
             Span::styled(role, Style::default().fg(theme.text)),
             Span::styled(
                 format!("   index {}", w.account_index),
@@ -485,9 +512,9 @@ pub(super) fn wallet_detail(f: &mut Frame, app: &mut App, area: Rect) {
     ];
     for (idx, line) in display.into_iter().enumerate() {
         let label = if idx == 0 {
-            "  note     "
+            format!("  {:<w$}", "note", w = LABEL_TEXT_W)
         } else {
-            "           "
+            format!("{:<w$}", "", w = LABEL_W)
         };
         info.push(Line::from(vec![
             Span::styled(label, Style::default().fg(theme.text_muted)),
@@ -572,7 +599,10 @@ pub(super) fn send(f: &mut Frame, app: &App, area: Rect) {
     let lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("  To      ", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                format!("  {:<w$}", "To", w = LABEL_TEXT_W),
+                Style::default().fg(theme.text_muted),
+            ),
             Span::styled(
                 format::input_tail(&app.input.send_to, 59),
                 Style::default().fg(theme.text),
@@ -580,12 +610,15 @@ pub(super) fn send(f: &mut Frame, app: &App, area: Rect) {
             cur(0),
         ]),
         Line::from(Span::styled(
-            format!("          {}", route_note.0),
+            format!("{:>w$}{}", "", route_note.0, w = LABEL_W),
             Style::default().fg(route_note.1),
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Amount  ", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                format!("  {:<w$}", "Amount", w = LABEL_TEXT_W),
+                Style::default().fg(theme.text_muted),
+            ),
             Span::styled(
                 app.input.send_amount.clone(),
                 Style::default().fg(theme.text),
@@ -598,21 +631,20 @@ pub(super) fn send(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(equiv, Style::default().fg(theme.usd)),
         ]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(
+        Line::from(Span::styled(
+            format!(
+                "{:>w$}{}  ·  fee ≈ {} SOL",
+                "",
                 avail
                     .map(|a| format!("available {} SOL", format::fmt_sol(a)))
                     .unwrap_or_default(),
-                Style::default().fg(theme.text_muted),
+                format::fmt_sol(app.send_fee()),
+                w = LABEL_W
             ),
-            Span::styled(
-                format!("  ·  fee ≈ {} SOL", format::fmt_sol(app.send_fee())),
-                Style::default().fg(theme.text_muted),
-            ),
-        ]),
+            Style::default().fg(theme.text_muted),
+        )),
         Line::from(Span::styled(
-            format!("  {after}"),
+            format!("{:>w$}{after}", "", w = LABEL_W),
             Style::default().fg(theme.text_muted),
         )),
     ];
@@ -683,7 +715,7 @@ fn render_intent_table(f: &mut Frame, app: &mut App, area: Rect, title: &str) {
     let widths = [
         Constraint::Length(12),
         Constraint::Length(14),
-        Constraint::Length(16),
+        Constraint::Length(18),
         Constraint::Length(13),
         Constraint::Min(11),
     ];
@@ -773,22 +805,34 @@ pub(super) fn settings(f: &mut Frame, app: &App, area: Rect) {
     let lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("  network    ", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                format!("  {:<w$}", "network", w = LABEL_TEXT_W),
+                Style::default().fg(theme.text_muted),
+            ),
             Span::styled("mainnet-beta", Style::default().fg(theme.text)),
         ]),
         Line::from(vec![
-            Span::styled("  rpc        ", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                format!("  {:<w$}", "rpc", w = LABEL_TEXT_W),
+                Style::default().fg(theme.text_muted),
+            ),
             Span::styled(
                 format::elide_middle(&crate::solana::rpc::redact_rpc_url(&app.rpc_url), 56),
                 Style::default().fg(theme.text),
             ),
         ]),
         Line::from(vec![
-            Span::styled("  commitment ", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                format!("  {:<w$}", "commitment", w = LABEL_TEXT_W),
+                Style::default().fg(theme.text_muted),
+            ),
             Span::styled("confirmed", Style::default().fg(theme.text)),
         ]),
         Line::from(vec![
-            Span::styled("  currency   ", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                format!("  {:<w$}", "currency", w = LABEL_TEXT_W),
+                Style::default().fg(theme.text_muted),
+            ),
             Span::styled(
                 format!(
                     "{} ({})",
@@ -800,7 +844,10 @@ pub(super) fn settings(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("   (u to cycle)", Style::default().fg(theme.text_muted)),
         ]),
         Line::from(vec![
-            Span::styled("  priority   ", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                format!("  {:<w$}", "priority", w = LABEL_TEXT_W),
+                Style::default().fg(theme.text_muted),
+            ),
             Span::styled(
                 format!(
                     "{} (≈ {} SOL)",
@@ -812,7 +859,10 @@ pub(super) fn settings(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("   (p to cycle)", Style::default().fg(theme.text_muted)),
         ]),
         Line::from(vec![
-            Span::styled("  auto-lock  ", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                format!("  {:<w$}", "auto-lock", w = LABEL_TEXT_W),
+                Style::default().fg(theme.text_muted),
+            ),
             Span::styled(format!("{lock_min} min"), Style::default().fg(theme.text)),
             Span::styled("   (+/- to adjust)", Style::default().fg(theme.text_muted)),
         ]),
