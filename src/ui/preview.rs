@@ -1112,6 +1112,82 @@ fn wallet_list_title_spells_out_subwallet() {
     );
 }
 
+fn render_buffer(app: &mut App, w: u16, h: u16) -> Buffer {
+    let backend = TestBackend::new(w, h);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| crate::ui::render(f, app)).unwrap();
+    terminal.backend().buffer().clone()
+}
+
+fn first_glyph_x(buf: &Buffer, y: u16, glyph: &str) -> Option<u16> {
+    let area = buf.area;
+    (0..area.width).find(|&x| buf.cell((x, y)).is_some_and(|c| c.symbol() == glyph))
+}
+
+fn row_text(buf: &Buffer, y: u16) -> String {
+    let area = buf.area;
+    (0..area.width)
+        .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+        .collect()
+}
+
+fn find_label_x(buf: &Buffer, label: &str) -> Option<(u16, u16)> {
+    let area = buf.area;
+    for y in 0..area.height {
+        let line = row_text(buf, y);
+        if let Some(byte_off) = line.find(label) {
+            let col = line[..byte_off].chars().count() as u16;
+            return Some((col, y));
+        }
+    }
+    None
+}
+
+#[test]
+fn wallet_list_name_origin_shared_across_roles() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.route = Route::WalletList;
+    let buf = render_buffer(&mut app, W, H);
+
+    let (master_name_x, _) =
+        find_label_x(&buf, "Treasury").expect("master name Treasury must render");
+    let (sub_name_x, _) =
+        find_label_x(&buf, "Cold storage").expect("sub name Cold storage must render");
+
+    assert_eq!(
+        master_name_x, sub_name_x,
+        "master and sub NAME columns must share a left edge: Treasury at x={master_name_x}, Cold storage at x={sub_name_x}"
+    );
+}
+
+#[test]
+fn wallet_list_star_lives_left_of_name_origin() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.route = Route::WalletList;
+    let buf = render_buffer(&mut app, W, H);
+
+    let (name_x, master_y) =
+        find_label_x(&buf, "Treasury").expect("master name Treasury must render");
+    let star_x = first_glyph_x(&buf, master_y, "★").expect("master row must carry the star");
+
+    assert!(
+        star_x < name_x,
+        "the master star must sit in its own column left of the NAME origin: star x={star_x}, name x={name_x}"
+    );
+    assert!(
+        name_x - star_x >= 3,
+        "the star must occupy its own width-2 column with column spacing before NAME, not sit inline in the NAME cell: star x={star_x}, name x={name_x}"
+    );
+    let (sub_name_x, _) =
+        find_label_x(&buf, "Cold storage").expect("sub name Cold storage must render");
+    assert!(
+        first_glyph_x(&buf, master_y, "★") < Some(sub_name_x),
+        "the star column lives left of the shared NAME origin: star x={star_x}, name origin x={sub_name_x}"
+    );
+}
+
 #[test]
 fn wallet_detail_master_is_explained_and_gold() {
     let mut app = test_app();

@@ -442,7 +442,7 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
     let show_addr = area.width >= 62;
     let show_usd = area.width >= 76;
 
-    let mut header_cells = vec![Cell::from("#"), Cell::from("NAME")];
+    let mut header_cells = vec![Cell::from("#"), Cell::from(""), Cell::from("NAME")];
     if show_addr {
         header_cells.push(Cell::from("ADDRESS"));
     }
@@ -464,6 +464,7 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
             crate::app::WalletListRow::ArchivedHeader => {
                 let caret = if app.archived_expanded { "▾" } else { "▸" };
                 let mut cells = vec![
+                    Cell::from(""),
                     Cell::from(""),
                     Cell::from(Line::from(vec![
                         Span::raw("  "),
@@ -495,19 +496,19 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
                 } else {
                     theme.text
                 };
-                let star_span = if is_master {
+                let marker_cell = if is_master {
                     let phase = w.account_index as f32 * 1.7;
                     let tw = ((app.anim_frame() as f32 * 0.20 + phase).sin() * 0.5 + 0.5).powf(1.5);
-                    Span::styled(
+                    Cell::from(Span::styled(
                         "★ ",
                         Style::default().fg(super::blend(
                             theme.master,
                             ratatui::style::Color::Rgb(255, 255, 255),
                             tw,
                         )),
-                    )
+                    ))
                 } else {
-                    Span::raw("  ")
+                    Cell::from("")
                 };
                 let pending = if w.has_open_intent { " ⏳" } else { "" };
                 let name_text = w.display_name();
@@ -534,8 +535,8 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
                         w.account_index.to_string(),
                         Style::default().fg(theme.text_muted),
                     )),
+                    marker_cell,
                     Cell::from(Line::from(vec![
-                        star_span,
                         Span::styled(name_text, Style::default().fg(name_color)),
                         Span::styled(pending, Style::default().fg(theme.warn)),
                     ])),
@@ -573,7 +574,11 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
         .count();
     let title = format!("Wallets ({master_count} master · {sub_count} subwallet)");
 
-    let mut widths = vec![Constraint::Length(4), Constraint::Min(18)];
+    let mut widths = vec![
+        Constraint::Length(4),
+        Constraint::Length(2),
+        Constraint::Min(18),
+    ];
     if show_addr {
         widths.push(Constraint::Length(14));
     }
