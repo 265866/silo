@@ -98,10 +98,6 @@ pub fn releases_api_url() -> String {
     format!("https://api.github.com/repos/{REPO}/releases/latest")
 }
 
-pub fn changelog_url(latest: &str) -> String {
-    format!("https://github.com/{REPO}/compare/v{CURRENT_VERSION}...v{latest}")
-}
-
 pub fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
     let v = v.trim().trim_start_matches('v');
     let core = v.split(['-', '+']).next().unwrap_or(v);
@@ -146,13 +142,6 @@ mod tests {
         assert!(is_newer("0.1.10", "0.1.9"));
         assert!(is_newer("0.10.0", "0.9.0"));
         assert!(!is_newer("0.9.0", "0.10.0"));
-    }
-
-    #[test]
-    fn changelog_points_at_compare_range() {
-        let url = changelog_url("9.9.9");
-        assert!(url.starts_with("https://github.com/265866/silo/compare/v"));
-        assert!(url.ends_with("...v9.9.9"));
     }
 
     #[test]
