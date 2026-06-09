@@ -4,7 +4,7 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::json;
 
 use super::{Db, append_audit, now_ms};
-use crate::types::{AuditEvent, Intent, IntentStatus};
+use crate::types::{AuditEvent, Intent, IntentStatus, TerminalStatus};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CreateIntentError {
@@ -349,15 +349,13 @@ impl Db {
     pub fn mark_terminal(
         &mut self,
         id: i64,
-        status: IntentStatus,
+        outcome: TerminalStatus,
         error: Option<&str>,
     ) -> Result<IntentTransitionOutcome, IntentTransitionError> {
-        debug_assert!(status.is_terminal());
-        let event = match status {
-            IntentStatus::Confirmed => AuditEvent::IntentConfirmed,
-            IntentStatus::Failed => AuditEvent::IntentFailed,
-            IntentStatus::Expired => AuditEvent::IntentExpired,
-            _ => AuditEvent::IntentFailed,
+        let event = match outcome {
+            TerminalStatus::Confirmed => AuditEvent::IntentConfirmed,
+            TerminalStatus::Failed => AuditEvent::IntentFailed,
+            TerminalStatus::Expired => AuditEvent::IntentExpired,
         };
         let now = now_ms();
         self.transition(
@@ -372,11 +370,11 @@ impl Db {
                 tx.execute(
                     "UPDATE tx_intents SET status=?1, error=?2, updated_at=?3
              WHERE id=?4 AND status NOT IN ('confirmed','failed','expired')",
-                    params![status.as_str(), error, now, id],
+                    params![outcome.as_str(), error, now, id],
                 )
             },
             event,
-            &json!({"id": id, "status": status.as_str(), "error": error}),
+            &json!({"id": id, "status": outcome.as_str(), "error": error}),
         )
     }
 
@@ -484,7 +482,7 @@ mod tests {
             Err(CreateIntentError::WalletHasOpenIntent) => {}
             other => panic!("expected WalletHasOpenIntent, got {other:?}"),
         }
-        d.mark_terminal(i1.id, IntentStatus::Failed, Some("test"))
+        d.mark_terminal(i1.id, TerminalStatus::Failed, Some("test"))
             .unwrap();
         assert!(
             d.create_intent(m, "DestAddr33333333333333333333333333333333333", 3000, None)
@@ -556,7 +554,7 @@ mod tests {
             IntentTransitionOutcome::NotFound
         );
         assert_eq!(
-            d.mark_terminal(999, IntentStatus::Failed, Some("missing"))
+            d.mark_terminal(999, TerminalStatus::Failed, Some("missing"))
                 .unwrap(),
             IntentTransitionOutcome::NotFound
         );
@@ -638,7 +636,7 @@ mod tests {
             IntentTransitionOutcome::Applied
         );
         assert_eq!(
-            d.mark_terminal(i.id, IntentStatus::Confirmed, None)
+            d.mark_terminal(i.id, TerminalStatus::Confirmed, None)
                 .unwrap(),
             IntentTransitionOutcome::Applied
         );
@@ -663,12 +661,12 @@ mod tests {
             .unwrap();
         d.mark_signed(i.id, "Sig", "bh", 100, 5000, b"x").unwrap();
         assert_eq!(
-            d.mark_terminal(i.id, IntentStatus::Confirmed, None)
+            d.mark_terminal(i.id, TerminalStatus::Confirmed, None)
                 .unwrap(),
             IntentTransitionOutcome::Applied
         );
         assert_eq!(
-            d.mark_terminal(i.id, IntentStatus::Expired, Some("late"))
+            d.mark_terminal(i.id, TerminalStatus::Expired, Some("late"))
                 .unwrap(),
             IntentTransitionOutcome::WrongState(IntentStatus::Confirmed)
         );
@@ -711,7 +709,7 @@ mod tests {
         d.create_intent(s, "DestB2222222222222222222222222222222222222B", 2000, None)
             .unwrap();
         assert_eq!(d.get_open_intents().unwrap().len(), 2);
-        d.mark_terminal(im.id, IntentStatus::Confirmed, None)
+        d.mark_terminal(im.id, TerminalStatus::Confirmed, None)
             .unwrap();
         let open = d.get_open_intents().unwrap();
         assert_eq!(open.len(), 1);
