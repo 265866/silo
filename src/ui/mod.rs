@@ -254,7 +254,13 @@ fn footer_hints(app: &App) -> String {
             "↑↓ move · enter open · n new wallet · r rename · d delete · q quit"
         }
         Route::Unlock => "type passphrase · enter unlock · ^C quit",
-        Route::Setup => "c create · i import · enter continue · esc back",
+        Route::Setup => match app.setup.stage {
+            crate::app::SetupStage::Choose => "c new wallet · i import · esc quit",
+            crate::app::SetupStage::ShowMnemonic => "enter continue · esc back",
+            crate::app::SetupStage::ImportEntry => "enter continue · esc back",
+            crate::app::SetupStage::SetPassphrase => "tab switch field · enter create · esc back",
+            crate::app::SetupStage::ConfirmMnemonic => "esc back",
+        },
         Route::WalletList => "enter open · s send · n new · c copy · ^L lock · q quit",
         Route::WalletDetail => "s send · M →master · F fund · c copy · h history · esc back",
         Route::Send if app.input.focus == 1 => {
@@ -392,6 +398,26 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     }
 }
 
+pub(super) const SETUP_WIDTH: u16 = 72;
+const SETUP_REF_HEIGHT: u16 = 18;
+
+pub(super) fn setup_panel(area: Rect, content_height: u16) -> Rect {
+    let w = SETUP_WIDTH.min(area.width);
+    let h = content_height.min(area.height);
+    let top = area.y
+        + area
+            .height
+            .saturating_sub(SETUP_REF_HEIGHT.min(area.height))
+            / 2;
+    let max_y = area.y + area.height.saturating_sub(h);
+    Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: top.min(max_y),
+        width: w,
+        height: h,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_message_modal(
     f: &mut Frame,
@@ -456,7 +482,7 @@ fn render_modal(f: &mut Frame, app: &App, area: Rect) {
                 title,
                 body,
                 theme.warn,
-                "  Enter confirm · Esc cancel",
+                "  y proceed · Enter/Esc go back",
             );
         }
         Modal::Error { title, body } => {

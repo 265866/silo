@@ -385,15 +385,17 @@ fn finish_setup_blocking(
             Ok((existing, key)) if existing.to_string() == mnemonic.to_string() => key,
             Ok(_) => {
                 return SetupResult::Failed(
-                    "Existing vault does not match this recovery phrase".to_string(),
+                    "This recovery phrase doesn't match the existing wallet".to_string(),
                 );
             }
-            Err(e) => return SetupResult::Failed(format!("could not reopen existing vault: {e}")),
+            Err(e) => {
+                return SetupResult::Failed(format!("Couldn't reopen the existing wallet: {e}"));
+            }
         }
     } else {
         match crate::vault::create_vault(&vault_path, &mnemonic, &passphrase) {
             Ok(k) => k,
-            Err(e) => return SetupResult::Failed(format!("could not create vault: {e}")),
+            Err(e) => return SetupResult::Failed(format!("Couldn't create wallet: {e}")),
         }
     };
     drop(passphrase);

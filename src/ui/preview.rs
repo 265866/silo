@@ -730,3 +730,231 @@ fn wallet_list_drops_fiat_column_when_narrow() {
         "USD column should be present at width 90:\n{wide}"
     );
 }
+
+#[test]
+fn confirm_counter_counts_non_empty_slots() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.route = Route::Setup;
+    app.setup.stage = SetupStage::ConfirmMnemonic;
+    app.setup.creating = true;
+    app.setup.mnemonic_words = vec!["abandon".into(); 12];
+    app.setup.confirm_words = vec![String::new(); 12];
+    app.setup.confirm_words[0] = "abandon".into();
+    app.setup.confirm_words[1] = "ab".into();
+    app.setup.confirm_words[2] = "ability".into();
+    app.setup.confirm_focus = 3;
+
+    let out = render(&mut app);
+    assert!(
+        out.contains("3/12 entered"),
+        "counter must count every non-empty slot, not just valid words:\n{out}"
+    );
+}
+
+#[test]
+fn confirm_mismatch_renders_message_and_danger() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.route = Route::Setup;
+    app.setup.stage = SetupStage::ConfirmMnemonic;
+    app.setup.creating = true;
+    app.setup.mnemonic_words = vec!["abandon".into(); 12];
+    app.setup.confirm_words = vec!["abandon".into(); 12];
+    app.setup.confirm_words[4] = "zoo".into();
+    app.setup.confirm_mismatch = Some(4);
+    app.setup.confirm_focus = 4;
+
+    let out = render(&mut app);
+    assert!(
+        out.contains("word 5 doesn't match"),
+        "mismatch message must name the first differing slot:\n{out}"
+    );
+}
+
+#[test]
+fn passphrase_shows_live_match_indicator() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.route = Route::Setup;
+    app.setup.stage = SetupStage::SetPassphrase;
+    app.input.passphrase = zeroize::Zeroizing::new("hunter22".into());
+
+    app.input.passphrase2 = zeroize::Zeroizing::new("hunter22".into());
+    let ok = render(&mut app);
+    assert!(
+        ok.contains("✓ match"),
+        "matching passphrases show a tick:\n{ok}"
+    );
+    assert!(
+        ok.contains("8+ characters recommended"),
+        "passphrase hint must be present:\n{ok}"
+    );
+    assert!(
+        !ok.contains("at least 8 characters"),
+        "hint must not claim a hard minimum that isn't enforced:\n{ok}"
+    );
+
+    app.input.passphrase2 = zeroize::Zeroizing::new("hunter23".into());
+    let bad = render(&mut app);
+    assert!(
+        bad.contains("✗ no match"),
+        "differing passphrases show no-match:\n{bad}"
+    );
+}
+
+#[test]
+fn import_shows_paste_hint_and_word_counter() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.route = Route::Setup;
+    app.setup.stage = SetupStage::ImportEntry;
+    app.input.import_phrase = zeroize::Zeroizing::new("abandon ability able about".into());
+
+    let out = render(&mut app);
+    assert!(out.contains("^V"), "import must hint at paste:\n{out}");
+    assert!(
+        out.contains("words: 4/12"),
+        "import must show a live word counter:\n{out}"
+    );
+}
+
+fn setup_stage_words() -> Vec<String> {
+    "legal winner thank year wave sausage worth useful legal winner thank yellow"
+        .split_whitespace()
+        .map(String::from)
+        .collect()
+}
+
+#[test]
+fn setup_footer_is_stage_specific() {
+    let cases = [
+        (SetupStage::Choose, "c new wallet · i import · esc quit"),
+        (SetupStage::ShowMnemonic, "enter continue · esc back"),
+        (SetupStage::ImportEntry, "enter continue · esc back"),
+        (
+            SetupStage::SetPassphrase,
+            "tab switch field · enter create · esc back",
+        ),
+    ];
+    for (stage, expected) in cases {
+        let mut app = test_app();
+        app.toasts.clear();
+        app.latest_version = None;
+        app.route = Route::Setup;
+        app.setup.stage = stage;
+        app.setup.mnemonic_words = setup_stage_words();
+        let out = render(&mut app);
+        assert!(
+            out.contains(expected),
+            "stage {stage:?} footer must read '{expected}':\n{out}"
+        );
+    }
+}
+
+#[test]
+fn setpassphrase_footer_never_says_vault() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.latest_version = None;
+    app.route = Route::Setup;
+    app.setup.stage = SetupStage::SetPassphrase;
+    let out = render(&mut app);
+    assert!(
+        out.contains("enter create") && !out.contains("create vault"),
+        "passphrase footer must say 'enter create', not 'create vault':\n{out}"
+    );
+}
+
+#[test]
+fn no_setup_screen_surfaces_the_word_vault() {
+    let stages = [
+        SetupStage::Choose,
+        SetupStage::ShowMnemonic,
+        SetupStage::ConfirmMnemonic,
+        SetupStage::ImportEntry,
+        SetupStage::SetPassphrase,
+    ];
+    for stage in stages {
+        let mut app = test_app();
+        app.toasts.clear();
+        app.route = Route::Setup;
+        app.setup.stage = stage;
+        app.setup.mnemonic_words = setup_stage_words();
+        if stage == SetupStage::ConfirmMnemonic {
+            let n = app.setup.mnemonic_words.len();
+            app.setup.begin_confirm(n);
+        }
+        let out = render(&mut app);
+        assert!(
+            !out.to_lowercase().contains("vault"),
+            "setup stage {stage:?} must not surface the word 'vault':\n{out}"
+        );
+    }
+}
+
+#[test]
+fn confirm_mnemonic_height_fits_12_words_without_hollow_box() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.route = Route::Setup;
+    app.setup.stage = SetupStage::ConfirmMnemonic;
+    app.setup.mnemonic_words = vec!["abandon".into(); 12];
+    app.setup.begin_confirm(12);
+
+    let out = render(&mut app);
+    let inner: Vec<&str> = out.lines().filter(|l| l.contains('│')).collect();
+    let is_blank = |l: &str| l.chars().all(|c| c == '│' || c == ' ');
+    let trailing_blanks = inner.iter().rev().take_while(|l| is_blank(l)).count();
+    assert!(
+        trailing_blanks == 0,
+        "12-word confirm panel must end on its hint, not a run of empty rows:\n{out}"
+    );
+    let last_meaningful = inner.iter().rev().find(|l| !is_blank(l)).copied();
+    assert!(
+        last_meaningful.is_some_and(|l| l.contains("enter confirm")),
+        "the bottom inner row should be the in-panel hint, proving the panel hugs content:\n{out}"
+    );
+}
+
+#[test]
+fn setup_panels_share_one_width_across_stages() {
+    let stages = [
+        SetupStage::Choose,
+        SetupStage::ShowMnemonic,
+        SetupStage::ConfirmMnemonic,
+        SetupStage::ImportEntry,
+        SetupStage::SetPassphrase,
+    ];
+    let mut widths = Vec::new();
+    for stage in stages {
+        let mut app = test_app();
+        app.toasts.clear();
+        app.route = Route::Setup;
+        app.setup.stage = stage;
+        app.setup.mnemonic_words = setup_stage_words();
+        if stage == SetupStage::ConfirmMnemonic {
+            let n = app.setup.mnemonic_words.len();
+            app.setup.begin_confirm(n);
+        }
+        let out = render(&mut app);
+        let w = out
+            .lines()
+            .find(|l| l.contains('╭') && l.contains('╮'))
+            .map(|l| {
+                let chars: Vec<char> = l.chars().collect();
+                let start = chars.iter().position(|c| *c == '╭').unwrap();
+                let end = chars.iter().rposition(|c| *c == '╮').unwrap();
+                end - start + 1
+            })
+            .unwrap_or(0);
+        widths.push((stage, w));
+    }
+    let first = widths[0].1;
+    for (stage, w) in &widths {
+        assert_eq!(
+            *w, first,
+            "every setup stage must share one border width; stage {stage:?} differs"
+        );
+    }
+}
