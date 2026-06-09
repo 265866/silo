@@ -1038,7 +1038,7 @@ fn compact_json(v: &serde_json::Value) -> String {
 
 pub(super) fn settings(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
-    let rect = super::centered_rect(72, 13, area);
+    let rect = super::centered_rect(72, 11, area);
     let lock_min = app.auto_lock_after.as_secs() / 60;
     let lines = vec![
         Line::from(""),
@@ -1104,11 +1104,6 @@ pub(super) fn settings(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(format!("{lock_min} min"), Style::default().fg(theme.text)),
             Span::styled("   (+/- to adjust)", Style::default().fg(theme.text_muted)),
         ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  e edit RPC · u currency · p priority · L lock now · esc back",
-            Style::default().fg(theme.text_muted),
-        )),
     ];
     f.render_widget(
         Paragraph::new(lines)

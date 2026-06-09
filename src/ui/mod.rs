@@ -251,7 +251,7 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
 fn footer_hints(app: &App) -> String {
     let hints = match app.route {
         Route::ProfileSelect => {
-            "↑↓ move · enter open · n new profile · r rename · d delete · q quit"
+            "↑/↓ jk move · enter open · n new profile · r rename · d delete · q quit"
         }
         Route::Unlock => "type passphrase · enter unlock · ^C quit",
         Route::Setup => match app.setup.stage {
@@ -270,13 +270,15 @@ fn footer_hints(app: &App) -> String {
         }
         Route::Send if app.input.focus == 1 => {
             "tab field · c SOL/fiat · m max (keep open) · a all (empty wallet) · enter review · ^V \
-             paste · esc cancel"
+             paste · ^L lock · esc cancel"
         }
-        Route::Send => "tab field · enter review · ^V paste · esc cancel",
-        Route::History => "↑↓ scroll · PgUp/PgDn · Home/End · c copy txid · t note · esc back",
-        Route::AuditLog => "↑↓ scroll · PgUp/PgDn · Home/End · esc back",
+        Route::Send => "tab field · enter review · ^V paste · ^L lock · esc cancel",
+        Route::History => {
+            "↑/↓ jk scroll · PgUp/PgDn · Home/End · c copy txid · t note · ^L lock · esc back"
+        }
+        Route::AuditLog => "↑/↓ jk scroll · PgUp/PgDn · Home/End · ^L lock · esc back",
         Route::Settings => {
-            "e edit RPC · u currency · p priority · +/- auto-lock · L lock now · esc back"
+            "e edit RPC · u currency · p priority · +/- auto-lock · ^L lock · esc back"
         }
     };
     let mut hints = hints.to_string();
@@ -487,7 +489,7 @@ fn render_modal(f: &mut Frame, app: &App, area: Rect) {
                 title,
                 body,
                 theme.warn,
-                "  y proceed · Enter/Esc go back",
+                "  y proceed · enter/esc go back",
             );
         }
         Modal::Error { title, body } => {
@@ -499,7 +501,7 @@ fn render_modal(f: &mut Frame, app: &App, area: Rect) {
                 title,
                 body,
                 theme.danger,
-                "press Enter to dismiss",
+                "enter / esc dismiss",
             );
         }
         Modal::Prompt { title, kind } => {
@@ -536,7 +538,7 @@ fn render_modal(f: &mut Frame, app: &App, area: Rect) {
                 }
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
-                    "  ctrl+s save · enter newline · esc cancel",
+                    "  ^S save · enter newline · esc cancel",
                     Style::default().fg(theme.text_muted),
                 )));
                 f.render_widget(Paragraph::new(lines).block(make_block()), rect);
