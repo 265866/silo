@@ -7,19 +7,30 @@ use crate::types::{AuditEvent, IntentStatus};
 
 pub const EXPIRY_SLACK: u64 = 150;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Decision {
+pub const ON_CHAIN_ERROR: &str = "on-chain error";
+pub const BLOCKHASH_EXPIRED: &str = "blockhash expired before confirmation";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
     FinalizeSuccess,
     WaitFinality,
-    Fail(String),
+    Fail,
     Expire,
     Rebroadcast,
 }
 
-fn decide(status: Option<&SignatureStatus>, current_height: u64, lvbh: u64) -> Decision {
+fn expired(current_height: Option<u64>, lvbh: u64) -> bool {
+    current_height.is_some_and(|h| h > lvbh + EXPIRY_SLACK)
+}
+
+pub fn decide(
+    status: Option<&SignatureStatus>,
+    current_height: Option<u64>,
+    lvbh: u64,
+) -> Decision {
     if let Some(st) = status {
         if st.is_error() {
-            return Decision::Fail("on-chain error".to_string());
+            return Decision::Fail;
         }
         if st.is_finalized() {
             return Decision::FinalizeSuccess;
@@ -27,15 +38,32 @@ fn decide(status: Option<&SignatureStatus>, current_height: u64, lvbh: u64) -> D
         if st.is_confirmed() {
             return Decision::WaitFinality;
         }
-        if current_height > lvbh + EXPIRY_SLACK {
+        if expired(current_height, lvbh) {
             return Decision::Expire;
         }
         return Decision::Rebroadcast;
     }
-    if current_height > lvbh + EXPIRY_SLACK {
+    if expired(current_height, lvbh) {
         Decision::Expire
     } else {
         Decision::Rebroadcast
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecheckOutcome {
+    Fail,
+    Confirmed,
+    KeepOpen,
+    Expire,
+}
+
+pub fn recheck_outcome(status: Option<&SignatureStatus>) -> RecheckOutcome {
+    match status {
+        Some(st) if st.is_error() => RecheckOutcome::Fail,
+        Some(st) if st.is_finalized() => RecheckOutcome::Confirmed,
+        Some(st) if st.is_confirmed() => RecheckOutcome::KeepOpen,
+        _ => RecheckOutcome::Expire,
     }
 }
 
@@ -129,13 +157,13 @@ pub async fn reconcile_boot(
             }
         };
 
-        match decide(status.as_ref(), height, lvbh) {
+        match decide(status.as_ref(), Some(height), lvbh) {
             Decision::FinalizeSuccess => {
                 terminal!(intent.id, IntentStatus::Confirmed, None);
             }
             Decision::WaitFinality => {}
-            Decision::Fail(reason) => {
-                terminal!(intent.id, IntentStatus::Failed, Some(reason.as_str()));
+            Decision::Fail => {
+                terminal!(intent.id, IntentStatus::Failed, Some(ON_CHAIN_ERROR));
             }
             Decision::Expire => {
                 let recheck = match rpc.get_signature_statuses(&[sig.as_str()], true).await {
@@ -145,24 +173,20 @@ pub async fn reconcile_boot(
                         continue;
                     }
                 };
-                if let Some(s2) = recheck {
-                    if s2.is_error() {
-                        terminal!(intent.id, IntentStatus::Failed, Some("on-chain error"));
+                match recheck_outcome(recheck.as_ref()) {
+                    RecheckOutcome::Fail => {
+                        terminal!(intent.id, IntentStatus::Failed, Some(ON_CHAIN_ERROR));
                         continue;
                     }
-                    if s2.is_finalized() {
+                    RecheckOutcome::Confirmed => {
                         terminal!(intent.id, IntentStatus::Confirmed, None);
                         continue;
                     }
-                    if s2.is_confirmed() {
-                        continue;
+                    RecheckOutcome::KeepOpen => continue,
+                    RecheckOutcome::Expire => {
+                        terminal!(intent.id, IntentStatus::Expired, Some(BLOCKHASH_EXPIRED));
                     }
                 }
-                terminal!(
-                    intent.id,
-                    IntentStatus::Expired,
-                    Some("blockhash expired before confirmation"),
-                );
             }
             Decision::Rebroadcast => {
                 let Some(bytes) = intent.signed_tx else {
@@ -638,33 +662,33 @@ mod tests {
     #[test]
     fn confirmed_status_waits_and_finalized_confirms() {
         assert_eq!(
-            decide(Some(&status(false, Some("confirmed"))), 0, 0),
+            decide(Some(&status(false, Some("confirmed"))), Some(0), 0),
             Decision::WaitFinality
         );
         assert_eq!(
-            decide(Some(&status(false, Some("finalized"))), 0, 0),
+            decide(Some(&status(false, Some("finalized"))), Some(0), 0),
             Decision::FinalizeSuccess
         );
     }
 
     #[test]
     fn on_chain_error_decision_fails() {
-        match decide(Some(&status(true, Some("confirmed"))), 0, 0) {
-            Decision::Fail(_) => {}
-            d => panic!("expected Fail, got {d:?}"),
-        }
+        assert_eq!(
+            decide(Some(&status(true, Some("confirmed"))), Some(0), 0),
+            Decision::Fail
+        );
     }
 
     #[test]
     fn processed_is_in_flight_until_expiry() {
         assert_eq!(
-            decide(Some(&status(false, Some("processed"))), 0, 0),
+            decide(Some(&status(false, Some("processed"))), Some(0), 0),
             Decision::Rebroadcast
         );
         assert_eq!(
             decide(
                 Some(&status(false, Some("processed"))),
-                1000 + EXPIRY_SLACK + 1,
+                Some(1000 + EXPIRY_SLACK + 1),
                 1000,
             ),
             Decision::Expire
@@ -673,9 +697,9 @@ mod tests {
 
     #[test]
     fn unknown_within_window_rebroadcasts() {
-        assert_eq!(decide(None, 1000, 1000), Decision::Rebroadcast);
+        assert_eq!(decide(None, Some(1000), 1000), Decision::Rebroadcast);
         assert_eq!(
-            decide(None, 1000 + EXPIRY_SLACK, 1000),
+            decide(None, Some(1000 + EXPIRY_SLACK), 1000),
             Decision::Rebroadcast
         );
     }
@@ -683,8 +707,38 @@ mod tests {
     #[test]
     fn unknown_past_window_is_expire_candidate() {
         assert_eq!(
-            decide(None, 1000 + EXPIRY_SLACK + 1, 1000),
+            decide(None, Some(1000 + EXPIRY_SLACK + 1), 1000),
             Decision::Expire
         );
+    }
+
+    #[test]
+    fn decide_with_no_height_never_expires() {
+        assert_eq!(decide(None, None, 1000), Decision::Rebroadcast);
+        assert_eq!(
+            decide(Some(&status(false, Some("processed"))), None, 1000),
+            Decision::Rebroadcast
+        );
+    }
+
+    #[test]
+    fn recheck_outcome_maps_each_status() {
+        assert_eq!(
+            recheck_outcome(Some(&status(true, Some("confirmed")))),
+            RecheckOutcome::Fail
+        );
+        assert_eq!(
+            recheck_outcome(Some(&status(false, Some("finalized")))),
+            RecheckOutcome::Confirmed
+        );
+        assert_eq!(
+            recheck_outcome(Some(&status(false, Some("confirmed")))),
+            RecheckOutcome::KeepOpen
+        );
+        assert_eq!(
+            recheck_outcome(Some(&status(false, Some("processed")))),
+            RecheckOutcome::Expire
+        );
+        assert_eq!(recheck_outcome(None), RecheckOutcome::Expire);
     }
 }
