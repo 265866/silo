@@ -232,7 +232,7 @@ fn tombstone_dir(config_dir: &Path, id: &str) -> Result<PathBuf> {
             return Ok(path);
         }
     }
-    Err(anyhow!("could not choose a profile tombstone path"))
+    Err(anyhow!("Couldn't choose a profile tombstone path"))
 }
 
 fn tombstone_id(name: &str) -> Option<&str> {

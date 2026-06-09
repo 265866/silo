@@ -450,9 +450,9 @@ fn copy_selected_txid(app: &mut App) {
     };
     match intent.signature.clone() {
         Some(sig) => {
-            copy_text(app, &sig, "Copied transaction id", false);
+            copy_text(app, &sig, "Copied transaction ID", false);
         }
-        None => app.toast_info("No transaction id yet (not signed)"),
+        None => app.toast_info("No transaction ID yet (not signed)"),
     }
 }
 
@@ -698,7 +698,7 @@ fn prepare_send(app: &mut App) {
         }
     };
     if !app.reconcile_done {
-        app.toast_err("Still reconciling — sends are disabled");
+        app.toast_err("Still syncing transfers — sends are disabled");
         return;
     }
     if app.send_cmd(Command::PrepareSend {
@@ -763,7 +763,7 @@ fn execute_send(app: &mut App) {
     ) {
         (Ok(f), Ok(t), Ok(b)) => (f, t, b),
         _ => {
-            app.toast_err("Could not decode addresses for signing");
+            app.toast_err("Couldn't decode addresses for signing");
             return;
         }
     };
@@ -847,7 +847,7 @@ fn profile_select_keys(app: &mut App, key: KeyEvent) {
             if let Some(p) = app.profiles.get(app.profile_sel) {
                 let id = p.id.clone();
                 if let Err(e) = app.switch_to_profile(&id) {
-                    app.toast_err(format!("Could not open profile: {e}"));
+                    app.toast_err(format!("Couldn't open profile: {e}"));
                 }
             }
         }
