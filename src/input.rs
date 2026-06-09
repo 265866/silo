@@ -66,7 +66,9 @@ fn unlock_keys(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Enter => try_unlock(app),
         _ => {
-            edit_text(&mut app.input.passphrase, &key);
+            if edit_text(&mut app.input.passphrase, &key) {
+                app.unlock_failed = false;
+            }
         }
     }
 }
@@ -1251,6 +1253,53 @@ mod tests {
             balance_lamports: None,
             has_open_intent: false,
         }
+    }
+
+    #[test]
+    fn failed_unlock_sets_flag_empties_buffer_and_keystroke_clears_it() {
+        let mut h = harness(true);
+        h.app.route = Route::Unlock;
+        h.app.input.passphrase = Zeroizing::new("typed-while-waiting".to_string());
+
+        h.app.apply_app_event(AppEvent::UnlockComplete {
+            result: crate::app::UnlockResult::WrongPassphrase,
+            generation: h.app.generation.load(Ordering::SeqCst),
+        });
+        assert!(h.app.unlock_failed, "failed unlock must set the flag");
+        assert!(
+            h.app.input.passphrase.is_empty(),
+            "failed unlock must scrub the passphrase buffer"
+        );
+
+        unlock_keys(
+            &mut h.app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        assert!(
+            !h.app.unlock_failed,
+            "the next keystroke must clear the failed-unlock flag"
+        );
+        assert_eq!(h.app.input.passphrase.as_str(), "x");
+    }
+
+    #[test]
+    fn successful_unlock_clears_failed_flag() {
+        let mut h = harness(true);
+        h.app.route = Route::Unlock;
+        h.app.unlock_failed = true;
+        let seed = crypto::seed_from_mnemonic(&crypto::parse_mnemonic(TEST_MNEMONIC).unwrap());
+
+        h.app.apply_app_event(AppEvent::UnlockComplete {
+            result: crate::app::UnlockResult::Unlocked {
+                seed,
+                wallets: vec![],
+            },
+            generation: h.app.generation.load(Ordering::SeqCst),
+        });
+        assert!(
+            !h.app.unlock_failed,
+            "a successful unlock must clear the failed-unlock flag"
+        );
     }
 
     #[test]

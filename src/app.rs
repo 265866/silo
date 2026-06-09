@@ -646,6 +646,7 @@ pub struct App {
     pub(crate) send_confirm_armed: bool,
     pub(crate) send_confirm_armed_at: Option<Instant>,
     pub(crate) blocking_input: bool,
+    pub(crate) unlock_failed: bool,
 
     pub(crate) last_activity: Instant,
     pub(crate) last_wall: SystemTime,
@@ -728,6 +729,7 @@ impl App {
             send_confirm_armed: false,
             send_confirm_armed_at: None,
             blocking_input: false,
+            unlock_failed: false,
             last_activity: Instant::now(),
             last_wall: SystemTime::now(),
             #[cfg(target_os = "linux")]
@@ -937,6 +939,7 @@ impl App {
 
     pub fn switch_to_profile(&mut self, id: &str) -> anyhow::Result<()> {
         crate::profiles::validate_id(id)?;
+        self.unlock_failed = false;
         let old = self.generation.load(Ordering::SeqCst);
         self.bump_generation();
         if !self.send_cmd(Command::OpenProfile {
@@ -950,6 +953,14 @@ impl App {
         }
         self.blocking_input = true;
         Ok(())
+    }
+
+    pub fn current_profile_name(&self) -> Option<&str> {
+        let id = self.current_profile.as_deref()?;
+        self.profiles
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.name.as_str())
     }
 
     pub fn begin_new_profile(&mut self) {
@@ -1098,6 +1109,7 @@ impl App {
         self.setup.scrub_confirm();
         self.anim_balance.clear();
         self.hot_until = None;
+        self.unlock_failed = false;
         self.route = Route::Unlock;
         self.db.call_blocking(|d| {
             let _ = d.audit(crate::types::AuditEvent::Locked, &serde_json::json!({}));
@@ -1607,6 +1619,7 @@ impl App {
                     UnlockResult::Unlocked { seed, wallets } => {
                         self.seed = Some(seed);
                         self.wallets = wallets;
+                        self.unlock_failed = false;
                         self.clamp_list_selection();
                         self.route = Route::WalletList;
                         self.note_activity();
@@ -1614,7 +1627,11 @@ impl App {
                         self.request_balance_refresh();
                         self.toast_ok("Unlocked");
                     }
-                    UnlockResult::WrongPassphrase => self.toast_err("Wrong passphrase"),
+                    UnlockResult::WrongPassphrase => {
+                        self.input.passphrase.zeroize();
+                        self.unlock_failed = true;
+                        self.toast_err("Wrong passphrase");
+                    }
                     UnlockResult::AuditKey => {
                         self.modal = Some(Modal::Error {
                             title: "Cannot open audit log".into(),

@@ -10,12 +10,16 @@ use crate::types::{IntentStatus, Role};
 
 pub(super) fn profile_select(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
-    let h = (app.profiles.len() as u16 + 7).clamp(10, area.height.max(10));
-    let rect = super::centered_rect(60, h, area);
+    let h = (app.profiles.len() as u16 + 8).clamp(11, area.height.max(11));
+    let rect = super::centered_rect(72, h, area);
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "  Choose a wallet profile:",
+            "  Choose a profile:",
+            Style::default().fg(theme.text_muted),
+        )),
+        Line::from(Span::styled(
+            "  Each profile is a separate wallet with its own recovery phrase.",
             Style::default().fg(theme.text_muted),
         )),
         Line::from(""),
@@ -43,16 +47,27 @@ pub(super) fn profile_select(f: &mut Frame, app: &App, area: Rect) {
         }
     }
     f.render_widget(
-        Paragraph::new(lines).block(panel("silo — wallets", true, theme)),
+        Paragraph::new(lines).block(panel("silo — profiles", true, theme)),
         rect,
     );
 }
 
 pub(super) fn unlock(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
-    let rect = super::centered_rect(64, 9, area);
-    let block = panel("Unlock silo", true, theme);
+    let title = match app.current_profile_name() {
+        Some(name) => format!("Unlock — {}", format::truncate_end(name, 48)),
+        None => "Unlock silo".to_string(),
+    };
+    let block = panel(title, true, theme);
     let masked = format::input_tail(&"•".repeat(app.input.passphrase.chars().count()), 47);
+    let error_line = if app.unlock_failed {
+        Line::from(Span::styled(
+            "  Incorrect passphrase — try again",
+            Style::default().fg(theme.danger),
+        ))
+    } else {
+        Line::from("")
+    };
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -68,7 +83,15 @@ pub(super) fn unlock(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(masked, Style::default().fg(theme.accent)),
             Span::styled("▏", Style::default().fg(theme.accent)),
         ]),
+        error_line,
+        Line::from(""),
+        Line::from(Span::styled(
+            "  A forgotten passphrase can't be recovered — only the recovery phrase can.",
+            Style::default().fg(theme.text_muted),
+        )),
     ];
+    let height = lines.len() as u16 + 2;
+    let rect = super::centered_rect(78, height, area);
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 

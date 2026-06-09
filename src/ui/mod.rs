@@ -251,7 +251,7 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
 fn footer_hints(app: &App) -> String {
     let hints = match app.route {
         Route::ProfileSelect => {
-            "↑↓ move · enter open · n new wallet · r rename · d delete · q quit"
+            "↑↓ move · enter open · n new profile · r rename · d delete · q quit"
         }
         Route::Unlock => "type passphrase · enter unlock · ^C quit",
         Route::Setup => match app.setup.stage {
