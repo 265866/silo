@@ -121,7 +121,7 @@ pub fn create_vault(path: &Path, mnemonic: &Mnemonic, passphrase: &str) -> Resul
     Ok(VaultKey(key))
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn unlock_vault(path: &Path, passphrase: &str) -> Result<Mnemonic> {
     Ok(unlock_vault_keyed(path, passphrase)?.0)
 }
