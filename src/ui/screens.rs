@@ -4,7 +4,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table};
 
-use super::{LABEL_TEXT_W, LABEL_W, format, panel};
+use super::{LABEL_TEXT_W, LABEL_W, caret_if_focused, format, indent_span, label_span, panel};
 use crate::app::{App, SetupStage};
 use crate::types::{IntentStatus, Role};
 
@@ -76,10 +76,7 @@ pub(super) fn unlock(f: &mut Frame, app: &App, area: Rect) {
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled(
-                format!("  {:<w$}", "passphrase", w = LABEL_TEXT_W),
-                Style::default().fg(theme.text_muted),
-            ),
+            label_span("passphrase", theme),
             Span::styled(masked, Style::default().fg(theme.accent)),
             Span::styled("▏", Style::default().fg(theme.accent)),
         ]),
@@ -304,13 +301,7 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
             let block = panel("Set a passphrase", true, theme);
             let p1 = format::input_tail(&"•".repeat(app.input.passphrase.chars().count()), 45);
             let p2 = format::input_tail(&"•".repeat(app.input.passphrase2.chars().count()), 45);
-            let cur = |i: usize| {
-                if app.input.focus == i {
-                    Span::styled("▏", Style::default().fg(theme.accent))
-                } else {
-                    Span::raw("")
-                }
-            };
+            let cur = |i: usize| caret_if_focused(app.input.focus == i, theme);
             let pass = app.input.passphrase.as_str();
             let conf = app.input.passphrase2.as_str();
             let match_line = if pass.is_empty() && conf.is_empty() {
@@ -331,18 +322,12 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
                 )),
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled(
-                        format!("  {:<w$}", "passphrase", w = LABEL_TEXT_W),
-                        Style::default().fg(theme.text_muted),
-                    ),
+                    label_span("passphrase", theme),
                     Span::styled(p1, Style::default().fg(theme.accent)),
                     cur(0),
                 ]),
                 Line::from(vec![
-                    Span::styled(
-                        format!("  {:<w$}", "confirm", w = LABEL_TEXT_W),
-                        Style::default().fg(theme.text_muted),
-                    ),
+                    label_span("confirm", theme),
                     Span::styled(p2, Style::default().fg(theme.accent)),
                     cur(1),
                 ]),
@@ -512,11 +497,12 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
                 };
                 let pending = if w.has_open_intent { " ⏳" } else { "" };
                 let name_text = w.display_name();
-                let bal = match app.shown_balance(w) {
+                let shown = app.shown_balance(w);
+                let bal = match shown {
                     Some(l) => format!("{} SOL", format::fmt_sol(l)),
                     None => "…".to_string(),
                 };
-                let usd = match app.shown_balance(w) {
+                let usd = match shown {
                     Some(l) => format::fmt_usd(price, l),
                     None => "…".to_string(),
                 };
@@ -638,17 +624,11 @@ pub(super) fn wallet_detail(f: &mut Frame, app: &mut App, area: Rect) {
     let mut info = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled(
-                format!("  {:<w$}", "address", w = LABEL_TEXT_W),
-                Style::default().fg(theme.text_muted),
-            ),
+            label_span("address", theme),
             Span::styled(addr_str, Style::default().fg(theme.text)),
         ]),
         Line::from(vec![
-            Span::styled(
-                format!("  {:<w$}", "balance", w = LABEL_TEXT_W),
-                Style::default().fg(theme.text_muted),
-            ),
+            label_span("balance", theme),
             Span::styled(
                 bal.map(|l| format!("{} SOL", format::fmt_sol(l)))
                     .unwrap_or_else(|| "loading…".into()),
@@ -671,10 +651,7 @@ pub(super) fn wallet_detail(f: &mut Frame, app: &mut App, area: Rect) {
             ),
         ]),
         {
-            let mut spans = vec![Span::styled(
-                format!("  {:<w$}", "type", w = LABEL_TEXT_W),
-                Style::default().fg(theme.text_muted),
-            )];
+            let mut spans = vec![label_span("type", theme)];
             if is_master {
                 spans.push(Span::styled(
                     "★ master",
@@ -747,13 +724,7 @@ pub(super) fn send(f: &mut Frame, app: &App, area: Rect) {
         _ => (String::new(), theme.text_muted),
     };
 
-    let cur = |i: usize| {
-        if app.input.focus == i {
-            Span::styled("▏", Style::default().fg(theme.accent))
-        } else {
-            Span::raw("")
-        }
-    };
+    let cur = |i: usize| caret_if_focused(app.input.focus == i, theme);
 
     let lamports = app.compose_lamports().ok();
     let fiat = app.input.send_in_fiat;
@@ -816,7 +787,7 @@ pub(super) fn send(f: &mut Frame, app: &App, area: Rect) {
         format!(" {other_unit}")
     };
     let switch = Line::from(vec![
-        Span::styled(format!("{:>w$}", "", w = LABEL_W), Style::default()),
+        indent_span(),
         Span::styled(
             format!("[{active_unit}]"),
             Style::default()
@@ -849,10 +820,7 @@ pub(super) fn send(f: &mut Frame, app: &App, area: Rect) {
     let mut lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled(
-                format!("  {:<w$}", "to", w = LABEL_TEXT_W),
-                Style::default().fg(theme.text_muted),
-            ),
+            label_span("to", theme),
             Span::styled(
                 format::input_tail(&app.input.send_to, field_w),
                 Style::default().fg(theme.text),
@@ -1097,34 +1065,22 @@ pub(super) fn settings(f: &mut Frame, app: &App, area: Rect) {
     let lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled(
-                format!("  {:<w$}", "network", w = LABEL_TEXT_W),
-                Style::default().fg(theme.text_muted),
-            ),
+            label_span("network", theme),
             Span::styled("mainnet-beta", Style::default().fg(theme.text)),
         ]),
         Line::from(vec![
-            Span::styled(
-                format!("  {:<w$}", "rpc", w = LABEL_TEXT_W),
-                Style::default().fg(theme.text_muted),
-            ),
+            label_span("rpc", theme),
             Span::styled(
                 format::elide_middle(&crate::solana::rpc::redact_rpc_url(&app.rpc_url), 56),
                 Style::default().fg(theme.text),
             ),
         ]),
         Line::from(vec![
-            Span::styled(
-                format!("  {:<w$}", "confirmations", w = LABEL_TEXT_W),
-                Style::default().fg(theme.text_muted),
-            ),
+            label_span("confirmations", theme),
             Span::styled("standard", Style::default().fg(theme.text)),
         ]),
         Line::from(vec![
-            Span::styled(
-                format!("  {:<w$}", "currency", w = LABEL_TEXT_W),
-                Style::default().fg(theme.text_muted),
-            ),
+            label_span("currency", theme),
             Span::styled(
                 format!(
                     "{} ({})",
@@ -1136,10 +1092,7 @@ pub(super) fn settings(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("   (u to cycle)", Style::default().fg(theme.text_muted)),
         ]),
         Line::from(vec![
-            Span::styled(
-                format!("  {:<w$}", "priority", w = LABEL_TEXT_W),
-                Style::default().fg(theme.text_muted),
-            ),
+            label_span("priority", theme),
             Span::styled(
                 format!(
                     "{} (≈ {} SOL)",
@@ -1151,10 +1104,7 @@ pub(super) fn settings(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("   (p to cycle)", Style::default().fg(theme.text_muted)),
         ]),
         Line::from(vec![
-            Span::styled(
-                format!("  {:<w$}", "auto-lock", w = LABEL_TEXT_W),
-                Style::default().fg(theme.text_muted),
-            ),
+            label_span("auto-lock", theme),
             Span::styled(format!("{lock_min} min"), Style::default().fg(theme.text)),
             Span::styled("   (+/- to adjust)", Style::default().fg(theme.text_muted)),
         ]),
