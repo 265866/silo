@@ -280,20 +280,25 @@ fn next_wallet_name(profiles: &[crate::profiles::ProfileMeta]) -> String {
     format!("Wallet {}", max + 1)
 }
 
+enum WalletCheckError {
+    Mismatch,
+    Read(String),
+}
+
 fn wallet_consistency(
     db: &Storage,
     seed: &crate::crypto::Seed,
-) -> Result<Vec<crate::types::WalletRow>, String> {
+) -> Result<Vec<crate::types::WalletRow>, WalletCheckError> {
     let wallets = db
         .call_blocking(|d| d.list_wallets())
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| WalletCheckError::Read(e.to_string()))?;
     if wallets
         .iter()
         .all(|w| crate::crypto::derive_address(seed, w.account_index) == w.pubkey)
     {
         Ok(wallets)
     } else {
-        Err("wallet mismatch".to_string())
+        Err(WalletCheckError::Mismatch)
     }
 }
 
@@ -321,13 +326,13 @@ fn unlock_vault_blocking(
     }
     let wallets = match wallet_consistency(&db, &seed) {
         Ok(wallets) => wallets,
-        Err(e) if e == "wallet mismatch" => {
+        Err(WalletCheckError::Mismatch) => {
             db.call_blocking(|d| {
                 let _ = d.audit(AuditEvent::IntegrityCheckFailed, &serde_json::json!({}));
             });
             return UnlockResult::WalletMismatch;
         }
-        Err(e) => return UnlockResult::WalletRead(e),
+        Err(WalletCheckError::Read(e)) => return UnlockResult::WalletRead(e),
     };
     match db.call_blocking(|d| d.verify_audit_chain()) {
         Ok(true) => {
@@ -358,7 +363,7 @@ fn finish_setup_blocking(
     let seed = crate::crypto::seed_from_mnemonic(&mnemonic);
     match wallet_consistency(&db, &seed) {
         Ok(_) => {}
-        Err(e) if e == "wallet mismatch" => {
+        Err(WalletCheckError::Mismatch) => {
             db.call_blocking(|d| {
                 let _ = d.audit(AuditEvent::IntegrityCheckFailed, &serde_json::json!({}));
             });
@@ -367,7 +372,7 @@ fn finish_setup_blocking(
                     .to_string(),
             );
         }
-        Err(e) => {
+        Err(WalletCheckError::Read(e)) => {
             return SetupResult::Failed(format!(
                 "Wallet metadata couldn't be read: {e}. Refusing to proceed."
             ));
