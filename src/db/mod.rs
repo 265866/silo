@@ -1,17 +1,16 @@
 mod intents;
 mod wallets;
 
-pub use intents::{CreateIntentError, IntentTransitionError, IntentTransitionOutcome};
+pub use intents::{CreateIntentError, IntentTransitionOutcome};
 
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use crate::sync::MutexExt;
 use crate::types::{AuditEntry, AuditEvent, Network};
 
 const SCHEMA_VERSION: u32 = 2;
@@ -330,10 +329,6 @@ impl Db {
     fn require_audit_key(&self) -> Result<[u8; 32]> {
         self.audit_key
             .context("audit key unavailable (vault locked)")
-    }
-
-    pub fn audit_unlocked(&self) -> bool {
-        self.audit_key.is_some()
     }
 
     pub fn lock_audit_key(&mut self) {

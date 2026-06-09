@@ -18,14 +18,6 @@ pub enum PriceSource {
     CoinGecko,
     Jupiter,
 }
-impl PriceSource {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            PriceSource::CoinGecko => "CoinGecko",
-            PriceSource::Jupiter => "Jupiter",
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct SolPrice {
@@ -199,14 +191,6 @@ async fn fetch_price_with_endpoints(
             primary: Box::new(primary),
             fallback: Box::new(fallback),
         })
-}
-
-pub async fn fetch_price_fallback_only(
-    client: &reqwest::Client,
-    currency: Currency,
-) -> Result<SolPrice, PriceError> {
-    let endpoints = PriceEndpoints::live();
-    fetch_price_fallback_only_with_endpoints(client, currency, &endpoints).await
 }
 
 async fn fetch_price_fallback_only_with_endpoints(

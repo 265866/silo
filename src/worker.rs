@@ -6,7 +6,7 @@ use serde_json::json;
 use tokio::sync::{Semaphore, mpsc, watch};
 
 use crate::app::{
-    AppEvent, ClipboardCopyResult, Command, OptimisticTransfer, PasteTarget, ProfileDeleteResult,
+    AppEvent, ClipboardCopyResult, Command, OptimisticTransfer, ProfileDeleteResult,
     ProfileOpenedPayload, SendPersistResult, SettingChange, SetupResult, UnlockResult,
     WalletTextField,
 };

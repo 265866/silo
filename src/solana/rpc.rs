@@ -189,10 +189,6 @@ impl Rpc {
         }
     }
 
-    pub fn url(&self) -> &str {
-        &self.url
-    }
-
     async fn call<T: DeserializeOwned>(
         &self,
         method: &'static str,
