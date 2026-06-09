@@ -91,10 +91,7 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
                 ]),
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled(
-                        "   i ",
-                        Style::default().bg(theme.border_focus).fg(theme.text),
-                    ),
+                    Span::styled("   i ", Style::default().bg(theme.accent).fg(theme.bg)),
                     Span::styled(
                         "  Import an existing recovery phrase",
                         Style::default().fg(theme.text),
@@ -188,7 +185,7 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
                     } else if crate::crypto::word_is_valid(w) {
                         Style::default().fg(theme.usd)
                     } else {
-                        Style::default().fg(theme.warn)
+                        Style::default().fg(theme.danger)
                     };
                     let shown = if focused {
                         format!("{w:<8}▏")
@@ -341,7 +338,7 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
                     Span::raw("  ")
                 };
                 let pending = if w.has_open_intent { " ⏳" } else { "" };
-                let name_text = format!("{}{}", w.display_name(), pending);
+                let name_text = w.display_name();
                 let bal = match app.shown_balance(w) {
                     Some(l) => format!("{} SOL", format::fmt_sol(l)),
                     None => "…".to_string(),
@@ -368,12 +365,16 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
                     Cell::from(Line::from(vec![
                         star_span,
                         Span::styled(name_text, Style::default().fg(name_color)),
+                        Span::styled(pending, Style::default().fg(theme.warn)),
                     ])),
                     Cell::from(Span::styled(
                         format::elide_addr(&w.pubkey),
                         Style::default().fg(theme.text_muted),
                     )),
-                    Cell::from(Span::styled(bal, Style::default().fg(bal_color))),
+                    Cell::from(Span::styled(
+                        bal,
+                        Style::default().fg(bal_color).add_modifier(Modifier::BOLD),
+                    )),
                     Cell::from(Span::styled(usd, Style::default().fg(usd_color))),
                 ])
             }
@@ -519,8 +520,8 @@ pub(super) fn send(f: &mut Frame, app: &App, area: Rect) {
                         .iter()
                         .find(|w| w.pubkey == app.input.send_to.trim());
                     match dest {
-                        Some(d) => (format!("✔ valid ({})", d.display_name()), theme.accent),
-                        None => ("✔ valid (external)".to_string(), theme.accent),
+                        Some(d) => (format!("✓ valid ({})", d.display_name()), theme.usd),
+                        None => ("✓ valid (external)".to_string(), theme.usd),
                     }
                 }
                 Err(e) => (format!("⚠ {e}"), theme.danger),
@@ -696,12 +697,12 @@ fn render_intent_table(f: &mut Frame, app: &mut App, area: Rect, title: &str) {
 
 fn status_style(s: IntentStatus, theme: &super::theme::Theme) -> (String, ratatui::style::Color) {
     match s {
-        IntentStatus::Confirmed => ("confirmed ✓".into(), theme.accent),
+        IntentStatus::Confirmed => ("confirmed ✓".into(), theme.usd),
         IntentStatus::Failed => ("failed".into(), theme.danger),
         IntentStatus::Expired => ("expired".into(), theme.warn),
-        IntentStatus::Submitted => ("submitted ⏳".into(), theme.text_muted),
-        IntentStatus::Signed => ("signing ⏳".into(), theme.text_muted),
-        IntentStatus::Created => ("pending ⏳".into(), theme.text_muted),
+        IntentStatus::Submitted => ("submitted ⏳".into(), theme.warn),
+        IntentStatus::Signed => ("signing ⏳".into(), theme.warn),
+        IntentStatus::Created => ("pending ⏳".into(), theme.warn),
     }
 }
 
@@ -806,7 +807,7 @@ pub(super) fn settings(f: &mut Frame, app: &App, area: Rect) {
                     crate::money::priority_label(app.priority_micro),
                     format::fmt_sol_exact(crate::money::priority_fee_lamports(app.priority_micro))
                 ),
-                Style::default().fg(theme.accent),
+                Style::default().fg(theme.text),
             ),
             Span::styled("   (p to cycle)", Style::default().fg(theme.text_muted)),
         ]),
