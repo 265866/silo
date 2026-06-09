@@ -630,8 +630,6 @@ mod tests {
 
     fn status(err: bool, conf: Option<&str>) -> SignatureStatus {
         SignatureStatus {
-            slot: 1,
-            confirmations: None,
             err: if err { Some(json!("boom")) } else { None },
             confirmation_status: conf.map(String::from),
         }

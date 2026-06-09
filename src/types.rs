@@ -190,7 +190,6 @@ impl IntentStatus {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct Intent {
     pub id: i64,
     pub from_wallet: i64,
@@ -199,12 +198,15 @@ pub struct Intent {
     pub fee_lamports: Option<u64>,
     pub status: IntentStatus,
     pub signature: Option<String>,
+    #[allow(dead_code)]
     pub recent_blockhash: Option<String>,
     pub last_valid_block_height: Option<u64>,
     pub signed_tx: Option<Vec<u8>>,
     pub note: Option<String>,
+    #[allow(dead_code)]
     pub error: Option<String>,
     pub created_at: i64,
+    #[allow(dead_code)]
     pub updated_at: i64,
 }
 
@@ -286,13 +288,15 @@ impl AuditEvent {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct AuditEntry {
+    #[allow(dead_code)]
     pub id: i64,
     pub ts: i64,
     pub event_type: String,
     pub details: serde_json::Value,
+    #[allow(dead_code)]
     pub prev_hash: Option<String>,
+    #[allow(dead_code)]
     pub row_hash: String,
 }
 

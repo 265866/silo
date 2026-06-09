@@ -13,11 +13,7 @@ const SIGSTATUS_CHUNK: usize = 256;
 const RETRY_AFTER_CAP_SECS: u64 = 60;
 
 #[derive(Clone, Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct SignatureStatus {
-    pub slot: u64,
-    #[serde(default)]
-    pub confirmations: Option<u64>,
     #[serde(default)]
     pub err: Option<serde_json::Value>,
     #[serde(rename = "confirmationStatus", default)]
