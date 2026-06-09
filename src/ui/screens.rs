@@ -10,12 +10,16 @@ use crate::types::{IntentStatus, Role};
 
 pub(super) fn profile_select(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
-    let h = (app.profiles.len() as u16 + 7).clamp(10, area.height.max(10));
-    let rect = super::centered_rect(60, h, area);
+    let h = (app.profiles.len() as u16 + 8).clamp(11, area.height.max(11));
+    let rect = super::centered_rect(72, h, area);
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "  Choose a wallet profile:",
+            "  Choose a profile:",
+            Style::default().fg(theme.text_muted),
+        )),
+        Line::from(Span::styled(
+            "  Each profile is a separate wallet with its own recovery phrase.",
             Style::default().fg(theme.text_muted),
         )),
         Line::from(""),
@@ -43,7 +47,7 @@ pub(super) fn profile_select(f: &mut Frame, app: &App, area: Rect) {
         }
     }
     f.render_widget(
-        Paragraph::new(lines).block(panel("silo — wallets", true, theme)),
+        Paragraph::new(lines).block(panel("silo — profiles", true, theme)),
         rect,
     );
 }
