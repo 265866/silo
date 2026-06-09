@@ -341,6 +341,7 @@ fn wallet_list_keys(app: &mut App, key: KeyEvent) {
             app.refresh_audit();
         }
         KeyCode::Char('g') => app.route = Route::Settings,
+        KeyCode::Char('U') => copy_changelog(app),
         KeyCode::Char('*') => app.celebrate_center(),
         _ => {}
     }
@@ -384,6 +385,15 @@ fn copy_text(app: &mut App, text: &str, ok_label: &str, arm_hot_refresh: bool) -
 
 fn copy_addr(app: &mut App, addr: &str) {
     copy_text(app, addr, "Copied address", true);
+}
+
+fn copy_changelog(app: &mut App) {
+    match app.changelog_url() {
+        Some(url) => {
+            copy_text(app, &url, "Copied changelog link", false);
+        }
+        None => app.toast_info("You're on the latest version"),
+    }
 }
 
 fn copy_selected_txid(app: &mut App) {
@@ -472,6 +482,7 @@ fn wallet_detail_keys(app: &mut App, key: KeyEvent) {
             app.route = Route::History;
             app.refresh_detail_intents();
         }
+        KeyCode::Char('U') => copy_changelog(app),
         _ => {}
     }
 }
@@ -833,6 +844,12 @@ fn settings_keys(app: &mut App, key: KeyEvent) {
             let currency = app.currency.next();
             app.send_cmd(Command::PersistSetting {
                 change: crate::app::SettingChange::Currency(currency),
+            });
+        }
+        KeyCode::Char('U') => {
+            let on = !app.update_check_enabled;
+            app.send_cmd(Command::PersistSetting {
+                change: crate::app::SettingChange::UpdateCheck(on),
             });
         }
         KeyCode::Char('L') => {

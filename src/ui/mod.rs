@@ -155,6 +155,10 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
     }
 
     let mut left = vec![
+        Span::styled(
+            format!("v{}  ", crate::update::CURRENT_VERSION),
+            Style::default().fg(theme.text_muted),
+        ),
         Span::styled("● ", Style::default().fg(dot_color)),
         Span::styled(net_label, Style::default().fg(theme.text)),
         Span::styled(" · confirmed", Style::default().fg(theme.text_muted)),
@@ -169,6 +173,14 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
         left.push(Span::styled(
             format!("  {} ", app.spinner()),
             Style::default().fg(theme.accent),
+        ));
+    }
+    if let Some(latest) = app.update_available() {
+        left.push(Span::styled(
+            format!("  ↑{latest}"),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -229,9 +241,15 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
         Route::History => "↑↓ scroll · c copy txid · t note · esc back",
         Route::AuditLog => "↑↓ scroll · esc back",
         Route::Settings => {
-            "e edit RPC · u currency · p priority · +/- auto-lock · L lock now · esc back"
+            "e edit RPC · u currency · p priority · +/- auto-lock · U updates · L lock now · esc back"
         }
     };
+    let mut hints = hints.to_string();
+    if app.update_available().is_some()
+        && matches!(app.route, Route::WalletList | Route::WalletDetail)
+    {
+        hints.push_str(" · U changelog");
+    }
     let p = Paragraph::new(Line::from(Span::styled(
         format!(" {hints}"),
         Style::default().fg(app.theme.text_muted),

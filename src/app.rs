@@ -57,6 +57,7 @@ pub enum SettingChange {
     Currency(crate::types::Currency),
     Priority(u64),
     AutoLock(u64),
+    UpdateCheck(bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +71,7 @@ pub enum Command {
     Reconcile,
     FetchRentExempt,
     FetchPrice,
+    CheckForUpdate,
     RefreshBalances {
         include_archived: bool,
     },
@@ -322,6 +324,9 @@ pub enum AppEvent {
         status: NetStatus,
         generation: u64,
     },
+    UpdateStatus {
+        latest: String,
+    },
     Error {
         message: String,
         generation: u64,
@@ -358,6 +363,7 @@ impl AppEvent {
             | AppEvent::RpcChanged { generation, .. }
             | AppEvent::NetStatus { generation, .. }
             | AppEvent::Error { generation, .. } => *generation,
+            AppEvent::UpdateStatus { .. } => 0,
         }
     }
 }
@@ -658,6 +664,10 @@ pub struct App {
     pub(crate) price_flash: f32,
     pub(crate) price_up: bool,
     last_price: Option<f64>,
+    pub(crate) install_method: crate::update::InstallMethod,
+    pub(crate) latest_version: Option<String>,
+    pub(crate) update_check_enabled: bool,
+    update_notified: bool,
     needs_redraw: bool,
 }
 
@@ -735,6 +745,10 @@ impl App {
             price_flash: 0.0,
             price_up: true,
             last_price: None,
+            install_method: crate::update::InstallMethod::detect(),
+            latest_version: None,
+            update_check_enabled: true,
+            update_notified: false,
             needs_redraw: true,
         }
     }
@@ -762,6 +776,46 @@ impl App {
         } else {
             self.route = Route::ProfileSelect;
         }
+    }
+
+    pub fn init_update_check(
+        &mut self,
+        enabled: bool,
+        latest_seen: Option<String>,
+        do_check: bool,
+    ) {
+        self.update_check_enabled = enabled;
+        self.latest_version = latest_seen;
+        if enabled && do_check {
+            self.send_cmd(Command::CheckForUpdate);
+        }
+    }
+
+    pub fn set_latest_version(&mut self, latest: String) {
+        self.latest_version = Some(latest);
+        if !self.update_notified && self.update_available().is_some() {
+            self.update_notified = true;
+            let latest = self.latest_version.clone().unwrap_or_default();
+            self.toast_info(format!(
+                "v{latest} available — press U to copy the changelog"
+            ));
+        }
+    }
+
+    pub fn update_available(&self) -> Option<&str> {
+        if !self.update_check_enabled {
+            return None;
+        }
+        let latest = self.latest_version.as_deref()?;
+        if crate::update::is_newer(latest, crate::update::CURRENT_VERSION) {
+            Some(latest)
+        } else {
+            None
+        }
+    }
+
+    pub fn changelog_url(&self) -> Option<String> {
+        self.update_available().map(crate::update::changelog_url)
     }
 
     pub fn is_running(&self) -> bool {
@@ -1406,6 +1460,10 @@ impl App {
     }
 
     pub fn apply_app_event(&mut self, ev: AppEvent) {
+        if let AppEvent::UpdateStatus { latest } = ev {
+            self.set_latest_version(latest);
+            return;
+        }
         if matches!(ev, AppEvent::SendPrepared { .. } | AppEvent::Error { .. }) {
             self.preparing_send = false;
         }
@@ -1413,6 +1471,7 @@ impl App {
             return;
         }
         match ev {
+            AppEvent::UpdateStatus { .. } => {}
             AppEvent::ReconcileComplete { resolved, .. } => {
                 self.reconcile_done = true;
                 if self.net_status == NetStatus::Syncing {
@@ -1789,6 +1848,15 @@ impl App {
                     self.auto_lock_after = Duration::from_secs(m * 60);
                     self.toast_info(format!("Auto-lock after {m} min"));
                 }
+                (SettingChange::UpdateCheck(on), Ok(())) => {
+                    self.update_check_enabled = on;
+                    if on {
+                        self.send_cmd(Command::CheckForUpdate);
+                        self.toast_info("Update checks on");
+                    } else {
+                        self.toast_info("Update checks off");
+                    }
+                }
                 (SettingChange::Currency(_), Err(e)) => {
                     self.toast_err(format!("Could not save currency: {e}"))
                 }
@@ -1797,6 +1865,9 @@ impl App {
                 }
                 (SettingChange::AutoLock(_), Err(e)) => {
                     self.toast_err(format!("Could not save auto-lock: {e}"))
+                }
+                (SettingChange::UpdateCheck(_), Err(e)) => {
+                    self.toast_err(format!("Could not save update setting: {e}"))
                 }
             },
             AppEvent::WalletTextSet { field, result, .. } => match result {
