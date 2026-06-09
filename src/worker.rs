@@ -14,7 +14,10 @@ use crate::db::{IntentTransitionOutcome, Storage};
 use crate::price::{
     COINGECKO_BACKOFF_SECS, PriceCache, SolPrice, fetch_price, fetch_price_backoff_aware,
 };
-use crate::solana::reconcile::{EXPIRY_SLACK, reconcile_boot};
+use crate::solana::reconcile::{
+    BLOCKHASH_EXPIRED, Decision, ON_CHAIN_ERROR, RecheckOutcome, decide, recheck_outcome,
+    reconcile_boot,
+};
 use crate::solana::rpc::Rpc;
 use crate::sync::MutexExt;
 use crate::types::{AuditEvent, IntentStatus, NetStatus, TransferOutcome};
@@ -1209,42 +1212,6 @@ async fn sig_status(rpc: &Rpc, sig: &str) -> Option<crate::solana::rpc::Signatur
         .and_then(|v| v.into_iter().next().flatten())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PollDecision {
-    Continue,
-    WaitFinality,
-    Confirm,
-    Fail,
-    ExpireCandidate,
-}
-
-fn poll_decision(
-    status: Option<&crate::solana::rpc::SignatureStatus>,
-    height: Option<u64>,
-    lvbh: u64,
-) -> PollDecision {
-    if let Some(st) = status {
-        if st.is_error() {
-            return PollDecision::Fail;
-        }
-        if st.is_finalized() {
-            return PollDecision::Confirm;
-        }
-        if st.is_confirmed() {
-            return PollDecision::WaitFinality;
-        }
-        if height.is_some_and(|h| h > lvbh + EXPIRY_SLACK) {
-            return PollDecision::ExpireCandidate;
-        }
-        return PollDecision::Continue;
-    }
-    if height.is_some_and(|h| h > lvbh + EXPIRY_SLACK) {
-        PollDecision::ExpireCandidate
-    } else {
-        PollDecision::Continue
-    }
-}
-
 async fn rebroadcast_if_due(
     rpc: &Rpc,
     bytes: &[u8],
@@ -1439,22 +1406,22 @@ async fn poll_confirmation(
             } else {
                 None
             };
-            match poll_decision(status.as_ref(), height, lvbh) {
-                PollDecision::Fail => {
+            match decide(status.as_ref(), height, lvbh) {
+                Decision::Fail => {
                     finalize(
                         &db,
                         &evt,
                         intent_id,
                         &sig,
                         IntentStatus::Failed,
-                        Some("on-chain error"),
+                        Some(ON_CHAIN_ERROR),
                         &generation,
                         cmd_gen,
                     )
                     .await;
                     return;
                 }
-                PollDecision::Confirm => {
+                Decision::FinalizeSuccess => {
                     finalize(
                         &db,
                         &evt,
@@ -1468,7 +1435,7 @@ async fn poll_confirmation(
                     .await;
                     return;
                 }
-                PollDecision::Continue => {
+                Decision::Rebroadcast => {
                     if let Err(returned) =
                         rebroadcast_if_due(&rpc, &bytes, &sig, lvbh, &mut last_rebroadcast).await
                     {
@@ -1495,54 +1462,52 @@ async fn poll_confirmation(
                         return;
                     }
                 }
-                PollDecision::WaitFinality => {}
-                PollDecision::ExpireCandidate => {
-                    if let Some(s2) = sig_status(&rpc, &sig).await {
-                        if s2.is_error() {
-                            finalize(
-                                &db,
-                                &evt,
-                                intent_id,
-                                &sig,
-                                IntentStatus::Failed,
-                                Some("on-chain error"),
-                                &generation,
-                                cmd_gen,
-                            )
-                            .await;
-                            return;
-                        }
-                        if s2.is_finalized() {
-                            finalize(
-                                &db,
-                                &evt,
-                                intent_id,
-                                &sig,
-                                IntentStatus::Confirmed,
-                                None,
-                                &generation,
-                                cmd_gen,
-                            )
-                            .await;
-                            return;
-                        }
-                        if s2.is_confirmed() {
-                            continue;
-                        }
+                Decision::WaitFinality => {}
+                Decision::Expire => match recheck_outcome(sig_status(&rpc, &sig).await.as_ref()) {
+                    RecheckOutcome::Fail => {
+                        finalize(
+                            &db,
+                            &evt,
+                            intent_id,
+                            &sig,
+                            IntentStatus::Failed,
+                            Some(ON_CHAIN_ERROR),
+                            &generation,
+                            cmd_gen,
+                        )
+                        .await;
+                        return;
                     }
-                    finalize(
-                        &db,
-                        &evt,
-                        intent_id,
-                        &sig,
-                        IntentStatus::Expired,
-                        Some("blockhash expired before confirmation"),
-                        &generation,
-                        cmd_gen,
-                    )
-                    .await;
-                    return;
-                }
+                    RecheckOutcome::Confirmed => {
+                        finalize(
+                            &db,
+                            &evt,
+                            intent_id,
+                            &sig,
+                            IntentStatus::Confirmed,
+                            None,
+                            &generation,
+                            cmd_gen,
+                        )
+                        .await;
+                        return;
+                    }
+                    RecheckOutcome::KeepOpen => continue,
+                    RecheckOutcome::Expire => {
+                        finalize(
+                            &db,
+                            &evt,
+                            intent_id,
+                            &sig,
+                            IntentStatus::Expired,
+                            Some(BLOCKHASH_EXPIRED),
+                            &generation,
+                            cmd_gen,
+                        )
+                        .await;
+                        return;
+                    }
+                },
             }
         }
 
@@ -2619,38 +2584,39 @@ mod tests {
     }
 
     #[test]
-    fn poll_decision_covers_terminal_and_pending_states() {
+    fn decide_covers_terminal_and_pending_states() {
+        use crate::solana::reconcile::EXPIRY_SLACK;
         assert_eq!(
-            poll_decision(Some(&status(false, Some("confirmed"))), None, 100),
-            PollDecision::WaitFinality
+            decide(Some(&status(false, Some("confirmed"))), None, 100),
+            Decision::WaitFinality
         );
         assert_eq!(
-            poll_decision(Some(&status(false, Some("finalized"))), None, 100),
-            PollDecision::Confirm
+            decide(Some(&status(false, Some("finalized"))), None, 100),
+            Decision::FinalizeSuccess
         );
         assert_eq!(
-            poll_decision(Some(&status(true, Some("confirmed"))), None, 100),
-            PollDecision::Fail
+            decide(Some(&status(true, Some("confirmed"))), None, 100),
+            Decision::Fail
         );
         assert_eq!(
-            poll_decision(Some(&status(false, Some("processed"))), None, 100),
-            PollDecision::Continue
+            decide(Some(&status(false, Some("processed"))), None, 100),
+            Decision::Rebroadcast
         );
         assert_eq!(
-            poll_decision(
+            decide(
                 Some(&status(false, Some("processed"))),
                 Some(100 + EXPIRY_SLACK + 1),
                 100,
             ),
-            PollDecision::ExpireCandidate
+            Decision::Expire
         );
         assert_eq!(
-            poll_decision(None, Some(100 + EXPIRY_SLACK), 100),
-            PollDecision::Continue
+            decide(None, Some(100 + EXPIRY_SLACK), 100),
+            Decision::Rebroadcast
         );
         assert_eq!(
-            poll_decision(None, Some(100 + EXPIRY_SLACK + 1), 100),
-            PollDecision::ExpireCandidate
+            decide(None, Some(100 + EXPIRY_SLACK + 1), 100),
+            Decision::Expire
         );
     }
 }
