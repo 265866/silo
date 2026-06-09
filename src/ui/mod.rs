@@ -194,11 +194,19 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
         dot_color = blend(dot_color, theme.bg, 0.55 * (1.0 - pulse(app.spinner_frame)));
     }
 
-    let mut left = match app.net_status {
-        NetStatus::Online => vec![Span::styled("● ", Style::default().fg(dot_color))],
-        NetStatus::Syncing => vec![Span::styled("● syncing ", Style::default().fg(dot_color))],
-        NetStatus::Offline => vec![Span::styled("● offline ", Style::default().fg(dot_color))],
-    };
+    let mut left = vec![
+        Span::styled("  ● ", Style::default().fg(dot_color)),
+        Span::styled(
+            crate::solana::rpc::rpc_host_label(&app.rpc_url),
+            Style::default().fg(theme.text_muted),
+        ),
+    ];
+    if app.net_status == NetStatus::Offline {
+        left.push(Span::styled(
+            " · offline",
+            Style::default().fg(theme.danger),
+        ));
+    }
     if app.update_available().is_some() {
         left.push(Span::styled(
             "update available ",

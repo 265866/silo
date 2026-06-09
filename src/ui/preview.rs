@@ -1699,6 +1699,33 @@ fn update_footer_suffix_reads_upgrade_not_changelog() {
 }
 
 #[test]
+fn status_dot_shows_rpc_host_and_offline_word() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.latest_version = None;
+    app.route = Route::WalletList;
+    app.net_status = NetStatus::Online;
+
+    let host = crate::solana::rpc::rpc_host_label(&app.rpc_url);
+    let out = render(&mut app);
+    assert!(
+        out.contains(&host),
+        "status bar must show the RPC host label {host:?}:\n{out}"
+    );
+    assert!(
+        !out.contains("● syncing"),
+        "status bar must drop the bare '● syncing' label:\n{out}"
+    );
+
+    app.net_status = NetStatus::Offline;
+    let out = render(&mut app);
+    assert!(
+        out.contains("offline"),
+        "offline status bar must surface the 'offline' word:\n{out}"
+    );
+}
+
+#[test]
 fn post_send_toasts_carry_transfer_noun() {
     let mut app = test_app();
     let cur_gen = app.generation.load(std::sync::atomic::Ordering::SeqCst);
