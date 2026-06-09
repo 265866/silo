@@ -146,7 +146,7 @@ fn shimmer_line(
 fn status_bar(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
     let mut dot_color = match app.net_status {
-        NetStatus::Online => theme.accent,
+        NetStatus::Online => theme.usd,
         NetStatus::Syncing => theme.warn,
         NetStatus::Offline => theme.danger,
     };
@@ -154,7 +154,11 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
         dot_color = blend(dot_color, theme.bg, 0.55 * (1.0 - pulse(app.spinner_frame)));
     }
 
-    let mut left = vec![Span::styled("● ", Style::default().fg(dot_color))];
+    let mut left = match app.net_status {
+        NetStatus::Online => vec![Span::styled("● ", Style::default().fg(dot_color))],
+        NetStatus::Syncing => vec![Span::styled("● syncing ", Style::default().fg(dot_color))],
+        NetStatus::Offline => vec![Span::styled("● offline ", Style::default().fg(dot_color))],
+    };
     if app.update_available().is_some() {
         left.push(Span::styled(
             "Update available! ",
@@ -186,11 +190,7 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
     } else {
         ""
     };
-    let flash_to = if app.price_up {
-        theme.usd
-    } else {
-        theme.danger
-    };
+    let flash_to = if app.price_up { theme.usd } else { theme.warn };
     let price_color = blend(theme.text_muted, flash_to, app.price_flash);
     let right = Span::styled(format!("{price}{arrow}"), Style::default().fg(price_color));
 
