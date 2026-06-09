@@ -569,9 +569,11 @@ fn fill_max_amount(app: &mut App) {
         match crate::money::max_send_keep_alive(bal, app.send_fee(), app.rent_exempt_min) {
             Some(max) => {
                 app.input.send_in_fiat = false;
-                app.input.send_amount = crate::money::format_lamports(max);
+                let amt = crate::money::format_lamports(max);
+                app.input.send_amount = amt.clone();
+                app.toast_info(format!("Filled max: {amt} SOL (keeps wallet open)"));
             }
-            None => app.toast_err("Balance too low to send while staying rent-exempt"),
+            None => app.toast_err("Not enough SOL — accounts must keep a small minimum balance"),
         }
     }
 }
@@ -583,9 +585,11 @@ fn fill_drain_amount(app: &mut App) {
         match crate::money::max_send_drain(bal, app.send_fee()) {
             Some(max) => {
                 app.input.send_in_fiat = false;
-                app.input.send_amount = crate::money::format_lamports(max);
+                let amt = crate::money::format_lamports(max);
+                app.input.send_amount = amt.clone();
+                app.toast_info(format!("Filled all: {amt} SOL (empties wallet)"));
             }
-            None => app.toast_err("Balance too low to cover the fee"),
+            None => app.toast_err("Not enough SOL to cover the fee"),
         }
     }
 }

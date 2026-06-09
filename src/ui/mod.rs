@@ -257,9 +257,11 @@ fn footer_hints(app: &App) -> String {
         Route::Setup => "c create · i import · enter continue · esc back",
         Route::WalletList => "enter open · s send · n new · c copy · ^L lock · q quit",
         Route::WalletDetail => "s send · M →master · F fund · c copy · h history · esc back",
-        Route::Send => {
-            "tab field · c SOL/fiat · m max · a all · enter review · ^V paste · esc cancel"
+        Route::Send if app.input.focus == 1 => {
+            "tab field · c SOL/fiat · m max (keep open) · a all (empty wallet) · enter review · ^V \
+             paste · esc cancel"
         }
+        Route::Send => "tab field · enter review · ^V paste · esc cancel",
         Route::History => "↑↓ scroll · c copy txid · t note · esc back",
         Route::AuditLog => "↑↓ scroll · esc back",
         Route::Settings => {
