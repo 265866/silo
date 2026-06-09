@@ -585,6 +585,121 @@ fn confirm_send_shows_large_send_banner_when_armed() {
     );
 }
 
+const VALID_EXTERNAL: &str = "HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk";
+
+fn send_from_master(app: &mut App) -> i64 {
+    let id = app
+        .wallets
+        .iter()
+        .find(|w| w.account_index == 0)
+        .map(|w| w.id)
+        .unwrap();
+    app.focused_wallet = Some(id);
+    app.route = Route::Send;
+    app.input.send_to = VALID_EXTERNAL.into();
+    id
+}
+
+#[test]
+fn send_amount_label_tracks_denomination() {
+    let mut app = fuzz_app();
+    send_from_master(&mut app);
+    app.input.send_amount = "2.5".into();
+    app.input.focus = 1;
+
+    app.input.send_in_fiat = false;
+    let sol = render(&mut app);
+    assert!(
+        sol.contains("amount"),
+        "amount field keeps a plain label:\n{sol}"
+    );
+    assert!(
+        sol.contains("[SOL]") && sol.contains("c to switch"),
+        "switch indicator must mark the active unit and the toggle key:\n{sol}"
+    );
+
+    app.input.send_in_fiat = true;
+    let fiat = render(&mut app);
+    assert!(
+        fiat.contains("[USD]"),
+        "switch indicator must mark the active fiat unit:\n{fiat}"
+    );
+}
+
+#[test]
+fn send_warns_when_amount_trips_source_floor() {
+    let mut app = fuzz_app();
+    let id = send_from_master(&mut app);
+    let fee = app.send_fee();
+    let min = app.rent_exempt_min;
+    let amount = 1_000_000_000u64;
+    if let Some(w) = app.wallets.iter_mut().find(|w| w.id == id) {
+        w.balance_lamports = Some(amount + fee + min / 2);
+    }
+    app.input.send_amount = "1".into();
+    let out = render(&mut app);
+    assert!(
+        out.contains("below the minimum balance"),
+        "must warn the send would drop the wallet below the minimum:\n{out}"
+    );
+    assert!(
+        !out.contains("rent-exempt"),
+        "must not expose the rent-exempt jargon:\n{out}"
+    );
+}
+
+#[test]
+fn send_warns_on_underfunded_first_deposit() {
+    let mut app = fuzz_app();
+    send_from_master(&mut app);
+    app.input.send_in_fiat = false;
+    app.input.send_amount = "0.0001".into();
+    let out = render(&mut app);
+    assert!(
+        out.contains("first deposit to a new address must be at least"),
+        "must warn that a first deposit must clear the minimum:\n{out}"
+    );
+}
+
+#[test]
+fn send_floor_note_stays_quiet_at_zero_amount() {
+    let mut app = fuzz_app();
+    send_from_master(&mut app);
+    app.input.send_in_fiat = false;
+    app.input.send_amount = "0".into();
+    let out = render(&mut app);
+    assert!(
+        !out.contains("first deposit"),
+        "zero amount must not surface the first-deposit floor note:\n{out}"
+    );
+    assert!(
+        !out.contains('⚠'),
+        "zero amount must not surface any floor warning:\n{out}"
+    );
+}
+
+#[test]
+fn send_avail_fee_line_never_leads_with_separator_when_loading() {
+    let mut app = fuzz_app();
+    let id = send_from_master(&mut app);
+    if let Some(w) = app.wallets.iter_mut().find(|w| w.id == id) {
+        w.balance_lamports = None;
+    }
+    app.input.send_amount.clear();
+    let out = render(&mut app);
+    assert!(
+        out.contains("available … · fee ≈"),
+        "loading balance must render an ellipsis, not a bare separator:\n{out}"
+    );
+    for line in out.lines() {
+        let t = line.trim_start();
+        assert!(
+            !t.starts_with('·'),
+            "no rendered line may lead with the separator:\n{out}"
+        );
+    }
+}
+
 #[test]
 fn wallet_list_footer_keeps_lock_and_quit() {
     for w in [80u16, 60] {
