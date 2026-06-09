@@ -114,6 +114,25 @@ pub fn panel(title: impl Into<String>, focused: bool, theme: &Theme) -> Block<'s
         .style(Style::default().bg(theme.bg))
 }
 
+pub(super) fn label_span(text: &str, theme: &Theme) -> Span<'static> {
+    Span::styled(
+        format!("  {text:<w$}", w = LABEL_TEXT_W),
+        Style::default().fg(theme.text_muted),
+    )
+}
+
+pub(super) fn indent_span() -> Span<'static> {
+    Span::styled(format!("{:w$}", "", w = LABEL_W), Style::default())
+}
+
+pub(super) fn caret_if_focused(focused: bool, theme: &Theme) -> Span<'static> {
+    if focused {
+        Span::styled("▏", Style::default().fg(theme.accent))
+    } else {
+        Span::raw("")
+    }
+}
+
 pub fn blend(a: ratatui::style::Color, b: ratatui::style::Color, t: f32) -> ratatui::style::Color {
     use ratatui::style::Color;
     let t = t.clamp(0.0, 1.0);
@@ -599,14 +618,9 @@ fn render_confirm_send(f: &mut Frame, app: &App, area: Rect) {
     let from_addr = format::elide_middle(&from_addr, addr_w);
     let to_addr = format::elide_middle(&ps.to, addr_w);
 
-    let label = |s: &str| {
-        Span::styled(
-            format!("  {s:<w$}", w = LABEL_TEXT_W),
-            Style::default().fg(theme.text_muted),
-        )
-    };
+    let label = |s: &str| label_span(s, theme);
     let val = |s: String| Span::styled(s, Style::default().fg(theme.text));
-    let indent = || Span::styled(format!("{:w$}", "", w = LABEL_W), Style::default());
+    let indent = || indent_span();
 
     let mut send_spans = vec![
         label("send"),
