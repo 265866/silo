@@ -788,7 +788,7 @@ impl App {
             self.update_notified = true;
             let latest = self.latest_version.clone().unwrap_or_default();
             self.toast_info(format!(
-                "v{latest} available — press U to copy the changelog"
+                "v{latest} available — press U to copy the upgrade command"
             ));
         }
     }
@@ -800,10 +800,6 @@ impl App {
         } else {
             None
         }
-    }
-
-    pub fn changelog_url(&self) -> Option<String> {
-        self.update_available().map(crate::update::changelog_url)
     }
 
     pub fn is_running(&self) -> bool {

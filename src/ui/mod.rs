@@ -17,16 +17,34 @@ use crate::app::{App, Modal, Route, ToastKind};
 use crate::types::NetStatus;
 use theme::Theme;
 
+const MIN_WIDTH: u16 = 60;
+const MIN_HEIGHT: u16 = 16;
+
 pub fn render(f: &mut Frame, app: &mut App) {
     let theme = app.theme;
     let area = f.area();
     app.last_area = area;
     f.render_widget(Block::default().style(Style::default().bg(theme.bg)), area);
 
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        let p = Paragraph::new(Line::from(Span::styled(
+            "silo needs at least 60x16 — please resize",
+            Style::default().fg(theme.text),
+        )))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true });
+        let rect = centered_rect(area.width, 1, area);
+        f.render_widget(p, rect);
+        return;
+    }
+
+    let footer_text = footer_hints(app);
+    let footer_h = footer_height(&footer_text, area.width);
+
     let chunks = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
-        Constraint::Length(2),
+        Constraint::Length(footer_h),
     ])
     .split(area);
 
@@ -44,8 +62,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
         Route::Settings => screens::settings(f, app, chunks[1]),
     }
 
-    footer(f, app, chunks[2]);
-    render_toasts(f, app, chunks[1]);
+    footer(f, app, &footer_text, chunks[2]);
+    render_toasts(f, app, chunks[2]);
 
     if app.modal.is_some() {
         render_modal(f, app, area);
@@ -164,14 +182,14 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
     };
     if app.update_available().is_some() {
         left.push(Span::styled(
-            "Update available! ",
+            "update available ",
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ));
         left.push(Span::styled(
-            app.install_method.upgrade_hint().to_string(),
-            Style::default().fg(theme.text),
+            "· press U for upgrade command",
+            Style::default().fg(theme.text_muted),
         ));
     }
     if !app.reconcile_done {
@@ -222,6 +240,7 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(right.width() as u16 + 1),
     ])
     .split(inner);
+    let left = clamp_spans(left, cols[0].width as usize);
     f.render_widget(Paragraph::new(Line::from(left)), cols[0]);
     f.render_widget(
         Paragraph::new(Line::from(right)).alignment(Alignment::Right),
@@ -229,16 +248,14 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn footer(f: &mut Frame, app: &App, area: Rect) {
+fn footer_hints(app: &App) -> String {
     let hints = match app.route {
         Route::ProfileSelect => {
             "↑↓ move · enter open · n new wallet · r rename · d delete · q quit"
         }
         Route::Unlock => "type passphrase · enter unlock · ^C quit",
         Route::Setup => "c create · i import · enter continue · esc back",
-        Route::WalletList => {
-            "↑↓ move · enter open · s send · M →master · F fund · n new sub · c copy · l label · t note · x archive · h history · a audit · g settings · r refresh · ^L lock · q quit"
-        }
+        Route::WalletList => "enter open · s send · n new · c copy · ^L lock · q quit",
         Route::WalletDetail => "s send · M →master · F fund · c copy · h history · esc back",
         Route::Send => {
             "tab field · c SOL/fiat · m max · a all · enter review · ^V paste · esc cancel"
@@ -255,6 +272,16 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
     {
         hints.push_str(" · U changelog");
     }
+    hints
+}
+
+fn footer_height(hints: &str, width: u16) -> u16 {
+    let avail = (width as usize).saturating_sub(1).max(1);
+    let lines = format::wrap_lines(hints, avail).len() as u16;
+    lines.clamp(1, 3)
+}
+
+fn footer(f: &mut Frame, app: &App, hints: &str, area: Rect) {
     let p = Paragraph::new(Line::from(Span::styled(
         format!(" {hints}"),
         Style::default().fg(app.theme.text_muted),
@@ -264,20 +291,23 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(p, area);
 }
 
-fn render_toasts(f: &mut Frame, app: &App, area: Rect) {
+fn render_toasts(f: &mut Frame, app: &App, footer_area: Rect) {
     if app.toasts.is_empty() {
         return;
     }
     let theme = &app.theme;
+    let frame = f.area();
     let n = app.toasts.len() as u16;
-    let width = 52.min(area.width.saturating_sub(2));
+    let width = 52.min(frame.width.saturating_sub(2));
     let height = n + 2;
-    if area.height < height + 1 {
+    if frame.height < height {
         return;
     }
+    let bottom = footer_area.y + footer_area.height;
+    let y = bottom.saturating_sub(height);
     let rect = Rect {
-        x: area.x + area.width.saturating_sub(width + 1),
-        y: area.y + area.height.saturating_sub(height + 1),
+        x: frame.x + frame.width.saturating_sub(width + 1),
+        y,
         width,
         height,
     };
@@ -322,6 +352,33 @@ fn render_toasts(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
+fn clamp_spans(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
+    let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    if total <= max {
+        return spans;
+    }
+    if max == 0 {
+        return Vec::new();
+    }
+    let budget = max.saturating_sub(1);
+    let mut out: Vec<Span<'static>> = Vec::with_capacity(spans.len());
+    let mut used = 0usize;
+    for s in spans {
+        let w = s.content.chars().count();
+        if used + w <= budget {
+            used += w;
+            out.push(s);
+        } else {
+            let take = budget - used;
+            let kept: String = s.content.chars().take(take).collect();
+            out.push(Span::styled(kept, s.style));
+            break;
+        }
+    }
+    out.push(Span::raw("…"));
+    out
+}
+
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let w = width.min(area.width);
     let h = height.min(area.height);
@@ -333,61 +390,84 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn render_message_modal(
+    f: &mut Frame,
+    theme: &Theme,
+    area: Rect,
+    width: u16,
+    title: &str,
+    body: &str,
+    border: ratatui::style::Color,
+    hint: &str,
+) {
+    let inner_w = width.min(area.width).saturating_sub(2).max(1) as usize;
+    let body_lines = format::wrap_lines(body, inner_w);
+    let want = 2 + 1 + body_lines.len() + 1 + 1;
+    let height = (want as u16).min(area.height);
+    let rect = centered_rect(width, height, area);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(border).add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme.surface));
+
+    let avail = rect.height.saturating_sub(2) as usize;
+    let mut lines = vec![Line::from("")];
+    for l in &body_lines {
+        lines.push(Line::from(Span::styled(
+            l.clone(),
+            Style::default().fg(theme.text),
+        )));
+    }
+    lines.push(Line::from(""));
+    let hint_line = Line::from(Span::styled(
+        hint.to_string(),
+        Style::default().fg(theme.text_muted),
+    ));
+    if lines.len() + 1 > avail {
+        lines.truncate(avail.saturating_sub(1));
+    }
+    while lines.len() + 1 < avail {
+        lines.push(Line::from(""));
+    }
+    lines.push(hint_line);
+
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
 fn render_modal(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
     match app.modal.as_ref().unwrap() {
         Modal::ConfirmSend => render_confirm_send(f, app, area),
         Modal::Confirm { title, body, .. } => {
-            let rect = centered_rect(62, 11, area);
-            f.render_widget(Clear, rect);
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme.warn))
-                .title(Span::styled(
-                    format!(" {title} "),
-                    Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
-                ))
-                .style(Style::default().bg(theme.surface));
-            let p = Paragraph::new(vec![
-                Line::from(""),
-                Line::from(Span::styled(body.clone(), Style::default().fg(theme.text))),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  Enter confirm · Esc cancel",
-                    Style::default().fg(theme.text_muted),
-                )),
-            ])
-            .wrap(Wrap { trim: true })
-            .block(block);
-            f.render_widget(p, rect);
+            render_message_modal(
+                f,
+                theme,
+                area,
+                62,
+                title,
+                body,
+                theme.warn,
+                "  Enter confirm · Esc cancel",
+            );
         }
         Modal::Error { title, body } => {
-            let rect = centered_rect(60, 9, area);
-            f.render_widget(Clear, rect);
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme.danger))
-                .title(Span::styled(
-                    format!(" {title} "),
-                    Style::default()
-                        .fg(theme.danger)
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .style(Style::default().bg(theme.surface));
-            let p = Paragraph::new(vec![
-                Line::from(""),
-                Line::from(Span::styled(body.clone(), Style::default().fg(theme.text))),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "press Enter to dismiss",
-                    Style::default().fg(theme.text_muted),
-                )),
-            ])
-            .wrap(Wrap { trim: true })
-            .block(block);
-            f.render_widget(p, rect);
+            render_message_modal(
+                f,
+                theme,
+                area,
+                60,
+                title,
+                body,
+                theme.danger,
+                "press Enter to dismiss",
+            );
         }
         Modal::Prompt { title, kind } => {
             let make_block = || {
@@ -479,6 +559,10 @@ fn render_confirm_send(f: &mut Frame, app: &App, area: Rect) {
 
     let rect = centered_rect(70, 16, area);
     f.render_widget(Clear, rect);
+    let inner_w = rect.width.saturating_sub(2) as usize;
+    let addr_w = inner_w.saturating_sub(LABEL_W).max(1);
+    let from_addr = format::elide_middle(&from_addr, addr_w);
+    let to_addr = format::elide_middle(&ps.to, addr_w);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -496,7 +580,7 @@ fn render_confirm_send(f: &mut Frame, app: &App, area: Rect) {
         )
     };
     let val = |s: String| Span::styled(s, Style::default().fg(theme.text));
-    let lines = vec![
+    let mut body = vec![
         Line::from(""),
         Line::from(vec![
             label("send"),
@@ -519,7 +603,7 @@ fn render_confirm_send(f: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![label("to"), val(dest_label)]),
         Line::from(vec![
             Span::styled(format!("{:w$}", "", w = LABEL_W), Style::default()),
-            Span::styled(ps.to.clone(), Style::default().fg(theme.text)),
+            Span::styled(to_addr, Style::default().fg(theme.text)),
         ]),
         Line::from(vec![
             label("fee"),
@@ -536,28 +620,33 @@ fn render_confirm_send(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(theme.text_muted),
             ),
         ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("     ", Style::default()),
-            Span::styled(
-                " Enter ",
-                Style::default()
-                    .bg(theme.accent)
-                    .fg(theme.bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" sign & broadcast      ", Style::default().fg(theme.text)),
-            Span::styled(
-                " Esc ",
-                Style::default().bg(theme.border_idle).fg(theme.text),
-            ),
-            Span::styled(" cancel", Style::default().fg(theme.text)),
-        ]),
     ];
+    let action = Line::from(vec![
+        Span::styled("     ", Style::default()),
+        Span::styled(
+            " Enter ",
+            Style::default()
+                .bg(theme.accent)
+                .fg(theme.bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" sign & broadcast      ", Style::default().fg(theme.text)),
+        Span::styled(
+            " Esc ",
+            Style::default().bg(theme.border_idle).fg(theme.text),
+        ),
+        Span::styled(" cancel", Style::default().fg(theme.text)),
+    ]);
+    let avail = rect.height.saturating_sub(2) as usize;
+    if body.len() + 1 > avail {
+        body.truncate(avail.saturating_sub(1));
+    }
+    while body.len() + 1 < avail {
+        body.push(Line::from(""));
+    }
+    body.push(action);
     f.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
         rect,
     );
 }

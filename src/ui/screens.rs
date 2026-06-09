@@ -105,6 +105,8 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
         }
         SetupStage::ShowMnemonic => {
             let rect = super::centered_rect(76, 15, area);
+            let inner_w = rect.width.saturating_sub(2) as usize;
+            let grid_cols = if inner_w >= 59 { 4 } else { 2 };
             let block = panel("Your recovery phrase", true, theme);
             let mut lines = vec![
                 Line::from(Span::styled(
@@ -118,11 +120,11 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
                 Line::from(""),
             ];
             let words = &app.setup.mnemonic_words;
-            let row_count = words.len().div_ceil(4);
+            let row_count = words.len().div_ceil(grid_cols);
             for row in 0..row_count {
                 let mut spans = vec![Span::raw("   ")];
-                for col in 0..4 {
-                    let idx = row * 4 + col;
+                for col in 0..grid_cols {
+                    let idx = row * grid_cols + col;
                     if let Some(w) = words.get(idx) {
                         spans.push(Span::styled(
                             format!("{:>2}. {:<10}", idx + 1, w),
@@ -141,6 +143,7 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
         }
         SetupStage::ConfirmMnemonic => {
             let rect = super::centered_rect(72, 16, area);
+            let inner_w = rect.width.saturating_sub(2) as usize;
             let block = panel("Confirm recovery phrase", true, theme);
             let words = &app.setup.confirm_words;
             let total = words.len();
@@ -163,7 +166,7 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
                 Line::from(""),
             ];
 
-            let cols = 4;
+            let cols = if inner_w >= 54 { 4 } else { 2 };
             let rows = total.div_ceil(cols);
             for row in 0..rows {
                 let mut spans = vec![Span::raw("  ")];
@@ -286,14 +289,18 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme;
     let price = app.price_now();
 
-    let header = Row::new(vec![
-        Cell::from("#"),
-        Cell::from("NAME"),
-        Cell::from("ADDRESS"),
-        Cell::from("BALANCE"),
-        Cell::from(app.currency.label()),
-    ])
-    .style(
+    let show_addr = area.width >= 62;
+    let show_usd = area.width >= 76;
+
+    let mut header_cells = vec![Cell::from("#"), Cell::from("NAME")];
+    if show_addr {
+        header_cells.push(Cell::from("ADDRESS"));
+    }
+    header_cells.push(Cell::from("BALANCE"));
+    if show_usd {
+        header_cells.push(Cell::from(app.currency.label()));
+    }
+    let header = Row::new(header_cells).style(
         Style::default()
             .fg(theme.text_muted)
             .add_modifier(Modifier::BOLD),
@@ -306,7 +313,7 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|r| match r {
             crate::app::WalletListRow::ArchivedHeader => {
                 let caret = if app.archived_expanded { "▾" } else { "▸" };
-                Row::new(vec![
+                let mut cells = vec![
                     Cell::from(""),
                     Cell::from(Line::from(vec![
                         Span::raw("  "),
@@ -317,10 +324,15 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
                                 .add_modifier(Modifier::BOLD),
                         ),
                     ])),
-                    Cell::from(""),
-                    Cell::from(""),
-                    Cell::from(""),
-                ])
+                ];
+                if show_addr {
+                    cells.push(Cell::from(""));
+                }
+                cells.push(Cell::from(""));
+                if show_usd {
+                    cells.push(Cell::from(""));
+                }
+                Row::new(cells)
             }
             crate::app::WalletListRow::Wallet(i) => {
                 let w = &app.wallets[i];
@@ -367,7 +379,7 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
                 } else {
                     theme.usd
                 };
-                Row::new(vec![
+                let mut cells = vec![
                     Cell::from(Span::styled(
                         w.account_index.to_string(),
                         Style::default().fg(theme.text_muted),
@@ -377,16 +389,24 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
                         Span::styled(name_text, Style::default().fg(name_color)),
                         Span::styled(pending, Style::default().fg(theme.warn)),
                     ])),
-                    Cell::from(Span::styled(
+                ];
+                if show_addr {
+                    cells.push(Cell::from(Span::styled(
                         format::elide_addr(&w.pubkey),
                         Style::default().fg(theme.text_muted),
-                    )),
-                    Cell::from(Span::styled(
-                        bal,
-                        Style::default().fg(bal_color).add_modifier(Modifier::BOLD),
-                    )),
-                    Cell::from(Span::styled(usd, Style::default().fg(usd_color))),
-                ])
+                    )));
+                }
+                cells.push(Cell::from(Span::styled(
+                    bal,
+                    Style::default().fg(bal_color).add_modifier(Modifier::BOLD),
+                )));
+                if show_usd {
+                    cells.push(Cell::from(Span::styled(
+                        usd,
+                        Style::default().fg(usd_color),
+                    )));
+                }
+                Row::new(cells)
             }
         })
         .collect();
@@ -403,13 +423,14 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
         .count();
     let title = format!("Wallets ({master_count} master · {sub_count} sub)");
 
-    let widths = [
-        Constraint::Length(4),
-        Constraint::Min(18),
-        Constraint::Length(14),
-        Constraint::Length(18),
-        Constraint::Length(14),
-    ];
+    let mut widths = vec![Constraint::Length(4), Constraint::Min(18)];
+    if show_addr {
+        widths.push(Constraint::Length(14));
+    }
+    widths.push(Constraint::Length(18));
+    if show_usd {
+        widths.push(Constraint::Length(14));
+    }
     const MARKERS: [&str; 6] = ["▏ ", "▎ ", "▍ ", "▌ ", "▍ ", "▎ "];
     let marker = MARKERS[(app.anim_frame() as usize / 2) % MARKERS.len()];
     let table = Table::new(rows, widths)
@@ -532,6 +553,9 @@ pub(super) fn wallet_detail(f: &mut Frame, app: &mut App, area: Rect) {
 pub(super) fn send(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
     let rect = super::centered_rect(72, 13, area);
+    let inner_w = rect.width.saturating_sub(2) as usize;
+    let field_w = inner_w.saturating_sub(LABEL_W + 1).max(1);
+    let note_w = inner_w.saturating_sub(LABEL_W).max(1);
     let from = app.focused_wallet();
     let from_name = from.map(|w| w.display_name()).unwrap_or_default();
     let from_id = from.map(|w| (w.account_index, w.id)).unwrap_or((0, 0));
@@ -604,13 +628,18 @@ pub(super) fn send(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(theme.text_muted),
             ),
             Span::styled(
-                format::input_tail(&app.input.send_to, 59),
+                format::input_tail(&app.input.send_to, field_w),
                 Style::default().fg(theme.text),
             ),
             cur(0),
         ]),
         Line::from(Span::styled(
-            format!("{:>w$}{}", "", route_note.0, w = LABEL_W),
+            format!(
+                "{:>w$}{}",
+                "",
+                format::truncate_end(&route_note.0, note_w),
+                w = LABEL_W
+            ),
             Style::default().fg(route_note.1),
         )),
         Line::from(""),

@@ -388,9 +388,11 @@ fn copy_addr(app: &mut App, addr: &str) {
 }
 
 fn copy_changelog(app: &mut App) {
-    match app.changelog_url() {
-        Some(url) => {
-            copy_text(app, &url, "Copied changelog link", false);
+    match app.update_available() {
+        Some(_) => {
+            let hint = app.install_method.upgrade_hint();
+            let cmd = hint.strip_prefix("Run: ").unwrap_or(hint).to_string();
+            copy_text(app, &cmd, "Upgrade command copied", false);
         }
         None => app.toast_info("You're on the latest version"),
     }
