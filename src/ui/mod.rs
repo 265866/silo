@@ -188,13 +188,13 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
         left.push(Span::styled(
-            "· press U for upgrade command",
+            "· press U to copy upgrade command",
             Style::default().fg(theme.text_muted),
         ));
     }
     if !app.reconcile_done {
         left.push(Span::styled(
-            format!("  {} reconciling", app.spinner()),
+            format!("  {} syncing transfers", app.spinner()),
             Style::default().fg(theme.warn),
         ));
     }
@@ -266,7 +266,7 @@ fn footer_hints(app: &App) -> String {
              lock · q quit"
         }
         Route::WalletDetail => {
-            "s send · M to master · F fund · c copy address · h history · q back · ^L lock"
+            "s send · M to master · F fund · c copy address · h transfers · q back · ^L lock"
         }
         Route::Send if app.input.focus == 1 => {
             "tab field · c SOL/fiat · m max (keep open) · a all (empty wallet) · enter review · ^V \
@@ -274,7 +274,7 @@ fn footer_hints(app: &App) -> String {
         }
         Route::Send => "tab field · enter review · ^V paste · ^L lock · esc cancel",
         Route::History => {
-            "↑/↓ jk scroll · PgUp/PgDn · Home/End · c copy txid · t note · ^L lock · esc back"
+            "↑/↓ jk scroll · PgUp/PgDn · Home/End · c copy ID · t note · ^L lock · esc back"
         }
         Route::AuditLog => "↑/↓ jk scroll · PgUp/PgDn · Home/End · ^L lock · esc back",
         Route::Settings => {
@@ -285,7 +285,7 @@ fn footer_hints(app: &App) -> String {
     if app.update_available().is_some()
         && matches!(app.route, Route::WalletList | Route::WalletDetail)
     {
-        hints.push_str(" · U changelog");
+        hints.push_str(" · U upgrade");
     }
     hints
 }

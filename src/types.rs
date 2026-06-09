@@ -337,7 +337,7 @@ impl std::fmt::Display for SendGuardError {
                 f.write_str("this wallet already has a transfer in progress")
             }
             SendGuardError::Reconciling => {
-                f.write_str("still reconciling in-flight transfers — sends are disabled")
+                f.write_str("still syncing in-flight transfers — sends are disabled")
             }
         }
     }

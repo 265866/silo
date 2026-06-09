@@ -225,7 +225,7 @@ fn preview_all_screens() {
     app.refresh_detail_intents_blocking();
     app.route = Route::History;
     app.history_state.select(Some(0));
-    banner("HISTORY — TX column (c copies the selected transaction id)");
+    banner("HISTORY — TX column (c copies the selected transaction ID)");
     print!("{}", render(&mut app));
 
     app.input.prompt_text =
@@ -1462,4 +1462,158 @@ fn authenticated_footers_wrap_to_at_most_two_lines_at_width_80() {
             "{route:?} footer must wrap to at most 2 lines at width 80, got {lines}: {hints}"
         );
     }
+}
+
+#[test]
+fn history_title_uses_transfers_noun() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.latest_version = None;
+    app.route = Route::History;
+
+    let from = app.wallets[0].id;
+    let to = app.wallets[1].pubkey.clone();
+    app.db.call_blocking(move |d| {
+        let i = d.create_intent(from, &to, 500_000_000, None).unwrap();
+        d.mark_signed(
+            i.id,
+            "5Hx9c4kQ2mWnTr8sV1pLb3JfYx7aZ2nQ8mK9kQpVtRf2dGhEjKpLmNoPqRsTuVwXy",
+            "BhAsH",
+            1000,
+            5023,
+            b"wire",
+        )
+        .unwrap();
+    });
+    app.focused_wallet = Some(app.wallets[0].id);
+    app.refresh_detail_intents_blocking();
+
+    let out = render(&mut app);
+    assert!(
+        out.contains("Transfers —"),
+        "history title must use the transfers noun:\n{out}"
+    );
+    assert!(
+        !out.contains("History —"),
+        "history title must drop the 'History —' label:\n{out}"
+    );
+}
+
+#[test]
+fn empty_history_uses_capitalized_transfers_copy() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.latest_version = None;
+    app.focused_wallet = Some(app.wallets[0].id);
+    app.detail_intents.clear();
+    app.route = Route::History;
+
+    let out = render(&mut app);
+    assert!(
+        out.contains("No transfers yet"),
+        "empty history must use the capitalized transfers copy:\n{out}"
+    );
+    assert!(
+        !out.contains("no transfers yet"),
+        "empty history must not use the lowercase copy:\n{out}"
+    );
+}
+
+#[test]
+fn syncing_status_avoids_reconciling_jargon() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.latest_version = None;
+    app.reconcile_done = false;
+    app.net_status = NetStatus::Syncing;
+    app.route = Route::WalletList;
+
+    let out = render(&mut app);
+    assert!(
+        out.contains("syncing transfers"),
+        "status bar must read 'syncing transfers':\n{out}"
+    );
+    assert!(
+        !out.to_lowercase().contains("reconciling"),
+        "no live status string may expose 'reconciling':\n{out}"
+    );
+}
+
+#[test]
+fn update_footer_suffix_reads_upgrade_not_changelog() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.route = Route::WalletList;
+    app.latest_version = Some("9.9.9".into());
+
+    let hints = super::footer_hints(&app);
+    assert!(
+        hints.contains("U upgrade"),
+        "update footer suffix must read 'U upgrade': {hints}"
+    );
+    assert!(
+        !hints.contains("U changelog"),
+        "update footer suffix must drop the 'U changelog' mislabel: {hints}"
+    );
+}
+
+#[test]
+fn post_send_toasts_carry_transfer_noun() {
+    let mut app = test_app();
+    let cur_gen = app.generation.load(std::sync::atomic::Ordering::SeqCst);
+
+    app.apply_app_event(AppEvent::TransferResult {
+        intent_id: 1,
+        outcome: TransferOutcome::Submitted {
+            signature: "5Hx9c4kQ2mWnTr8sV1pLb3JfYx7aZ2nQ8mK9kQpVtRf".into(),
+        },
+        transfer: None,
+        generation: cur_gen,
+    });
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.text.contains("Transfer submitted")),
+        "submitted toast must label the transfer noun: {:?}",
+        app.toasts.iter().map(|t| &t.text).collect::<Vec<_>>()
+    );
+
+    app.toasts.clear();
+    app.apply_app_event(AppEvent::TransferResult {
+        intent_id: 1,
+        outcome: TransferOutcome::StillPending {
+            signature: "5Hx9c4kQ2mWnTr8sV1pLb3JfYx7aZ2nQ8mK9kQpVtRf".into(),
+        },
+        transfer: None,
+        generation: cur_gen,
+    });
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.text.contains("Transfer still pending")),
+        "still-pending toast must label the transfer noun: {:?}",
+        app.toasts.iter().map(|t| &t.text).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn settings_confirmation_row_avoids_commitment_jargon() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.latest_version = None;
+    app.route = Route::Settings;
+
+    let out = render(&mut app);
+    assert!(
+        out.contains("confirmations"),
+        "settings must label the row 'confirmations':\n{out}"
+    );
+    assert!(
+        out.contains("standard"),
+        "settings must show the plain 'standard' value:\n{out}"
+    );
+    assert!(
+        !out.contains("commitment"),
+        "settings must drop the 'commitment' jargon:\n{out}"
+    );
 }

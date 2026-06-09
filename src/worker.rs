@@ -375,7 +375,7 @@ fn finish_setup_blocking(
         }
         Err(e) => {
             return SetupResult::Failed(format!(
-                "Wallet metadata could not be read: {e}. Refusing to proceed."
+                "Wallet metadata couldn't be read: {e}. Refusing to proceed."
             ));
         }
     }
@@ -418,14 +418,14 @@ fn finish_setup_blocking(
     };
     if !master_ok {
         return SetupResult::Failed(
-            "Could not initialize the master wallet — please retry".to_string(),
+            "Couldn't initialize the master wallet — please retry".to_string(),
         );
     }
 
     if let Some(id) = current_profile {
         let profiles = match crate::profiles::load(&config_dir) {
             Ok(profiles) => profiles,
-            Err(e) => return SetupResult::Failed(format!("could not load profiles: {e}")),
+            Err(e) => return SetupResult::Failed(format!("Couldn't load profiles: {e}")),
         };
         let name = next_wallet_name(&profiles);
         if let Err(e) = crate::profiles::register(
@@ -436,17 +436,17 @@ fn finish_setup_blocking(
                 created_at: crate::db::now_ms(),
             },
         ) {
-            return SetupResult::Failed(format!("could not register profile: {e}"));
+            return SetupResult::Failed(format!("Couldn't register profile: {e}"));
         }
     }
 
     let wallets = match db.call_blocking(|d| d.list_wallets()) {
         Ok(wallets) => wallets,
-        Err(e) => return SetupResult::Failed(format!("Could not load wallets: {e}")),
+        Err(e) => return SetupResult::Failed(format!("Couldn't load wallets: {e}")),
     };
     let profiles = match crate::profiles::load(&config_dir) {
         Ok(profiles) => profiles,
-        Err(e) => return SetupResult::Failed(format!("Could not load profiles: {e}")),
+        Err(e) => return SetupResult::Failed(format!("Couldn't load profiles: {e}")),
     };
     let _ = creating;
     SetupResult::Finished {
@@ -474,7 +474,7 @@ fn persist_signed_send_blocking(
                 "This wallet already has a transfer in progress".to_string(),
             );
         }
-        Err(e) => return SendPersistResult::Failed(format!("Could not record transfer: {e}")),
+        Err(e) => return SendPersistResult::Failed(format!("Couldn't record transfer: {e}")),
     };
     let intent_id = intent.id;
     let blockhash = pending.blockhash.clone();
@@ -497,15 +497,15 @@ fn persist_signed_send_blocking(
                 d.mark_terminal(
                     intent_id,
                     IntentStatus::Failed,
-                    Some("could not persist signed transfer"),
+                    Some("couldn't persist signed transfer"),
                 )
             });
             match cleaned {
                 Ok(_) => {
-                    SendPersistResult::Failed(format!("Could not persist signed transfer: {e}"))
+                    SendPersistResult::Failed(format!("Couldn't persist signed transfer: {e}"))
                 }
                 Err(_) => SendPersistResult::Failed(format!(
-                    "Could not persist signed transfer, and could not clean up the pending \
+                    "Couldn't persist signed transfer, and couldn't clean up the pending \
                      record: {e} — restart silo to reconcile before sending from this wallet again"
                 )),
             }
@@ -603,7 +603,7 @@ async fn handle_command(
                     .and_then(|_| crate::profiles::load(&config_dir))
                     .map(|profiles| ProfileDeleteResult::Deleted { profiles })
                     .unwrap_or_else(|e| {
-                        ProfileDeleteResult::Failed(format!("Could not delete profile: {e}"))
+                        ProfileDeleteResult::Failed(format!("Couldn't delete profile: {e}"))
                     })
             })
             .await
@@ -827,7 +827,7 @@ async fn handle_command(
             let result = tokio::task::spawn_blocking(move || {
                 crate::profiles::rename(&config_dir, &id, &name)
                     .and_then(|_| crate::profiles::load(&config_dir))
-                    .map_err(|e| format!("Could not rename profile: {e}"))
+                    .map_err(|e| format!("Couldn't rename profile: {e}"))
             })
             .await
             .unwrap_or_else(|e| Err(format!("rename profile task failed: {e}")));
@@ -921,7 +921,7 @@ async fn handle_command(
                 Err(e) => {
                     let _ = evt
                         .send(AppEvent::BalancesFailed {
-                            reason: format!("could not load wallets: {e}"),
+                            reason: format!("Couldn't load wallets: {e}"),
                             generation: cmd_gen,
                         })
                         .await;
@@ -975,7 +975,7 @@ async fn handle_command(
             let (blockhash, lvbh) = match rpc_now.get_latest_blockhash().await {
                 Ok(x) => x,
                 Err(e) => {
-                    send_error(&evt, cmd_gen, format!("could not fetch blockhash: {e}")).await;
+                    send_error(&evt, cmd_gen, format!("Couldn't fetch blockhash: {e}")).await;
                     return;
                 }
             };
@@ -985,7 +985,7 @@ async fn handle_command(
                     send_error(
                         &evt,
                         cmd_gen,
-                        format!("could not fetch recipient balance: {e}"),
+                        format!("Couldn't fetch recipient balance: {e}"),
                     )
                     .await;
                     return;
@@ -1036,7 +1036,7 @@ async fn handle_command(
             match wrote {
                 Some(Ok(())) => {}
                 Some(Err(e)) => {
-                    send_error(&evt, cmd_gen, format!("could not save RPC URL: {e}")).await;
+                    send_error(&evt, cmd_gen, format!("Couldn't save RPC URL: {e}")).await;
                     return;
                 }
                 None => return,
@@ -1080,7 +1080,7 @@ async fn handle_command(
                     })
                     .await;
             }
-            Err(e) => send_error(&evt, cmd_gen, format!("could not load wallets: {e}")).await,
+            Err(e) => send_error(&evt, cmd_gen, format!("Couldn't load wallets: {e}")).await,
         },
 
         Command::LoadDetail { wallet_id } => {
@@ -1105,7 +1105,7 @@ async fn handle_command(
                     send_error(
                         &evt,
                         cmd_gen,
-                        format!("could not load transfer history: {e}"),
+                        format!("Couldn't load transfer history: {e}"),
                     )
                     .await
                 }
@@ -1121,7 +1121,7 @@ async fn handle_command(
                     })
                     .await;
             }
-            Err(e) => send_error(&evt, cmd_gen, format!("could not load audit log: {e}")).await,
+            Err(e) => send_error(&evt, cmd_gen, format!("Couldn't load audit log: {e}")).await,
         },
     }
 }
@@ -1153,7 +1153,7 @@ async fn finalize(
                 evt,
                 cmd_gen,
                 format!(
-                    "transfer {} on-chain but could not be recorded locally — will reconcile on restart: {e}",
+                    "transfer {} on-chain but couldn't be recorded locally — will reconcile on restart: {e}",
                     status.as_str()
                 ),
             )
@@ -1334,7 +1334,7 @@ async fn broadcast_submit(
             send_error(
                 evt,
                 cmd_gen,
-                format!("could not record submitted transfer: {e}"),
+                format!("Couldn't record submitted transfer: {e}"),
             )
             .await;
             return None;
@@ -2286,7 +2286,7 @@ mod tests {
         while let Ok(ev) = evt_rx.try_recv() {
             match ev {
                 AppEvent::Error { message, .. } => {
-                    assert!(message.contains("could not be recorded locally"));
+                    assert!(message.contains("couldn't be recorded locally"));
                     saw_error = true;
                 }
                 AppEvent::TransferResult {

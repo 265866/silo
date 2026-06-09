@@ -864,14 +864,14 @@ pub(super) fn history(f: &mut Frame, app: &mut App, area: Rect) {
         .focused_wallet()
         .map(|w| w.display_name())
         .unwrap_or_default();
-    render_intent_table(f, app, area, &format!("History — {name}"));
+    render_intent_table(f, app, area, &format!("Transfers — {name}"));
 }
 
 fn render_intent_table(f: &mut Frame, app: &mut App, area: Rect, title: &str) {
     let theme = &app.theme;
     if app.detail_intents.is_empty() {
         let p = Paragraph::new(Line::from(Span::styled(
-            "  no transfers yet",
+            "  No transfers yet",
             Style::default().fg(theme.text_muted),
         )))
         .block(panel(title.to_string(), false, theme));
@@ -1061,10 +1061,10 @@ pub(super) fn settings(f: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled(
-                format!("  {:<w$}", "commitment", w = LABEL_TEXT_W),
+                format!("  {:<w$}", "confirmations", w = LABEL_TEXT_W),
                 Style::default().fg(theme.text_muted),
             ),
-            Span::styled("confirmed", Style::default().fg(theme.text)),
+            Span::styled("standard", Style::default().fg(theme.text)),
         ]),
         Line::from(vec![
             Span::styled(

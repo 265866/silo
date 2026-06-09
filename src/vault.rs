@@ -246,7 +246,7 @@ fn unique_tmp_path(dir: &Path, file_name: &str) -> Result<PathBuf> {
         }
     }
     Err(anyhow!(
-        "could not choose a unique temp file for {file_name}"
+        "Couldn't choose a unique temp file for {file_name}"
     ))
 }
 

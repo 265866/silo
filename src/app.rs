@@ -801,7 +801,7 @@ impl App {
             self.update_notified = true;
             let latest = self.latest_version.clone().unwrap_or_default();
             self.toast_info(format!(
-                "v{latest} available — press U to copy the upgrade command"
+                "v{latest} available · press U to copy upgrade command"
             ));
         }
     }
@@ -949,7 +949,7 @@ impl App {
             let _ =
                 self.generation
                     .compare_exchange(old + 1, old, Ordering::SeqCst, Ordering::SeqCst);
-            anyhow::bail!("could not queue profile open");
+            anyhow::bail!("Couldn't queue profile open");
         }
         self.blocking_input = true;
         Ok(())
@@ -981,7 +981,7 @@ impl App {
             let _ =
                 self.generation
                     .compare_exchange(old + 1, old, Ordering::SeqCst, Ordering::SeqCst);
-            self.toast_err("could not queue new profile creation");
+            self.toast_err("Couldn't queue new profile creation");
             return;
         }
         self.blocking_input = true;
@@ -1011,7 +1011,7 @@ impl App {
         match crate::profiles::load(&self.config_dir) {
             Ok(profiles) => self.profiles = profiles,
             Err(e) => {
-                self.toast_err(format!("Could not load profiles: {e}"));
+                self.toast_err(format!("Couldn't load profiles: {e}"));
                 return;
             }
         }
@@ -1423,7 +1423,7 @@ impl App {
             self.wallets.clear();
             self.anim_balance.clear();
             self.clamp_list_selection();
-            self.toast_err(format!("Could not load wallets: {e}"));
+            self.toast_err(format!("Couldn't load wallets: {e}"));
         }
     }
 
@@ -1573,7 +1573,7 @@ impl App {
                 match &outcome {
                     TransferOutcome::Submitted { signature } => {
                         self.toast_info(format!(
-                            "Submitted {}",
+                            "Transfer submitted (tx {})",
                             crate::ui::format::elide_addr(signature)
                         ));
                     }
@@ -1591,11 +1591,8 @@ impl App {
                     TransferOutcome::Expired => {
                         self.toast_err("Transfer expired (blockhash) — safe to retry");
                     }
-                    TransferOutcome::StillPending { signature } => {
-                        self.toast_info(format!(
-                            "Still pending {} — continuing to poll",
-                            crate::ui::format::elide_addr(signature)
-                        ));
+                    TransferOutcome::StillPending { .. } => {
+                        self.toast_info("Transfer still pending — waiting for confirmation");
                     }
                 }
                 self.refresh_detail_intents();
@@ -1635,7 +1632,7 @@ impl App {
                     UnlockResult::AuditKey => {
                         self.modal = Some(Modal::Error {
                             title: "Cannot open audit log".into(),
-                            body: "The audit key could not be derived (database/vault inconsistent). Refusing to operate.".into(),
+                            body: "The audit key couldn't be derived (database/vault inconsistent). Refusing to operate.".into(),
                         });
                     }
                     UnlockResult::WalletMismatch => {
@@ -1648,7 +1645,7 @@ impl App {
                         self.modal = Some(Modal::Error {
                             title: "Cannot verify wallet database".into(),
                             body: format!(
-                                "Wallet metadata could not be read: {e}. Refusing to operate."
+                                "Wallet metadata couldn't be read: {e}. Refusing to operate."
                             ),
                         });
                     }
@@ -1727,7 +1724,7 @@ impl App {
                         if self.pending_profile_open.is_some() {
                             self.try_next_profile_fallback(&e);
                         } else {
-                            self.toast_err(format!("Could not open profile: {e}"));
+                            self.toast_err(format!("Couldn't open profile: {e}"));
                         }
                         return;
                     }
@@ -1735,7 +1732,7 @@ impl App {
                 let vault_path = match crate::profiles::vault_path(&self.config_dir, &payload.id) {
                     Ok(p) => p,
                     Err(e) => {
-                        self.toast_err(format!("could not resolve profile path: {e}"));
+                        self.toast_err(format!("Couldn't resolve profile path: {e}"));
                         return;
                     }
                 };
@@ -1754,7 +1751,7 @@ impl App {
                     self.route = Route::Setup;
                 } else {
                     if let Err(e) = self.load_profile_scoped_state() {
-                        self.toast_err(format!("could not load profile state: {e}"));
+                        self.toast_err(format!("Couldn't load profile state: {e}"));
                     }
                     self.detail_intents.clear();
                     self.reconcile_done = false;
@@ -1839,7 +1836,7 @@ impl App {
                     self.request_balance_refresh();
                     self.toast_ok(format!("Derived subwallet #{idx}"));
                 }
-                Err(_) => self.toast_err("Could not derive subwallet"),
+                Err(_) => self.toast_err("Couldn't derive subwallet"),
             },
             AppEvent::SettingPersisted { change, result, .. } => match (change, result) {
                 (SettingChange::Currency(c), Ok(())) => {
@@ -1864,13 +1861,13 @@ impl App {
                     self.toast_info(format!("Auto-lock after {m} min"));
                 }
                 (SettingChange::Currency(_), Err(e)) => {
-                    self.toast_err(format!("Could not save currency: {e}"))
+                    self.toast_err(format!("Couldn't save currency: {e}"))
                 }
                 (SettingChange::Priority(_), Err(e)) => {
-                    self.toast_err(format!("Could not save priority fee: {e}"))
+                    self.toast_err(format!("Couldn't save priority fee: {e}"))
                 }
                 (SettingChange::AutoLock(_), Err(e)) => {
-                    self.toast_err(format!("Could not save auto-lock: {e}"))
+                    self.toast_err(format!("Couldn't save auto-lock: {e}"))
                 }
             },
             AppEvent::WalletTextSet { field, result, .. } => match result {
@@ -1882,8 +1879,8 @@ impl App {
                     });
                 }
                 Err(e) => self.toast_err(match field {
-                    WalletTextField::Label => format!("Could not save label: {e}"),
-                    WalletTextField::Note => format!("Could not save note: {e}"),
+                    WalletTextField::Label => format!("Couldn't save label: {e}"),
+                    WalletTextField::Note => format!("Couldn't save note: {e}"),
                 }),
             },
             AppEvent::IntentNoteSet { result, .. } => match result {
@@ -1892,7 +1889,7 @@ impl App {
                     self.history_state.select(None);
                     self.toast_ok("Transfer note updated");
                 }
-                Err(e) => self.toast_err(format!("Could not save transfer note: {e}")),
+                Err(e) => self.toast_err(format!("Couldn't save transfer note: {e}")),
             },
             AppEvent::WalletsLoaded { wallets, .. } => {
                 self.apply_reloaded_wallets(wallets);
@@ -1920,7 +1917,7 @@ impl App {
                 self.rpc_url = url;
                 self.net_status = NetStatus::Syncing;
                 self.reconcile_done = false;
-                self.toast_info("RPC updated — reconciling");
+                self.toast_info("RPC updated — syncing transfers");
             }
             AppEvent::NetStatus { status, .. } => {
                 self.net_status = status;
@@ -2053,7 +2050,7 @@ impl App {
                 Ok(v) => self.detail_intents = v,
                 Err(e) => {
                     self.detail_intents.clear();
-                    self.toast_err(format!("Could not load transfer history: {e}"));
+                    self.toast_err(format!("Couldn't load transfer history: {e}"));
                 }
             },
             None => self.detail_intents.clear(),
@@ -2068,7 +2065,7 @@ impl App {
             Ok(v) => self.audit = v,
             Err(e) => {
                 self.audit.clear();
-                self.toast_err(format!("Could not load audit log: {e}"));
+                self.toast_err(format!("Couldn't load audit log: {e}"));
             }
         }
         self.audit_state.select(None);
