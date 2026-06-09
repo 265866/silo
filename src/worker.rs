@@ -185,25 +185,16 @@ pub fn spawn_workers(
                             };
                             match cmd {
                                 Command::Broadcast { intent_id } => {
-                                    if let Some(ctx) = broadcast_submit(
-                                        intent_id,
-                                        &db,
-                                        &rpc,
-                                        &evt,
-                                        &generation,
-                                        cmd_gen,
-                                    )
-                                    .await
-                                    {
-                                        let db = db.clone();
-                                        let rpc = rpc.clone();
-                                        let evt = evt.clone();
-                                        let generation = generation.clone();
-                                        confirm_tasks.spawn(async move {
-                                            poll_confirmation(ctx, db, rpc, evt, generation, cmd_gen)
-                                                .await;
-                                        });
-                                    }
+                                    let db = db.clone();
+                                    let rpc = rpc.clone();
+                                    let evt = evt.clone();
+                                    let generation = generation.clone();
+                                    confirm_tasks.spawn(async move {
+                                        broadcast_and_poll(
+                                            intent_id, db, rpc, evt, generation, cmd_gen,
+                                        )
+                                        .await;
+                                    });
                                 }
                                 other => {
                                     handle_command(
@@ -1006,9 +997,7 @@ async fn handle_command(
                 .await;
         }
 
-        Command::Broadcast { intent_id } => {
-            broadcast_and_poll(intent_id, db, rpc, evt, generation, cmd_gen).await;
-        }
+        Command::Broadcast { .. } => unreachable!("Broadcast is an ordered command"),
 
         Command::ChangeRpc { url } => {
             if generation.load(Ordering::SeqCst) != cmd_gen {
