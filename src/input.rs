@@ -326,16 +326,6 @@ fn import_phrase_error(phrase: &str) -> String {
     "Checksum failed — re-check the word order".into()
 }
 
-fn next_wallet_name(profiles: &[crate::profiles::ProfileMeta]) -> String {
-    let max = profiles
-        .iter()
-        .filter_map(|p| p.name.strip_prefix("Wallet "))
-        .filter_map(|n| n.trim().parse::<u32>().ok())
-        .max()
-        .unwrap_or(0);
-    format!("Wallet {}", max + 1)
-}
-
 fn wallet_list_keys(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('q') => app.running = false,
@@ -1169,7 +1159,6 @@ mod tests {
     use crate::price::{PriceCache, PriceSource, SolPrice};
     use crate::profiles::ProfileMeta;
     use crate::solana::rpc::Rpc;
-    use crate::types::IntentStatus;
 
     const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 

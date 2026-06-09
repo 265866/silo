@@ -6,7 +6,6 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::mpsc;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::clipboard::ClipboardManager;
 use crate::crypto::Seed;
 use crate::db::{Db, Storage};
 use crate::price::{PriceCache, SolPrice};
@@ -615,7 +614,6 @@ pub struct App {
     pub(crate) price: Arc<PriceCache>,
     pub(crate) cmd_tx: mpsc::Sender<(u64, Command)>,
     pub(crate) generation: Arc<AtomicU64>,
-    pub(crate) clip: ClipboardManager,
     pub(crate) theme: Theme,
 
     pub(crate) seed: Option<Seed>,
@@ -703,7 +701,6 @@ impl App {
             price,
             cmd_tx,
             generation,
-            clip: ClipboardManager::new(),
             theme: Theme::dark(),
             seed: None,
             reconcile_done: false,
@@ -1004,19 +1001,6 @@ impl App {
                 "Profile deleted, but no remaining profile could be opened: {last_err}"
             ));
             self.begin_new_profile();
-        }
-    }
-
-    pub fn reload_profiles(&mut self) {
-        match crate::profiles::load(&self.config_dir) {
-            Ok(profiles) => self.profiles = profiles,
-            Err(e) => {
-                self.toast_err(format!("Couldn't load profiles: {e}"));
-                return;
-            }
-        }
-        if self.profile_sel >= self.profiles.len() {
-            self.profile_sel = self.profiles.len().saturating_sub(1);
         }
     }
 

@@ -5,9 +5,6 @@ pub enum Network {
     MainnetBeta,
 }
 impl Network {
-    pub fn as_str(&self) -> &'static str {
-        "mainnet-beta"
-    }
     pub fn default_rpc_url(&self) -> &'static str {
         "https://api.mainnet-beta.solana.com"
     }
