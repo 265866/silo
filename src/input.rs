@@ -846,12 +846,6 @@ fn settings_keys(app: &mut App, key: KeyEvent) {
                 change: crate::app::SettingChange::Currency(currency),
             });
         }
-        KeyCode::Char('U') => {
-            let on = !app.update_check_enabled;
-            app.send_cmd(Command::PersistSetting {
-                change: crate::app::SettingChange::UpdateCheck(on),
-            });
-        }
         KeyCode::Char('L') => {
             app.lock();
             app.toast_info("Locked");

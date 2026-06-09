@@ -94,9 +94,8 @@ async fn main() -> Result<()> {
                 crate::app::AUTO_LOCK_MAX_MINUTES,
             )
         });
-    let update_check_enabled = db.get_meta("update_check_enabled")?.as_deref() != Some("0");
     let update_latest_seen = db.get_meta("update_latest_seen")?;
-    let update_check_due = update_check_enabled && update_check_due(&db)?;
+    let update_check_due = update_check_due(&db)?;
     let vault_path = profile_dir.join("vault.json");
 
     let db = Storage::new(db);
@@ -140,7 +139,7 @@ async fn main() -> Result<()> {
         active_id,
         first_run,
     );
-    app.init_update_check(update_check_enabled, update_latest_seen, update_check_due);
+    app.init_update_check(update_latest_seen, update_check_due);
 
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -246,7 +245,7 @@ async fn run(
 ) -> Result<()> {
     let mut events = EventStream::new();
     let active_tick = std::time::Duration::from_millis(50);
-    let idle_tick = std::time::Duration::from_secs(1);
+    let ambient_tick = std::time::Duration::from_millis(100);
     let tick = tokio::time::sleep(active_tick);
     tokio::pin!(tick);
     let mut shutdown = Shutdown::new();
@@ -284,13 +283,11 @@ async fn run(
                 app.stop();
             },
             _ = &mut tick => {
-                let tick_redrew = app.tick();
+                app.tick();
                 app.maybe_auto_lock();
                 app.maybe_auto_refresh();
-                if tick_redrew || app.animations_active() {
-                    app.request_redraw();
-                }
-                let period = if app.animations_active() { active_tick } else { idle_tick };
+                app.request_redraw();
+                let period = if app.animations_active() { active_tick } else { ambient_tick };
                 tick.as_mut().reset(tokio::time::Instant::now() + period);
             }
             _ = shutdown.recv() => {

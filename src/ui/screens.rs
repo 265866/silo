@@ -767,21 +767,9 @@ fn compact_json(v: &serde_json::Value) -> String {
 
 pub(super) fn settings(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
-    let rect = super::centered_rect(72, 15, area);
+    let rect = super::centered_rect(72, 13, area);
     let lock_min = app.auto_lock_after.as_secs() / 60;
-    let updates_status = if !app.update_check_enabled {
-        "off".to_string()
-    } else if let Some(v) = app.update_available() {
-        format!("on · v{v} available")
-    } else {
-        "on · up to date".to_string()
-    };
-    let updates_color = if app.update_check_enabled {
-        theme.accent
-    } else {
-        theme.text_muted
-    };
-    let mut lines = vec![
+    let lines = vec![
         Line::from(""),
         Line::from(vec![
             Span::styled("  network    ", Style::default().fg(theme.text_muted)),
@@ -827,26 +815,12 @@ pub(super) fn settings(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(format!("{lock_min} min"), Style::default().fg(theme.text)),
             Span::styled("   (+/- to adjust)", Style::default().fg(theme.text_muted)),
         ]),
-        Line::from(vec![
-            Span::styled("  updates    ", Style::default().fg(theme.text_muted)),
-            Span::styled(updates_status, Style::default().fg(updates_color)),
-            Span::styled("   (U to toggle)", Style::default().fg(theme.text_muted)),
-        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  e edit RPC · u currency · p priority · L lock now · esc back",
+            Style::default().fg(theme.text_muted),
+        )),
     ];
-    if app.update_available().is_some() {
-        lines.push(Line::from(vec![
-            Span::styled("             ↑ ", Style::default().fg(theme.accent)),
-            Span::styled(
-                app.install_method.upgrade_hint().to_string(),
-                Style::default().fg(theme.text),
-            ),
-        ]));
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  e edit RPC · u currency · p priority · U updates · L lock now · esc back",
-        Style::default().fg(theme.text_muted),
-    )));
     f.render_widget(
         Paragraph::new(lines)
             .alignment(Alignment::Left)

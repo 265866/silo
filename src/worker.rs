@@ -758,11 +758,6 @@ async fn handle_command(
                     m.to_string(),
                     json!({ "auto_lock_minutes": m }),
                 ),
-                SettingChange::UpdateCheck(on) => (
-                    "update_check_enabled",
-                    if on { "1" } else { "0" }.to_string(),
-                    json!({ "update_check_enabled": on }),
-                ),
             };
             let outcome = db
                 .call_current(generation.clone(), cmd_gen, move |d| {

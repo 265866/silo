@@ -57,7 +57,6 @@ pub enum SettingChange {
     Currency(crate::types::Currency),
     Priority(u64),
     AutoLock(u64),
-    UpdateCheck(bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -666,7 +665,6 @@ pub struct App {
     last_price: Option<f64>,
     pub(crate) install_method: crate::update::InstallMethod,
     pub(crate) latest_version: Option<String>,
-    pub(crate) update_check_enabled: bool,
     update_notified: bool,
     needs_redraw: bool,
 }
@@ -747,7 +745,6 @@ impl App {
             last_price: None,
             install_method: crate::update::InstallMethod::detect(),
             latest_version: None,
-            update_check_enabled: true,
             update_notified: false,
             needs_redraw: true,
         }
@@ -778,15 +775,9 @@ impl App {
         }
     }
 
-    pub fn init_update_check(
-        &mut self,
-        enabled: bool,
-        latest_seen: Option<String>,
-        do_check: bool,
-    ) {
-        self.update_check_enabled = enabled;
+    pub fn init_update_check(&mut self, latest_seen: Option<String>, do_check: bool) {
         self.latest_version = latest_seen;
-        if enabled && do_check {
+        if do_check {
             self.send_cmd(Command::CheckForUpdate);
         }
     }
@@ -803,9 +794,6 @@ impl App {
     }
 
     pub fn update_available(&self) -> Option<&str> {
-        if !self.update_check_enabled {
-            return None;
-        }
         let latest = self.latest_version.as_deref()?;
         if crate::update::is_newer(latest, crate::update::CURRENT_VERSION) {
             Some(latest)
@@ -1173,11 +1161,7 @@ impl App {
     }
 
     pub fn anim_frame(&self) -> u64 {
-        if self.animations_active() {
-            self.frame
-        } else {
-            0
-        }
+        self.frame
     }
 
     fn balances_settled(&self) -> bool {
@@ -1848,15 +1832,6 @@ impl App {
                     self.auto_lock_after = Duration::from_secs(m * 60);
                     self.toast_info(format!("Auto-lock after {m} min"));
                 }
-                (SettingChange::UpdateCheck(on), Ok(())) => {
-                    self.update_check_enabled = on;
-                    if on {
-                        self.send_cmd(Command::CheckForUpdate);
-                        self.toast_info("Update checks on");
-                    } else {
-                        self.toast_info("Update checks off");
-                    }
-                }
                 (SettingChange::Currency(_), Err(e)) => {
                     self.toast_err(format!("Could not save currency: {e}"))
                 }
@@ -1865,9 +1840,6 @@ impl App {
                 }
                 (SettingChange::AutoLock(_), Err(e)) => {
                     self.toast_err(format!("Could not save auto-lock: {e}"))
-                }
-                (SettingChange::UpdateCheck(_), Err(e)) => {
-                    self.toast_err(format!("Could not save update setting: {e}"))
                 }
             },
             AppEvent::WalletTextSet { field, result, .. } => match result {
@@ -2429,22 +2401,19 @@ mod tests {
     }
 
     #[test]
-    fn idle_ticks_skip_redraw_while_events_request_exactly_one() {
+    fn idle_ticks_keep_ambient_animation_advancing() {
         let (mut app, _wallet_id) = idle_unlocked_app();
-        app.take_redraw();
-
-        let mut draws = 0;
-        for _ in 0..200 {
-            let redraw = app.tick();
-            if redraw || app.animations_active() {
-                app.request_redraw();
-            }
-            if app.take_redraw() {
-                draws += 1;
-            }
+        let start = app.anim_frame();
+        for _ in 0..10 {
+            app.tick();
         }
-        assert_eq!(draws, 0, "a fully idle app must not repaint on idle ticks");
+        assert_ne!(
+            app.anim_frame(),
+            start,
+            "the ambient animation frame must advance even when fully idle"
+        );
 
+        app.take_redraw();
         app.request_redraw();
         assert!(app.take_redraw(), "an event must trigger a redraw");
         assert!(
