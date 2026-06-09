@@ -539,30 +539,174 @@ fn render_confirm_send(f: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let from = app.wallets.iter().find(|w| w.id == ps.from_id);
-    let from_label = from.map(|w| w.display_name()).unwrap_or_default();
+    let from_label = from
+        .map(|w| format!("{} (#{})", w.display_name(), w.account_index))
+        .unwrap_or_default();
     let from_addr = from.map(|w| w.pubkey.clone()).unwrap_or_default();
-    let dest_label = app
-        .wallets
-        .iter()
-        .find(|w| w.pubkey == ps.to)
-        .map(|w| format!(" ({})", w.display_name()))
-        .unwrap_or_else(|| " (external)".to_string());
+    let dest = app.wallets.iter().find(|w| w.pubkey == ps.to);
+    let dest_internal = dest.map(|w| w.display_name());
 
     let price = app.price_now();
-    let usd = format::fmt_usd(price, ps.lamports);
-    let price_note = match price {
-        Some(p) => format!("{} {}s", p.source.as_str(), p.age_secs()),
-        None => "price unavailable".to_string(),
-    };
     let total = ps.lamports.saturating_add(ps.fee);
-    let bh_age = ps.prepared_at.elapsed().as_secs();
 
-    let rect = centered_rect(70, 16, area);
-    f.render_widget(Clear, rect);
-    let inner_w = rect.width.saturating_sub(2) as usize;
+    let armed = app.send_confirm_armed && app.pending_send_is_large();
+    let large_pct = from
+        .and_then(|w| w.balance_lamports)
+        .filter(|bal| *bal > 0)
+        .map(|bal| (total.saturating_mul(100) / bal).min(100));
+    let after = from
+        .and_then(|w| w.balance_lamports)
+        .map(|bal| bal.saturating_sub(total));
+
+    let width = 70u16;
+    let inner_w = width.min(area.width).saturating_sub(2).max(1) as usize;
     let addr_w = inner_w.saturating_sub(LABEL_W).max(1);
     let from_addr = format::elide_middle(&from_addr, addr_w);
     let to_addr = format::elide_middle(&ps.to, addr_w);
+
+    let label = |s: &str| {
+        Span::styled(
+            format!("  {s:<w$}", w = LABEL_TEXT_W),
+            Style::default().fg(theme.text_muted),
+        )
+    };
+    let val = |s: String| Span::styled(s, Style::default().fg(theme.text));
+    let indent = || Span::styled(format!("{:w$}", "", w = LABEL_W), Style::default());
+
+    let mut send_spans = vec![
+        label("send"),
+        Span::styled(
+            format!("{} SOL", format::fmt_sol_exact(ps.lamports)),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(p) = price {
+        let usd = format::fmt_usd(Some(p), ps.lamports);
+        send_spans.push(Span::styled(
+            format!("  ≈ {usd}"),
+            Style::default().fg(theme.text_muted),
+        ));
+        let age = p.age_secs();
+        if age > 60 {
+            let stale = age > crate::price::STALE_AFTER_SECS;
+            let color = if stale { theme.warn } else { theme.text_muted };
+            send_spans.push(Span::styled(
+                format!("  (price {}m old)", age / 60),
+                Style::default().fg(color),
+            ));
+        }
+    } else {
+        send_spans.push(Span::styled(
+            "  ≈ usd unavailable",
+            Style::default().fg(theme.text_muted),
+        ));
+    }
+
+    let mut body = vec![Line::from(""), Line::from(send_spans)];
+
+    if armed {
+        let pct = large_pct.unwrap_or(100);
+        body.push(Line::from(Span::styled(
+            format!("  ⚠ this sends ~{pct}% of this wallet's balance"),
+            Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    body.push(Line::from(vec![label("from"), val(from_label)]));
+    body.push(Line::from(vec![
+        indent(),
+        Span::styled(from_addr, Style::default().fg(theme.text)),
+    ]));
+
+    let to_span = match &dest_internal {
+        Some(name) => Span::styled(format!("({name})"), Style::default().fg(theme.text_muted)),
+        None => Span::styled(
+            "(external)".to_string(),
+            Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
+        ),
+    };
+    body.push(Line::from(vec![label("to"), to_span]));
+    body.push(Line::from(vec![
+        indent(),
+        Span::styled(to_addr, Style::default().fg(theme.text)),
+    ]));
+    if dest_internal.is_none() {
+        body.push(Line::from(vec![
+            indent(),
+            Span::styled(
+                "⚠ leaving your wallets",
+                Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+
+    body.push(Line::from(vec![
+        label("fee"),
+        val(format!("{} SOL", format::fmt_sol_exact(ps.fee))),
+    ]));
+    body.push(Line::from(vec![
+        label("total"),
+        Span::styled(
+            format!("{} SOL", format::fmt_sol_exact(total)),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    if let Some(after) = after {
+        body.push(Line::from(vec![
+            label("after"),
+            Span::styled(
+                format!("≈ {} SOL", format::fmt_sol_exact(after)),
+                Style::default().fg(theme.text_muted),
+            ),
+        ]));
+    }
+
+    let refreshing = ps.prepared_at.elapsed() > crate::input::BLOCKHASH_REFRESH_AFTER;
+    if refreshing {
+        body.push(Line::from(Span::styled(
+            "  Refreshing network details…",
+            Style::default().fg(theme.text_muted),
+        )));
+    }
+
+    let send_label = if armed {
+        "confirm large send"
+    } else {
+        "Send now"
+    };
+    let action = Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            " Enter ",
+            Style::default()
+                .bg(theme.warn)
+                .fg(theme.bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {send_label}"),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("   ", Style::default()),
+        Span::styled(
+            " Esc ",
+            Style::default().bg(theme.border_idle).fg(theme.text),
+        ),
+        Span::styled(" cancel", Style::default().fg(theme.text)),
+    ]);
+    let helper = Line::from(Span::styled(
+        "  signs and broadcasts the transaction",
+        Style::default().fg(theme.text_muted),
+    ));
+
+    let want = (2 + body.len() + 2 + 1) as u16;
+    let height = want.min(area.height).max(3);
+    let rect = centered_rect(width, height, area);
+    f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -573,77 +717,15 @@ fn render_confirm_send(f: &mut Frame, app: &App, area: Rect) {
         ))
         .style(Style::default().bg(theme.surface));
 
-    let label = |s: &str| {
-        Span::styled(
-            format!("  {s:<w$}", w = LABEL_TEXT_W),
-            Style::default().fg(theme.text_muted),
-        )
-    };
-    let val = |s: String| Span::styled(s, Style::default().fg(theme.text));
-    let mut body = vec![
-        Line::from(""),
-        Line::from(vec![
-            label("send"),
-            Span::styled(
-                format!("{} SOL", format::fmt_sol_exact(ps.lamports)),
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  ≈ {usd}  ({price_note})"),
-                Style::default().fg(theme.text_muted),
-            ),
-        ]),
-        Line::from(vec![label("from"), val(from_label)]),
-        Line::from(vec![
-            Span::styled(format!("{:w$}", "", w = LABEL_W), Style::default()),
-            Span::styled(from_addr, Style::default().fg(theme.text)),
-        ]),
-        Line::from(vec![label("to"), val(dest_label)]),
-        Line::from(vec![
-            Span::styled(format!("{:w$}", "", w = LABEL_W), Style::default()),
-            Span::styled(to_addr, Style::default().fg(theme.text)),
-        ]),
-        Line::from(vec![
-            label("fee"),
-            val(format!("{} SOL", format::fmt_sol_exact(ps.fee))),
-            Span::styled(
-                format!("   total {} SOL", format::fmt_sol_exact(total)),
-                Style::default().fg(theme.text_muted),
-            ),
-        ]),
-        Line::from(vec![
-            label("hash"),
-            Span::styled(
-                format!("blockhash age {bh_age}s (re-fetched if stale)"),
-                Style::default().fg(theme.text_muted),
-            ),
-        ]),
-    ];
-    let action = Line::from(vec![
-        Span::styled("     ", Style::default()),
-        Span::styled(
-            " Enter ",
-            Style::default()
-                .bg(theme.accent)
-                .fg(theme.bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" sign & broadcast      ", Style::default().fg(theme.text)),
-        Span::styled(
-            " Esc ",
-            Style::default().bg(theme.border_idle).fg(theme.text),
-        ),
-        Span::styled(" cancel", Style::default().fg(theme.text)),
-    ]);
     let avail = rect.height.saturating_sub(2) as usize;
-    if body.len() + 1 > avail {
-        body.truncate(avail.saturating_sub(1));
+    if body.len() + 3 > avail {
+        body.truncate(avail.saturating_sub(3));
     }
-    while body.len() + 1 < avail {
+    while body.len() + 3 < avail {
         body.push(Line::from(""));
     }
+    body.push(Line::from(""));
+    body.push(helper);
     body.push(action);
     f.render_widget(
         Paragraph::new(body).block(block).wrap(Wrap { trim: false }),

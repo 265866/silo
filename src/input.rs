@@ -7,7 +7,7 @@ use crate::crypto;
 use crate::solana::tx;
 use crate::types::{Role, RouteError, WalletRow};
 
-const BLOCKHASH_REFRESH_AFTER: std::time::Duration = std::time::Duration::from_secs(45);
+pub(crate) const BLOCKHASH_REFRESH_AFTER: std::time::Duration = std::time::Duration::from_secs(45);
 
 pub fn handle_event(app: &mut App, ev: Event) {
     match ev {
