@@ -496,7 +496,11 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
                     Cell::from("")
                 };
                 let pending = if w.has_open_intent { " ⏳" } else { "" };
-                let name_text = w.display_name();
+                let name_text = if archived {
+                    format!("  {}", w.display_name())
+                } else {
+                    w.display_name()
+                };
                 let shown = app.shown_balance(w);
                 let bal = match shown {
                     Some(l) => format!("{} SOL", format::fmt_sol(l)),
