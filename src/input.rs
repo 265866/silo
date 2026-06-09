@@ -894,10 +894,6 @@ fn settings_keys(app: &mut App, key: KeyEvent) {
                 change: crate::app::SettingChange::Currency(currency),
             });
         }
-        KeyCode::Char('L') => {
-            app.lock();
-            app.toast_info("Locked");
-        }
         KeyCode::Char('p') => {
             let priority = crate::money::next_priority_preset(app.priority_micro);
             app.send_cmd(Command::PersistSetting {
@@ -1883,6 +1879,33 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn settings_plain_l_does_not_lock_but_ctrl_l_does() {
+        let mut h = harness(true);
+        h.app.modal = None;
+        h.app.route = Route::Settings;
+        assert!(h.app.seed.is_some(), "fixture must start unlocked");
+
+        handle_key(
+            &mut h.app,
+            KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE),
+        );
+        handle_key(
+            &mut h.app,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+        );
+        assert!(
+            h.app.seed.is_some(),
+            "plain L/l on settings must not lock; ^L is the only lock key"
+        );
+
+        handle_key(
+            &mut h.app,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+        );
+        assert!(h.app.seed.is_none(), "^L must lock from settings");
     }
 
     #[test]
