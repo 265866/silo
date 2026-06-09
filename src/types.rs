@@ -130,6 +130,7 @@ pub struct WalletRow {
     pub label: Option<String>,
     pub note: Option<String>,
     pub archived: bool,
+    #[allow(dead_code)]
     pub created_at: i64,
     pub balance_lamports: Option<u64>,
     pub has_open_intent: bool,
@@ -189,6 +190,7 @@ impl IntentStatus {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct Intent {
     pub id: i64,
     pub from_wallet: i64,
@@ -208,11 +210,21 @@ pub struct Intent {
 
 #[derive(Clone, Debug)]
 pub enum TransferOutcome {
-    Submitted { signature: String },
-    Confirmed { signature: String },
-    Failed { reason: String },
+    Submitted {
+        signature: String,
+    },
+    Confirmed {
+        #[allow(dead_code)]
+        signature: String,
+    },
+    Failed {
+        reason: String,
+    },
     Expired,
-    StillPending { signature: String },
+    StillPending {
+        #[allow(dead_code)]
+        signature: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -274,6 +286,7 @@ impl AuditEvent {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct AuditEntry {
     pub id: i64,
     pub ts: i64,
@@ -287,7 +300,6 @@ pub struct AuditEntry {
 pub enum RouteError {
     SubToSubForbidden,
     SelfSend,
-    UnknownDestination,
     ProgramAddress,
 }
 impl std::fmt::Display for RouteError {
@@ -295,7 +307,6 @@ impl std::fmt::Display for RouteError {
         let s = match self {
             RouteError::SubToSubForbidden => "subwallet → subwallet is blocked",
             RouteError::SelfSend => "cannot send to the same wallet",
-            RouteError::UnknownDestination => "not a valid Solana address",
             RouteError::ProgramAddress => "cannot send to a program address",
         };
         f.write_str(s)

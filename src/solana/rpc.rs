@@ -13,6 +13,7 @@ const SIGSTATUS_CHUNK: usize = 256;
 const RETRY_AFTER_CAP_SECS: u64 = 60;
 
 #[derive(Clone, Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct SignatureStatus {
     pub slot: u64,
     #[serde(default)]
@@ -33,6 +34,7 @@ impl SignatureStatus {
     pub fn is_finalized(&self) -> bool {
         matches!(self.confirmation_status.as_deref(), Some("finalized"))
     }
+    #[allow(dead_code)]
     pub fn is_confirmed_or_finalized(&self) -> bool {
         self.is_confirmed() || self.is_finalized()
     }

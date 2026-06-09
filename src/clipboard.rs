@@ -1,7 +1,10 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyOutcome {
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     Persistent,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     NonPersistent,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     PersistenceUnknown,
 }
 

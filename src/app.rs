@@ -239,6 +239,7 @@ pub enum AppEvent {
         generation: u64,
     },
     TransferResult {
+        #[allow(dead_code)]
         intent_id: i64,
         outcome: TransferOutcome,
         transfer: Option<OptimisticTransfer>,

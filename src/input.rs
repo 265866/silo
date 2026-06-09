@@ -242,7 +242,7 @@ fn start_create(app: &mut App) {
         .for_each(|w| w.zeroize());
     app.setup.mnemonic_words.clear();
     app.input.import_phrase.zeroize();
-    match crypto::generate_mnemonic(crypto::WordCount::Twelve) {
+    match crypto::generate_mnemonic() {
         Ok(m) => {
             app.setup.creating = true;
             let phrase = Zeroizing::new(m.to_string());

@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_imports)]
-
 use std::sync::{Arc, Mutex};
 
 mod app;
@@ -315,7 +313,9 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{Shutdown, disable_bracketed_paste};
+    #[cfg(target_os = "linux")]
+    use super::Shutdown;
+    use super::disable_bracketed_paste;
 
     #[test]
     fn teardown_emits_disable_bracketed_paste() {

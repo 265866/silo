@@ -121,6 +121,7 @@ pub fn create_vault(path: &Path, mnemonic: &Mnemonic, passphrase: &str) -> Resul
     Ok(VaultKey(key))
 }
 
+#[allow(dead_code)]
 pub fn unlock_vault(path: &Path, passphrase: &str) -> Result<Mnemonic> {
     Ok(unlock_vault_keyed(path, passphrase)?.0)
 }
@@ -300,7 +301,7 @@ fn replace_atomic(tmp_path: &Path, path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{WordCount, generate_mnemonic};
+    use crate::crypto::generate_mnemonic;
     use proptest::prelude::*;
     use tempfile::tempdir;
 
@@ -317,7 +318,7 @@ mod tests {
     fn create_then_unlock_roundtrip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.json");
-        let mnemonic = generate_mnemonic(WordCount::Twelve).unwrap();
+        let mnemonic = generate_mnemonic().unwrap();
 
         create_vault(&path, &mnemonic, "correct horse battery staple").unwrap();
         assert!(vault_exists(&path));
@@ -330,7 +331,7 @@ mod tests {
     fn create_time_params_meet_cold_storage_floor() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.json");
-        let mnemonic = generate_mnemonic(WordCount::Twelve).unwrap();
+        let mnemonic = generate_mnemonic().unwrap();
         create_vault(&path, &mnemonic, "pw").unwrap();
 
         let vault: VaultFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -353,7 +354,7 @@ mod tests {
     fn legacy_param_vault_still_unlocks() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.json");
-        let mnemonic = generate_mnemonic(WordCount::Twelve).unwrap();
+        let mnemonic = generate_mnemonic().unwrap();
 
         let legacy_m = 19_456;
         let legacy_t = 2;
@@ -389,7 +390,7 @@ mod tests {
     fn wrong_passphrase_fails() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.json");
-        let mnemonic = generate_mnemonic(WordCount::Twelve).unwrap();
+        let mnemonic = generate_mnemonic().unwrap();
 
         create_vault(&path, &mnemonic, "right-passphrase").unwrap();
         assert!(unlock_vault(&path, "wrong-passphrase").is_err());
@@ -399,8 +400,8 @@ mod tests {
     fn refuses_to_overwrite_existing_vault() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.json");
-        let m1 = generate_mnemonic(WordCount::Twelve).unwrap();
-        let m2 = generate_mnemonic(WordCount::Twelve).unwrap();
+        let m1 = generate_mnemonic().unwrap();
+        let m2 = generate_mnemonic().unwrap();
 
         create_vault(&path, &m1, "pw").unwrap();
         assert!(create_vault(&path, &m2, "pw").is_err());
@@ -414,7 +415,7 @@ mod tests {
     fn corrupt_salt_length_errors_not_panics() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.json");
-        let mnemonic = generate_mnemonic(WordCount::Twelve).unwrap();
+        let mnemonic = generate_mnemonic().unwrap();
         create_vault(&path, &mnemonic, "pw").unwrap();
 
         let mut vault: VaultFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -431,7 +432,7 @@ mod tests {
     fn oversized_salt_errors_not_panics() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.json");
-        let mnemonic = generate_mnemonic(WordCount::Twelve).unwrap();
+        let mnemonic = generate_mnemonic().unwrap();
         create_vault(&path, &mnemonic, "pw").unwrap();
 
         let mut vault: VaultFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -451,7 +452,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.json");
-        let mnemonic = generate_mnemonic(WordCount::Twelve).unwrap();
+        let mnemonic = generate_mnemonic().unwrap();
         create_vault(&path, &mnemonic, "pw").unwrap();
 
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -462,7 +463,7 @@ mod tests {
     fn corrupt_nonce_length_errors_not_panics() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.json");
-        let mnemonic = generate_mnemonic(WordCount::Twelve).unwrap();
+        let mnemonic = generate_mnemonic().unwrap();
         create_vault(&path, &mnemonic, "pw").unwrap();
 
         let mut vault: VaultFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -478,7 +479,7 @@ mod tests {
     fn out_of_bounds_kdf_params_rejected() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.json");
-        let mnemonic = generate_mnemonic(WordCount::Twelve).unwrap();
+        let mnemonic = generate_mnemonic().unwrap();
         create_vault(&path, &mnemonic, "pw").unwrap();
 
         let mut vault: VaultFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -492,7 +493,7 @@ mod tests {
     fn tampered_ciphertext_fails() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.json");
-        let mnemonic = generate_mnemonic(WordCount::Twelve).unwrap();
+        let mnemonic = generate_mnemonic().unwrap();
         create_vault(&path, &mnemonic, "pw").unwrap();
 
         let mut vault: VaultFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
