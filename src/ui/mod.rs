@@ -211,23 +211,25 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(theme.text_muted),
         ));
     }
-    if !app.reconcile_done {
-        left.push(Span::styled(
-            format!("  {} syncing transfers", app.spinner()),
-            Style::default().fg(theme.warn),
-        ));
-    }
-    let loading_balances = app.wallets.iter().any(|w| w.balance_lamports.is_none());
-    if app.inflight > 0 || loading_balances {
-        let label = if loading_balances {
-            "loading balances"
-        } else {
-            ""
-        };
-        left.push(Span::styled(
-            format!("  {} {label}", app.spinner()),
-            Style::default().fg(theme.accent),
-        ));
+    if app.seed.is_some() {
+        if !app.reconcile_done {
+            left.push(Span::styled(
+                format!("  {} syncing transfers", app.spinner()),
+                Style::default().fg(theme.warn),
+            ));
+        }
+        let loading_balances = app.wallets.iter().any(|w| w.balance_lamports.is_none());
+        if app.inflight > 0 || loading_balances {
+            let label = if loading_balances {
+                "loading balances"
+            } else {
+                ""
+            };
+            left.push(Span::styled(
+                format!("  {} {label}", app.spinner()),
+                Style::default().fg(theme.accent),
+            ));
+        }
     }
 
     let price = format::fmt_price(app.price_now());

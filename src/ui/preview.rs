@@ -1651,6 +1651,12 @@ fn syncing_status_avoids_reconciling_jargon() {
     app.reconcile_done = false;
     app.net_status = NetStatus::Syncing;
     app.route = Route::WalletList;
+    let mnemonic = crate::crypto::parse_mnemonic(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+         about",
+    )
+    .unwrap();
+    app.seed = Some(crate::crypto::seed_from_mnemonic(&mnemonic));
 
     let out = render(&mut app);
     assert!(
