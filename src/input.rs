@@ -422,8 +422,7 @@ fn copy_addr(app: &mut App, addr: &str) {
 fn copy_upgrade_command(app: &mut App) {
     match app.update_available() {
         Some(_) => {
-            let hint = app.install_method.upgrade_hint();
-            let cmd = hint.strip_prefix("Run: ").unwrap_or(hint).to_string();
+            let cmd = app.install_method.upgrade_command().to_string();
             copy_text(app, &cmd, "Upgrade command copied", false);
         }
         None => app.toast_info("You're on the latest version"),

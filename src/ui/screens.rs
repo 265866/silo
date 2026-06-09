@@ -1,12 +1,56 @@
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table};
 
+use super::theme::Theme;
 use super::{LABEL_TEXT_W, LABEL_W, caret_if_focused, format, indent_span, label_span, panel};
 use crate::app::{App, SetupStage};
 use crate::types::{IntentStatus, Role};
+
+const PASS_BOX_INNER_W: usize = 40;
+
+fn passphrase_box(
+    f: &mut Frame,
+    area: Rect,
+    label: &str,
+    value_len: usize,
+    focused: bool,
+    theme: &Theme,
+) {
+    let border = if focused {
+        theme.accent
+    } else {
+        theme.border_idle
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border))
+        .title(Span::styled(
+            format!(" {label} "),
+            Style::default().fg(theme.text_muted),
+        ))
+        .style(Style::default().bg(theme.bg));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let shown = format::input_tail(&"•".repeat(value_len), PASS_BOX_INNER_W);
+    let shown_len = shown.chars().count() as u16;
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            shown,
+            Style::default().fg(theme.accent),
+        ))),
+        inner,
+    );
+
+    if focused {
+        let x = inner.x + shown_len.min(inner.width);
+        f.set_cursor_position(Position { x, y: inner.y });
+    }
+}
 
 pub(super) fn profile_select(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
@@ -59,7 +103,6 @@ pub(super) fn unlock(f: &mut Frame, app: &App, area: Rect) {
         None => "Unlock silo".to_string(),
     };
     let block = panel(title, true, theme);
-    let masked = format::input_tail(&"•".repeat(app.input.passphrase.chars().count()), 47);
     let error_line = if app.unlock_failed {
         Line::from(Span::styled(
             "  Incorrect passphrase — try again",
@@ -75,11 +118,9 @@ pub(super) fn unlock(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(theme.text_muted),
         )),
         Line::from(""),
-        Line::from(vec![
-            label_span("passphrase", theme),
-            Span::styled(masked, Style::default().fg(theme.accent)),
-            Span::styled("▏", Style::default().fg(theme.accent)),
-        ]),
+        Line::from(""),
+        Line::from(""),
+        Line::from(""),
         error_line,
         Line::from(""),
         Line::from(Span::styled(
@@ -90,6 +131,21 @@ pub(super) fn unlock(f: &mut Frame, app: &App, area: Rect) {
     let height = lines.len() as u16 + 2;
     let rect = super::centered_rect(78, height, area);
     f.render_widget(Paragraph::new(lines).block(block), rect);
+
+    let box_rect = Rect {
+        x: rect.x + 3,
+        y: rect.y + 4,
+        width: (PASS_BOX_INNER_W as u16 + 2).min(rect.width.saturating_sub(6)),
+        height: 3,
+    };
+    passphrase_box(
+        f,
+        box_rect,
+        "Passphrase",
+        app.input.passphrase.chars().count(),
+        true,
+        theme,
+    );
 }
 
 pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
@@ -299,9 +355,6 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
         }
         SetupStage::SetPassphrase => {
             let block = panel("Set a passphrase", true, theme);
-            let p1 = format::input_tail(&"•".repeat(app.input.passphrase.chars().count()), 45);
-            let p2 = format::input_tail(&"•".repeat(app.input.passphrase2.chars().count()), 45);
-            let cur = |i: usize| caret_if_focused(app.input.focus == i, theme);
             let pass = app.input.passphrase.as_str();
             let conf = app.input.passphrase2.as_str();
             let match_line = if pass.is_empty() && conf.is_empty() {
@@ -321,16 +374,12 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(theme.text_muted),
                 )),
                 Line::from(""),
-                Line::from(vec![
-                    label_span("passphrase", theme),
-                    Span::styled(p1, Style::default().fg(theme.accent)),
-                    cur(0),
-                ]),
-                Line::from(vec![
-                    label_span("confirm", theme),
-                    Span::styled(p2, Style::default().fg(theme.accent)),
-                    cur(1),
-                ]),
+                Line::from(""),
+                Line::from(""),
+                Line::from(""),
+                Line::from(""),
+                Line::from(""),
+                Line::from(""),
                 match_line,
                 Line::from(Span::styled(
                     "  8+ characters recommended",
@@ -343,6 +392,36 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
             ];
             let rect = super::setup_panel(area, lines.len() as u16 + 2);
             f.render_widget(Paragraph::new(lines).block(block), rect);
+
+            let box_w = (PASS_BOX_INNER_W as u16 + 2).min(rect.width.saturating_sub(6));
+            let pass_box = Rect {
+                x: rect.x + 3,
+                y: rect.y + 4,
+                width: box_w,
+                height: 3,
+            };
+            let confirm_box = Rect {
+                x: rect.x + 3,
+                y: rect.y + 7,
+                width: box_w,
+                height: 3,
+            };
+            passphrase_box(
+                f,
+                pass_box,
+                "Passphrase",
+                app.input.passphrase.chars().count(),
+                app.input.focus == 0,
+                theme,
+            );
+            passphrase_box(
+                f,
+                confirm_box,
+                "Confirm",
+                app.input.passphrase2.chars().count(),
+                app.input.focus == 1,
+                theme,
+            );
         }
     }
 }
@@ -496,7 +575,11 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
                     Cell::from("")
                 };
                 let pending = if w.has_open_intent { " ⏳" } else { "" };
-                let name_text = w.display_name();
+                let name_text = if archived {
+                    format!("  {}", w.display_name())
+                } else {
+                    w.display_name()
+                };
                 let shown = app.shown_balance(w);
                 let bal = match shown {
                     Some(l) => format!("{} SOL", format::fmt_sol(l)),

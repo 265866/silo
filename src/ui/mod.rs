@@ -39,7 +39,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     }
 
     let footer_text = footer_hints(app);
-    let footer_h = footer_height(&footer_text, area.width);
+    let footer_h = footer_height(app, &footer_text, area.width);
 
     let chunks = Layout::vertical([
         Constraint::Length(3),
@@ -194,40 +194,38 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
         dot_color = blend(dot_color, theme.bg, 0.55 * (1.0 - pulse(app.spinner_frame)));
     }
 
-    let mut left = match app.net_status {
-        NetStatus::Online => vec![Span::styled("● ", Style::default().fg(dot_color))],
-        NetStatus::Syncing => vec![Span::styled("● syncing ", Style::default().fg(dot_color))],
-        NetStatus::Offline => vec![Span::styled("● offline ", Style::default().fg(dot_color))],
-    };
-    if app.update_available().is_some() {
-        left.push(Span::styled(
-            "update available ",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ));
-        left.push(Span::styled(
-            "· press U to copy upgrade command",
+    let mut left = vec![
+        Span::styled("  ● ", Style::default().fg(dot_color)),
+        Span::styled(
+            crate::solana::rpc::rpc_host_label(&app.rpc_url),
             Style::default().fg(theme.text_muted),
+        ),
+    ];
+    if app.net_status == NetStatus::Offline {
+        left.push(Span::styled(
+            " · offline",
+            Style::default().fg(theme.danger),
         ));
     }
-    if !app.reconcile_done {
-        left.push(Span::styled(
-            format!("  {} syncing transfers", app.spinner()),
-            Style::default().fg(theme.warn),
-        ));
-    }
-    let loading_balances = app.wallets.iter().any(|w| w.balance_lamports.is_none());
-    if app.inflight > 0 || loading_balances {
-        let label = if loading_balances {
-            "loading balances"
-        } else {
-            ""
-        };
-        left.push(Span::styled(
-            format!("  {} {label}", app.spinner()),
-            Style::default().fg(theme.accent),
-        ));
+    if app.seed.is_some() {
+        if !app.reconcile_done {
+            left.push(Span::styled(
+                format!("  {} syncing transfers", app.spinner()),
+                Style::default().fg(theme.warn),
+            ));
+        }
+        let loading_balances = app.wallets.iter().any(|w| w.balance_lamports.is_none());
+        if app.inflight > 0 || loading_balances {
+            let label = if loading_balances {
+                "loading balances"
+            } else {
+                ""
+            };
+            left.push(Span::styled(
+                format!("  {} {label}", app.spinner()),
+                Style::default().fg(theme.accent),
+            ));
+        }
     }
 
     let price = format::fmt_price(app.price_now());
@@ -281,8 +279,7 @@ fn footer_hints(app: &App) -> String {
             crate::app::SetupStage::ConfirmMnemonic => "esc back",
         },
         Route::WalletList => {
-            "enter open · s send · n new subwallet · c copy address · ⏳ transfer in progress · ^L \
-             lock · q quit"
+            "enter open · s send · n new subwallet · c copy address · ^L lock · q quit"
         }
         Route::WalletDetail => {
             "s send · M to master · F fund · c copy address · h transfers · q back · ^L lock"
@@ -301,28 +298,74 @@ fn footer_hints(app: &App) -> String {
         }
     };
     let mut hints = hints.to_string();
-    if app.update_available().is_some()
-        && matches!(app.route, Route::WalletList | Route::WalletDetail)
-    {
-        hints.push_str(" · U upgrade");
+    if app.route == Route::WalletList && app.wallets.iter().any(|w| w.has_open_intent) {
+        hints.push_str(" · ⏳ transfer in progress");
     }
     hints
 }
 
-fn footer_height(hints: &str, width: u16) -> u16 {
+fn hint_height(hints: &str, width: u16) -> u16 {
     let avail = (width as usize).saturating_sub(1).max(1);
     let lines = format::wrap_lines(hints, avail).len() as u16;
-    lines.clamp(1, 3)
+    lines.clamp(1, 2)
+}
+
+fn upgrade_line_text(app: &App) -> Option<String> {
+    let latest = app.update_available()?;
+    Some(format!(
+        "↑ v{latest} · {}",
+        app.install_method.upgrade_command()
+    ))
+}
+
+fn footer_height(app: &App, hints: &str, width: u16) -> u16 {
+    let mut h = hint_height(hints, width);
+    if let Some(line) = upgrade_line_text(app) {
+        let avail = (width as usize).saturating_sub(1).max(1);
+        h += format::wrap_lines(&line, avail).len() as u16;
+    }
+    h.clamp(1, 4)
 }
 
 fn footer(f: &mut Frame, app: &App, hints: &str, area: Rect) {
-    let p = Paragraph::new(Line::from(Span::styled(
+    let theme = &app.theme;
+    let hints_p = Paragraph::new(Line::from(Span::styled(
         format!(" {hints}"),
-        Style::default().fg(app.theme.text_muted),
+        Style::default().fg(theme.text_muted),
     )))
     .wrap(Wrap { trim: true })
-    .style(Style::default().bg(app.theme.surface));
-    f.render_widget(p, area);
+    .style(Style::default().bg(theme.surface));
+
+    let Some(latest) = app.update_available() else {
+        f.render_widget(hints_p, area);
+        return;
+    };
+
+    let avail = (area.width as usize).saturating_sub(1).max(1);
+    let upgrade_text = upgrade_line_text(app).unwrap_or_default();
+    let upgrade_h = (format::wrap_lines(&upgrade_text, avail).len() as u16).min(area.height);
+    let hints_h = area.height.saturating_sub(upgrade_h);
+
+    let rows =
+        Layout::vertical([Constraint::Length(hints_h), Constraint::Length(upgrade_h)]).split(area);
+    f.render_widget(hints_p, rows[0]);
+
+    let notice = Paragraph::new(Line::from(vec![
+        Span::styled(
+            format!("↑ v{latest} · "),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            app.install_method.upgrade_command(),
+            Style::default().fg(theme.accent),
+        ),
+    ]))
+    .alignment(Alignment::Right)
+    .wrap(Wrap { trim: true })
+    .style(Style::default().bg(theme.surface));
+    f.render_widget(notice, rows[1]);
 }
 
 fn render_toasts(f: &mut Frame, app: &App, footer_area: Rect) {

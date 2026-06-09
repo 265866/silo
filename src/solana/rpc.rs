@@ -100,6 +100,55 @@ pub fn redact_rpc_url(raw: &str) -> String {
     }
 }
 
+const PROVIDER_NICKNAMES: &[(&str, &str)] = &[
+    ("solana.com", "Solana"),
+    ("helius-rpc.com", "Helius"),
+    ("alchemy.com", "Alchemy"),
+    ("quiknode.pro", "QuickNode"),
+    ("ankr.com", "Ankr"),
+    ("rpcpool.com", "Triton"),
+    ("syndica.io", "Syndica"),
+    ("shyft.to", "Shyft"),
+    ("chainstack.com", "Chainstack"),
+];
+
+pub fn rpc_host_label(raw: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        return raw.trim().to_string();
+    };
+    let Some(host_raw) = url.host_str() else {
+        return raw.trim().to_string();
+    };
+    let host = host_raw.to_ascii_lowercase();
+    let host = host.strip_suffix('.').unwrap_or(&host);
+
+    if host == "localhost" {
+        return "local".to_string();
+    }
+    let ip_candidate = host.strip_prefix('[').and_then(|h| h.strip_suffix(']'));
+    if let Ok(ip) = ip_candidate.unwrap_or(host).parse::<std::net::IpAddr>() {
+        if ip.is_loopback() {
+            return "local".to_string();
+        }
+        return match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
+        };
+    }
+
+    for (suffix, name) in PROVIDER_NICKNAMES {
+        if host == *suffix || host.ends_with(&format!(".{suffix}")) {
+            return (*name).to_string();
+        }
+    }
+
+    let mut labels = host.rsplit('.');
+    match (labels.next(), labels.next()) {
+        (Some(tld), Some(sld)) => format!("{sld}.{tld}"),
+        _ => host.to_string(),
+    }
+}
+
 #[derive(Deserialize)]
 struct RpcEnvelope<T> {
     result: Option<T>,
@@ -588,6 +637,43 @@ mod tests {
         assert_eq!(
             redact_rpc_url("http://127.0.0.1:8899"),
             "http://127.0.0.1:8899"
+        );
+    }
+
+    #[test]
+    fn rpc_host_label_maps_providers_and_hosts() {
+        assert_eq!(
+            rpc_host_label("https://api.mainnet-beta.solana.com"),
+            "Solana"
+        );
+        assert_eq!(rpc_host_label("https://mainnet.helius-rpc.com"), "Helius");
+        assert_eq!(
+            rpc_host_label("https://solana-mainnet.g.alchemy.com/v2/key"),
+            "Alchemy"
+        );
+        assert_eq!(
+            rpc_host_label("https://my-node.solana-mainnet.quiknode.pro/abc/"),
+            "QuickNode"
+        );
+        assert_eq!(rpc_host_label("https://rpc.ankr.com/solana"), "Ankr");
+        assert_eq!(rpc_host_label("http://127.0.0.1:8899"), "local");
+        assert_eq!(rpc_host_label("http://localhost:8899"), "local");
+        assert_eq!(rpc_host_label("https://rpc.example.io"), "example.io");
+        assert_eq!(rpc_host_label("http://10.0.0.5:8899"), "10.0.0.5:8899");
+        assert_eq!(rpc_host_label("not a url"), "not a url");
+
+        assert_eq!(rpc_host_label("http://[::1]"), "local");
+        assert_eq!(
+            rpc_host_label("http://[2001:db8::1]:8899"),
+            "[2001:db8::1]:8899"
+        );
+        assert_eq!(rpc_host_label("https://a.b.example.co.uk"), "co.uk");
+        assert_eq!(rpc_host_label("https://example.io"), "example.io");
+        assert_eq!(rpc_host_label("https://evil-solana.com"), "evil-solana.com");
+        assert_eq!(rpc_host_label("https://notsolana.com"), "notsolana.com");
+        assert_eq!(
+            rpc_host_label("https://api.mainnet-beta.solana.com."),
+            "Solana"
         );
     }
 
