@@ -261,8 +261,13 @@ fn footer_hints(app: &App) -> String {
             crate::app::SetupStage::SetPassphrase => "tab switch field · enter create · esc back",
             crate::app::SetupStage::ConfirmMnemonic => "esc back",
         },
-        Route::WalletList => "enter open · s send · n new · c copy · ^L lock · q quit",
-        Route::WalletDetail => "s send · M →master · F fund · c copy · h history · esc back",
+        Route::WalletList => {
+            "enter open · s send · n new subwallet · c copy address · ⏳ transfer in progress · ^L \
+             lock · q quit"
+        }
+        Route::WalletDetail => {
+            "s send · M to master · F fund · c copy address · h history · q back · ^L lock"
+        }
         Route::Send if app.input.focus == 1 => {
             "tab field · c SOL/fiat · m max (keep open) · a all (empty wallet) · enter review · ^V \
              paste · esc cancel"

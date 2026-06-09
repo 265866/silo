@@ -383,7 +383,7 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
                     Cell::from(Line::from(vec![
                         Span::raw("  "),
                         Span::styled(
-                            format!("{caret} Archived ({archived_count})"),
+                            format!("{caret} archived ({archived_count})"),
                             Style::default()
                                 .fg(theme.text_muted)
                                 .add_modifier(Modifier::BOLD),
@@ -486,7 +486,7 @@ pub(super) fn wallet_list(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .filter(|w| w.role == Role::Sub && !w.archived)
         .count();
-    let title = format!("Wallets ({master_count} master · {sub_count} sub)");
+    let title = format!("Wallets ({master_count} master · {sub_count} subwallet)");
 
     let mut widths = vec![Constraint::Length(4), Constraint::Min(18)];
     if show_addr {
