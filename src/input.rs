@@ -2403,4 +2403,152 @@ mod tests {
             "an ordinary wallet recipient must still be accepted"
         );
     }
+
+    fn setup_confirm_harness(words: &[&str]) -> Harness {
+        let mut h = harness(false);
+        h.app.modal = None;
+        h.app.route = Route::Setup;
+        h.app.setup.stage = SetupStage::ConfirmMnemonic;
+        h.app.setup.creating = true;
+        h.app.setup.mnemonic_words = words.iter().map(|w| w.to_string()).collect();
+        h.app.setup.begin_confirm(words.len());
+        h
+    }
+
+    #[test]
+    fn confirm_mismatch_points_at_first_differing_slot() {
+        let words = ["abandon", "ability", "able", "about"];
+        let mut h = setup_confirm_harness(&words);
+        h.app.setup.confirm_words = vec![
+            "abandon".into(),
+            "ability".into(),
+            "zoo".into(),
+            "about".into(),
+        ];
+        h.app.setup.confirm_focus = 3;
+
+        confirm_mnemonic_keys(
+            &mut h.app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        assert_eq!(h.app.setup.confirm_mismatch, Some(2));
+        assert_eq!(h.app.setup.confirm_focus, 2);
+        assert!(
+            h.app
+                .toasts
+                .iter()
+                .any(|t| t.text == "word 3 doesn't match"),
+            "must name the first mismatched word"
+        );
+    }
+
+    #[test]
+    fn confirm_mismatch_clears_on_edit() {
+        let words = ["abandon", "ability"];
+        let mut h = setup_confirm_harness(&words);
+        h.app.setup.confirm_mismatch = Some(1);
+        h.app.setup.confirm_focus = 1;
+
+        confirm_mnemonic_keys(
+            &mut h.app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        assert_eq!(h.app.setup.confirm_mismatch, None);
+    }
+
+    #[test]
+    fn confirm_right_arrow_does_not_commit_word() {
+        let words = ["abandon", "ability"];
+        let mut h = setup_confirm_harness(&words);
+        h.app.setup.confirm_words = vec!["aban".into(), String::new()];
+        h.app.setup.confirm_focus = 0;
+
+        confirm_mnemonic_keys(
+            &mut h.app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        );
+
+        assert_eq!(
+            h.app.setup.confirm_words[0], "aban",
+            "Right must not expand or commit the current slot"
+        );
+        assert_eq!(h.app.setup.confirm_focus, 1, "Right moves focus forward");
+    }
+
+    #[test]
+    fn confirm_space_commits_exact_valid_word() {
+        let words = ["add", "ability"];
+        let mut h = setup_confirm_harness(&words);
+        h.app.setup.confirm_words = vec!["add".into(), String::new()];
+        h.app.setup.confirm_focus = 0;
+
+        confirm_mnemonic_keys(
+            &mut h.app,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        );
+
+        assert_eq!(
+            h.app.setup.confirm_words[0], "add",
+            "an exact valid word commits as typed, not expanded to a longer prefix match"
+        );
+        assert_eq!(h.app.setup.confirm_focus, 1);
+    }
+
+    #[test]
+    fn empty_passphrase_confirm_defaults_to_safe() {
+        let mut h = harness(false);
+        h.app.route = Route::Setup;
+        h.app.setup.stage = SetupStage::SetPassphrase;
+        h.app.setup.creating = true;
+        h.app.setup.mnemonic_words = TEST_MNEMONIC.split_whitespace().map(String::from).collect();
+        h.app.input.passphrase = Zeroizing::new(String::new());
+        h.app.input.passphrase2 = Zeroizing::new(String::new());
+
+        finish_setup(&mut h.app);
+        assert!(
+            matches!(h.app.modal, Some(Modal::Confirm { .. })),
+            "empty passphrase must raise a confirm modal"
+        );
+
+        modal_keys(
+            &mut h.app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(h.app.modal.is_none(), "Enter dismisses the modal");
+        assert!(
+            h.rx.try_recv().is_err(),
+            "Enter must NOT proceed with an empty passphrase"
+        );
+
+        finish_setup(&mut h.app);
+        modal_keys(
+            &mut h.app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+        assert!(
+            matches!(h.rx.try_recv(), Ok((_, Command::FinishSetup { .. }))),
+            "explicit y proceeds with the empty passphrase"
+        );
+    }
+
+    #[test]
+    fn import_error_names_the_failing_word() {
+        assert_eq!(
+            import_phrase_error("abandon abandon abandon"),
+            "Recovery phrase has 3 words — expected 12 or 24"
+        );
+        let mut twelve: Vec<&str> = vec!["abandon"; 12];
+        twelve[4] = "zzzzz";
+        let phrase = twelve.join(" ");
+        assert_eq!(
+            import_phrase_error(&phrase),
+            "Word 5 ('zzzzz') is not a valid word"
+        );
+        let bad_checksum = ["abandon"; 12].join(" ");
+        assert_eq!(
+            import_phrase_error(&bad_checksum),
+            "Checksum failed — re-check the word order"
+        );
+    }
 }
