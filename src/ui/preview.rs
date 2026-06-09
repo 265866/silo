@@ -137,6 +137,48 @@ fn render(app: &mut App) -> String {
     buffer_to_string(terminal.backend().buffer())
 }
 
+fn empty_app() -> App {
+    let db = Db::open_memory().unwrap();
+    let db = Storage::new(db);
+    let price = Arc::new(PriceCache::new());
+    let (tx, _rx) = mpsc::channel::<(u64, Command)>(16);
+    let client = reqwest::Client::new();
+    let rpc = Arc::new(Mutex::new(crate::solana::rpc::Rpc::new(
+        client.clone(),
+        "https://api.mainnet-beta.solana.com",
+    )));
+    let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut app = App::new(
+        db,
+        price,
+        tx,
+        generation,
+        rpc,
+        client,
+        PathBuf::from("/tmp/silo-preview"),
+        "https://api.mainnet-beta.solana.com".into(),
+        PathBuf::from("/tmp/silo-preview/vault.json"),
+    );
+    app.reconcile_done = true;
+    app.net_status = NetStatus::Online;
+    app.reload_wallets();
+    app
+}
+
+fn cell_fg_present(app: &mut App, glyph: &str, fg: ratatui::style::Color) -> bool {
+    let backend = TestBackend::new(W, H);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| crate::ui::render(f, app)).unwrap();
+    let buf = terminal.backend().buffer().clone();
+    let area = buf.area;
+    (0..area.height).any(|y| {
+        (0..area.width).any(|x| {
+            buf.cell((x, y))
+                .is_some_and(|c| c.symbol() == glyph && c.fg == fg)
+        })
+    })
+}
+
 fn banner(title: &str) {
     println!("\n╔══════════════════════════════════════════════════════════════════════════╗");
     println!("  {title}");
@@ -303,7 +345,7 @@ fn preview_archived_dropdown() {
     let out = render(&mut app);
     print!("{out}");
     assert!(
-        out.contains("Archived (1)"),
+        out.contains("archived (1)"),
         "archived header should render"
     );
     assert!(
@@ -957,4 +999,132 @@ fn setup_panels_share_one_width_across_stages() {
             "every setup stage must share one border width; stage {stage:?} differs"
         );
     }
+}
+
+fn focus_wallet(app: &mut App, account_index: u32) {
+    let id = app
+        .wallets
+        .iter()
+        .find(|w| w.account_index == account_index)
+        .map(|w| w.id)
+        .unwrap();
+    app.focused_wallet = Some(id);
+    app.refresh_detail_intents_blocking();
+}
+
+#[test]
+fn wallet_detail_footer_advertises_back_and_lock() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.latest_version = None;
+    app.route = Route::WalletDetail;
+    focus_wallet(&mut app, 0);
+    let out = render(&mut app);
+    assert!(
+        out.contains("q back"),
+        "wallet-detail footer must advertise q back:\n{out}"
+    );
+    assert!(
+        out.contains("^L lock"),
+        "wallet-detail footer must advertise ^L lock:\n{out}"
+    );
+}
+
+#[test]
+fn wallet_footers_name_the_copy_object() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.latest_version = None;
+
+    app.route = Route::WalletList;
+    let list = render(&mut app);
+    assert!(
+        list.contains("c copy address"),
+        "wallet-list footer must name what c copies:\n{list}"
+    );
+
+    app.route = Route::WalletDetail;
+    focus_wallet(&mut app, 0);
+    let detail = render(&mut app);
+    assert!(
+        detail.contains("c copy address"),
+        "wallet-detail footer must name what c copies:\n{detail}"
+    );
+}
+
+#[test]
+fn wallet_list_title_spells_out_subwallet() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.route = Route::WalletList;
+    let out = render(&mut app);
+    assert!(
+        out.contains("subwallet)"),
+        "panel title must spell out subwallet, not abbreviate to sub:\n{out}"
+    );
+}
+
+#[test]
+fn wallet_detail_master_is_explained_and_gold() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.route = Route::WalletDetail;
+    focus_wallet(&mut app, 0);
+    let out = render(&mut app);
+    assert!(
+        out.contains("★ master"),
+        "master type line must carry the gold star cue:\n{out}"
+    );
+    assert!(
+        out.contains("funds subwallets") && out.contains("cannot be archived"),
+        "master type line must explain what master means:\n{out}"
+    );
+    let master_fg = app.theme.master;
+    assert!(
+        cell_fg_present(&mut app, "m", master_fg),
+        "the master label must render in the master color"
+    );
+}
+
+#[test]
+fn wallet_detail_subwallet_type_stays_plain() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.route = Route::WalletDetail;
+    focus_wallet(&mut app, 1);
+    let out = render(&mut app);
+    assert!(
+        out.contains("subwallet"),
+        "subwallet type line must label the role:\n{out}"
+    );
+    assert!(
+        !out.contains("funds subwallets"),
+        "the master qualifier must not appear on a subwallet:\n{out}"
+    );
+}
+
+#[test]
+fn wallet_list_footer_carries_pending_legend() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.latest_version = None;
+    app.route = Route::WalletList;
+    let out = render_sized(&mut app, 96, 24);
+    assert!(
+        out.contains('⏳') && out.contains("transfer in progress"),
+        "wallet-list footer must legend the pending glyph:\n{out}"
+    );
+}
+
+#[test]
+fn wallet_list_empty_state_prompts_for_a_subwallet() {
+    let mut app = empty_app();
+    app.toasts.clear();
+    app.route = Route::WalletList;
+    assert!(app.wallets.is_empty(), "fixture must start with no wallets");
+    let out = render(&mut app);
+    assert!(
+        out.contains("No wallets yet") && out.contains("press n to add a subwallet"),
+        "empty wallet list must prompt the user to add a subwallet:\n{out}"
+    );
 }
