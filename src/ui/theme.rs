@@ -30,7 +30,7 @@ impl Theme {
             danger: Color::Rgb(248, 113, 113),
             warn: Color::Rgb(251, 191, 36),
             selection_bg: Color::Rgb(27, 40, 64),
-            master: Color::Rgb(251, 191, 36),
+            master: Color::Rgb(234, 179, 8),
         }
     }
 }
