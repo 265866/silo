@@ -1644,8 +1644,6 @@ mod tests {
 
     fn status(err: bool, confirmation_status: Option<&str>) -> crate::solana::rpc::SignatureStatus {
         crate::solana::rpc::SignatureStatus {
-            slot: 1,
-            confirmations: None,
             err: err.then_some(json!("err")),
             confirmation_status: confirmation_status.map(String::from),
         }
