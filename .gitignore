@@ -1,3 +1,7 @@
 /target
 /secrets
 /.claude/
+/.cursor/
+/.codex/
+AGENTS.md
+CLAUDE.md
