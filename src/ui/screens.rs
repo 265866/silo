@@ -56,7 +56,7 @@ pub(super) fn unlock(f: &mut Frame, app: &App, area: Rect) {
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "  Enter your passphrase to unlock the vault.",
+            "  Enter your passphrase to unlock your wallet.",
             Style::default().fg(theme.text_muted),
         )),
         Line::from(""),
@@ -76,13 +76,12 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
     match app.setup.stage {
         SetupStage::Choose => {
-            let rect = super::centered_rect(60, 11, area);
             let block = panel("Welcome to silo", true, theme);
             let lines = vec![
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  No vault found. Set one up:",
-                    Style::default().fg(theme.text),
+                    "  A self-custody SOL wallet — your keys stay on this computer.",
+                    Style::default().fg(theme.text_muted),
                 )),
                 Line::from(""),
                 Line::from(vec![
@@ -91,6 +90,7 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
                         "  Create a new wallet (generate a recovery phrase)",
                         Style::default().fg(theme.text),
                     ),
+                    Span::styled("  (recommended)", Style::default().fg(theme.text_muted)),
                 ]),
                 Line::from(""),
                 Line::from(vec![
@@ -101,25 +101,35 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
                     ),
                 ]),
             ];
+            let rect = super::setup_panel(area, lines.len() as u16 + 2);
             f.render_widget(Paragraph::new(lines).block(block), rect);
         }
         SetupStage::ShowMnemonic => {
-            let rect = super::centered_rect(76, 15, area);
-            let inner_w = rect.width.saturating_sub(2) as usize;
+            let inner_w = super::SETUP_WIDTH.saturating_sub(2) as usize;
             let grid_cols = if inner_w >= 59 { 4 } else { 2 };
-            let block = panel("Your recovery phrase", true, theme);
+            let words = &app.setup.mnemonic_words;
             let mut lines = vec![
                 Line::from(Span::styled(
-                    "  Write these 12 words down and keep them safe.",
+                    format!(
+                        "  Write these {} words down and keep them safe.",
+                        words.len()
+                    ),
                     Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
                 )),
                 Line::from(Span::styled(
-                    "  Anyone with this phrase controls all funds. silo never shows it again.",
+                    "  Anyone with this recovery phrase controls all funds. silo never",
+                    Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    "  shows it again.",
+                    Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    "  Write it on paper. Never screenshot or save it to a file.",
                     Style::default().fg(theme.text_muted),
                 )),
                 Line::from(""),
             ];
-            let words = &app.setup.mnemonic_words;
             let row_count = words.len().div_ceil(grid_cols);
             for row in 0..row_count {
                 let mut spans = vec![Span::raw("   ")];
@@ -136,31 +146,31 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
             }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "  Press Enter once you've written them down.",
+                "  Enter continues · Esc goes back (a new recovery phrase will be generated).",
                 Style::default().fg(theme.text_muted),
             )));
+            let rect = super::setup_panel(area, lines.len() as u16 + 2);
+            let block = panel("Your recovery phrase", true, theme)
+                .border_style(Style::default().fg(theme.warn));
             f.render_widget(Paragraph::new(lines).block(block), rect);
         }
         SetupStage::ConfirmMnemonic => {
-            let rect = super::centered_rect(72, 16, area);
-            let inner_w = rect.width.saturating_sub(2) as usize;
+            let inner_w = super::SETUP_WIDTH.saturating_sub(2) as usize;
             let block = panel("Confirm recovery phrase", true, theme);
             let words = &app.setup.confirm_words;
             let total = words.len();
             let focus = app.setup.confirm_focus;
-            let done = words
-                .iter()
-                .filter(|w| crate::crypto::word_is_valid(w))
-                .count();
+            let mismatch = app.setup.confirm_mismatch;
+            let filled = words.iter().filter(|w| !w.is_empty()).count();
 
             let mut lines = vec![
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  Re-enter your phrase. Each word auto-completes and jumps to the",
+                    "  Re-enter your recovery phrase. Each word auto-completes and jumps",
                     Style::default().fg(theme.text_muted),
                 )),
                 Line::from(Span::styled(
-                    "  next box; backspace on an empty box goes back.",
+                    "  to the next box; backspace on an empty box goes back.",
                     Style::default().fg(theme.text_muted),
                 )),
                 Line::from(""),
@@ -177,11 +187,21 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
                     }
                     let w = &words[idx];
                     let focused = idx == focus;
+                    let mismatched = mismatch == Some(idx);
                     spans.push(Span::styled(
                         format!("{:>2} ", idx + 1),
                         Style::default().fg(theme.text_muted),
                     ));
-                    let field_style = if focused {
+                    let field_style = if mismatched {
+                        let base = Style::default()
+                            .fg(theme.danger)
+                            .add_modifier(Modifier::BOLD);
+                        if focused {
+                            base.bg(theme.selection_bg)
+                        } else {
+                            base
+                        }
+                    } else if focused {
                         Style::default()
                             .fg(theme.accent)
                             .bg(theme.selection_bg)
@@ -205,23 +225,45 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
             }
 
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                format!("  {done}/{total} words"),
-                Style::default().fg(theme.text_muted),
-            )));
+            if let Some(i) = mismatch {
+                lines.push(Line::from(Span::styled(
+                    format!("  word {} doesn't match", i + 1),
+                    Style::default().fg(theme.danger),
+                )));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    format!("  {filled}/{total} entered"),
+                    Style::default().fg(theme.text_muted),
+                )));
+            }
             lines.push(Line::from(Span::styled(
                 "  space/tab next · ←/→ move · enter confirm · esc back",
                 Style::default().fg(theme.text_muted),
             )));
+            let rect = super::setup_panel(area, lines.len() as u16 + 2);
             f.render_widget(Paragraph::new(lines).block(block), rect);
         }
         SetupStage::ImportEntry => {
-            let rect = super::centered_rect(70, 11, area);
             let block = panel("Import recovery phrase", true, theme);
+            let count = app.input.import_phrase.split_whitespace().count();
+            let target = if count > 12 { 24 } else { 12 };
+            let counter_style = if count == 12 || count == 24 {
+                Style::default().fg(theme.usd)
+            } else {
+                Style::default().fg(theme.text_muted)
+            };
+            let inner_w = super::SETUP_WIDTH.saturating_sub(2) as usize;
+            let phrase_lines = format::wrap_lines(app.input.import_phrase.as_str(), inner_w)
+                .len()
+                .max(1);
             let lines = vec![
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  Type or paste your 12/24-word phrase, then Enter.",
+                    "  Type or paste your 12/24-word recovery phrase, then Enter.",
+                    Style::default().fg(theme.text_muted),
+                )),
+                Line::from(Span::styled(
+                    "  Paste with ^V.",
                     Style::default().fg(theme.text_muted),
                 )),
                 Line::from(""),
@@ -233,14 +275,20 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
                     ),
                     Span::styled("▏", Style::default().fg(theme.accent)),
                 ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("  words: {count}/{target}"),
+                    counter_style,
+                )),
             ];
+            let height = lines.len() as u16 + phrase_lines.saturating_sub(1) as u16 + 2;
+            let rect = super::setup_panel(area, height);
             f.render_widget(
                 Paragraph::new(lines).wrap(Wrap { trim: true }).block(block),
                 rect,
             );
         }
         SetupStage::SetPassphrase => {
-            let rect = super::centered_rect(62, 10, area);
             let block = panel("Set a passphrase", true, theme);
             let p1 = format::input_tail(&"•".repeat(app.input.passphrase.chars().count()), 45);
             let p2 = format::input_tail(&"•".repeat(app.input.passphrase2.chars().count()), 45);
@@ -250,6 +298,18 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     Span::raw("")
                 }
+            };
+            let pass = app.input.passphrase.as_str();
+            let conf = app.input.passphrase2.as_str();
+            let match_line = if pass.is_empty() && conf.is_empty() {
+                Line::from(Span::raw(""))
+            } else if pass == conf {
+                Line::from(Span::styled("  ✓ match", Style::default().fg(theme.usd)))
+            } else {
+                Line::from(Span::styled(
+                    "  ✗ no match",
+                    Style::default().fg(theme.danger),
+                ))
             };
             let lines = vec![
                 Line::from(""),
@@ -274,12 +334,17 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
                     Span::styled(p2, Style::default().fg(theme.accent)),
                     cur(1),
                 ]),
-                Line::from(""),
+                match_line,
                 Line::from(Span::styled(
-                    "  tab switch · enter create vault",
+                    "  8+ characters recommended",
+                    Style::default().fg(theme.text_muted),
+                )),
+                Line::from(Span::styled(
+                    "  tab switch · enter create",
                     Style::default().fg(theme.text_muted),
                 )),
             ];
+            let rect = super::setup_panel(area, lines.len() as u16 + 2);
             f.render_widget(Paragraph::new(lines).block(block), rect);
         }
     }

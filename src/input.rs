@@ -107,13 +107,18 @@ fn setup_keys(app: &mut App, key: KeyEvent) {
             _ => {}
         },
         SetupStage::ConfirmMnemonic => confirm_mnemonic_keys(app, key),
+        SetupStage::ImportEntry if ctrl(&key, 'v') => {
+            app.send_cmd(Command::ClipboardPaste {
+                target: crate::app::PasteTarget::ImportPhrase,
+            });
+        }
         SetupStage::ImportEntry => match key.code {
             KeyCode::Enter => match crypto::parse_mnemonic(&app.input.import_phrase) {
                 Ok(_) => {
                     app.setup.stage = SetupStage::SetPassphrase;
                     app.input.focus = 0;
                 }
-                Err(_) => app.toast_err("Invalid recovery phrase"),
+                Err(_) => app.toast_err(import_phrase_error(&app.input.import_phrase)),
             },
             KeyCode::Esc => leave_setup_substage(app),
             _ => {
@@ -242,7 +247,7 @@ fn start_create(app: &mut App) {
             app.setup.mnemonic_words = phrase.split_whitespace().map(String::from).collect();
             app.setup.stage = SetupStage::ShowMnemonic;
         }
-        Err(e) => app.toast_err(format!("could not generate phrase: {e}")),
+        Err(e) => app.toast_err(format!("Couldn't generate recovery phrase: {e}")),
     }
 }
 
@@ -255,7 +260,8 @@ fn finish_setup(app: &mut App) {
         app.modal = Some(Modal::Confirm {
             title: "No passphrase".into(),
             body: "Your recovery phrase will be saved with an EMPTY passphrase — anyone with \
-                   access to this computer's files could read it. Continue without a passphrase?"
+                   access to this computer's files could read it. Press y to continue without a \
+                   passphrase, or Enter/Esc to go back and set one."
                 .into(),
             action: crate::app::ConfirmAction::CreateWithEmptyPassphrase,
         });
@@ -275,7 +281,7 @@ fn create_vault_and_finish(app: &mut App) {
         Zeroizing::new(app.input.import_phrase.to_string())
     };
     if let Err(e) = crypto::parse_mnemonic(&phrase) {
-        app.toast_err(format!("invalid phrase: {e}"));
+        app.toast_err(format!("Invalid recovery phrase: {e}"));
         return;
     }
     let passphrase = std::mem::replace(&mut app.input.passphrase, Zeroizing::new(String::new()));
@@ -291,11 +297,31 @@ fn create_vault_and_finish(app: &mut App) {
     }) {
         app.blocking_input = true;
         app.toast_info(if app.setup.creating {
-            "Creating vault…"
+            "Creating wallet…"
         } else {
-            "Importing vault…"
+            "Importing wallet…"
         });
     }
+}
+
+const VALID_WORD_COUNTS: [usize; 5] = [12, 15, 18, 21, 24];
+
+fn import_phrase_error(phrase: &str) -> String {
+    let words: Vec<&str> = phrase.split_whitespace().collect();
+    let count = words.len();
+    if count == 0 {
+        return "Enter your recovery phrase".into();
+    }
+    if !VALID_WORD_COUNTS.contains(&count) {
+        return format!("Recovery phrase has {count} words — expected 12 or 24");
+    }
+    if let Some(pos) = words
+        .iter()
+        .position(|w| !crypto::word_is_valid(&w.to_ascii_lowercase()))
+    {
+        return format!("Word {} ('{}') is not a valid word", pos + 1, words[pos]);
+    }
+    "Checksum failed — re-check the word order".into()
 }
 
 fn next_wallet_name(profiles: &[crate::profiles::ProfileMeta]) -> String {

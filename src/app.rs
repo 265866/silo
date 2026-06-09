@@ -371,6 +371,7 @@ impl AppEvent {
 pub enum PasteTarget {
     SendTo,
     SendAmount,
+    ImportPhrase,
 }
 
 #[derive(Debug)]
@@ -1675,7 +1676,7 @@ impl App {
                         self.send_cmd(Command::FetchPrice);
                         self.send_cmd(Command::Reconcile);
                         self.request_balance_refresh();
-                        self.toast_ok("Vault created");
+                        self.toast_ok("Wallet created");
                         self.celebrate_center();
                     }
                     SetupResult::Failed(reason) => self.toast_err(reason),
@@ -1781,13 +1782,20 @@ impl App {
                 Err(e) => self.toast_err(format!("Copy failed: {e}")),
             },
             AppEvent::ClipboardPasted { target, result, .. } => {
-                if self.route != Route::Send {
+                let on_screen = match target {
+                    PasteTarget::SendTo | PasteTarget::SendAmount => self.route == Route::Send,
+                    PasteTarget::ImportPhrase => {
+                        self.route == Route::Setup && self.setup.stage == SetupStage::ImportEntry
+                    }
+                };
+                if !on_screen {
                     return;
                 }
                 match result {
                     Ok(text) => match target {
                         PasteTarget::SendTo => self.input.send_to = text.trim().to_string(),
                         PasteTarget::SendAmount => self.input.send_amount = text.trim().to_string(),
+                        PasteTarget::ImportPhrase => self.input.import_phrase.push_str(text.trim()),
                     },
                     Err(e) => self.toast_err(format!("Paste failed: {e}")),
                 }
