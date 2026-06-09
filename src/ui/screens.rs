@@ -917,13 +917,45 @@ fn status_style(s: IntentStatus, theme: &super::theme::Theme) -> (String, ratatu
         IntentStatus::Failed => ("failed".into(), theme.danger),
         IntentStatus::Expired => ("expired".into(), theme.warn),
         IntentStatus::Submitted => ("submitted ⏳".into(), theme.warn),
-        IntentStatus::Signed => ("signing ⏳".into(), theme.warn),
+        IntentStatus::Signed => ("signed ⏳".into(), theme.warn),
         IntentStatus::Created => ("pending ⏳".into(), theme.warn),
     }
 }
 
 pub(super) fn audit_log(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = &app.theme;
+
+    if app.audit.is_empty() {
+        let lines = vec![
+            Line::from(Span::styled(
+                "  Tamper-evident record of every action",
+                Style::default().fg(theme.text_muted),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  no events yet",
+                Style::default().fg(theme.text_muted),
+            )),
+        ];
+        let p = Paragraph::new(lines).block(panel("Audit log", true, theme));
+        f.render_widget(p, area);
+        return;
+    }
+
+    let blk = panel("Audit log", true, theme);
+    let inner = blk.inner(area);
+    f.render_widget(blk, area);
+
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "  Tamper-evident record of every action",
+            Style::default().fg(theme.text_muted),
+        ))),
+        chunks[0],
+    );
+
     let header = Row::new(vec![
         Cell::from("WHEN"),
         Cell::from("EVENT"),
@@ -962,9 +994,8 @@ pub(super) fn audit_log(f: &mut Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header)
         .row_highlight_style(Style::default().bg(theme.selection_bg))
-        .highlight_symbol("▸ ")
-        .block(panel("Audit log (append-only, hash-chained)", true, theme));
-    f.render_stateful_widget(table, area, &mut app.audit_state);
+        .highlight_symbol("▸ ");
+    f.render_stateful_widget(table, chunks[1], &mut app.audit_state);
 }
 
 fn compact_json(v: &serde_json::Value) -> String {

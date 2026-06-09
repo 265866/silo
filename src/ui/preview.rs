@@ -1128,3 +1128,109 @@ fn wallet_list_empty_state_prompts_for_a_subwallet() {
         "empty wallet list must prompt the user to add a subwallet:\n{out}"
     );
 }
+
+#[test]
+fn audit_log_empty_state_shows_no_events_yet() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.route = Route::AuditLog;
+    app.audit.clear();
+    let out = render(&mut app);
+    assert!(
+        out.contains("no events yet"),
+        "empty audit log must show 'no events yet':\n{out}"
+    );
+    assert!(
+        out.contains("Audit log"),
+        "empty audit log must still show the panel title:\n{out}"
+    );
+}
+
+#[test]
+fn audit_log_title_and_subtitle() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.route = Route::AuditLog;
+    app.refresh_audit_blocking();
+    let out = render(&mut app);
+    assert!(
+        out.contains("Audit log"),
+        "audit log panel title must read 'Audit log':\n{out}"
+    );
+    assert!(
+        !out.contains("append-only") && !out.contains("hash-chained"),
+        "implementation jargon must not appear in the panel title:\n{out}"
+    );
+    assert!(
+        out.contains("Tamper-evident record of every action"),
+        "tamper-evidence subtitle must appear inside the panel:\n{out}"
+    );
+}
+
+#[test]
+fn history_footer_shows_scroll_key_hints() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.latest_version = None;
+    app.route = Route::History;
+    let out = render_sized(&mut app, 96, 24);
+    assert!(
+        out.contains("PgUp/PgDn"),
+        "history footer must show PgUp/PgDn:\n{out}"
+    );
+    assert!(
+        out.contains("Home/End"),
+        "history footer must show Home/End:\n{out}"
+    );
+}
+
+#[test]
+fn audit_log_footer_shows_scroll_key_hints() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.latest_version = None;
+    app.route = Route::AuditLog;
+    let out = render_sized(&mut app, 96, 24);
+    assert!(
+        out.contains("PgUp/PgDn"),
+        "audit log footer must show PgUp/PgDn:\n{out}"
+    );
+    assert!(
+        out.contains("Home/End"),
+        "audit log footer must show Home/End:\n{out}"
+    );
+}
+
+#[test]
+fn status_style_signed_is_past_participle_not_gerund() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.route = Route::History;
+
+    let from = app.wallets[0].id;
+    let to = app.wallets[1].pubkey.clone();
+    app.db.call_blocking(move |d| {
+        let i = d.create_intent(from, &to, 500_000_000, None).unwrap();
+        d.mark_signed(
+            i.id,
+            "5Hx9c4kQ2mWnTr8sV1pLb3JfYx7aZ2nQ8mK9kQpVtRf2dGhEjKpLmNoPqRsTuVwXy",
+            "BhAsH",
+            1000,
+            5023,
+            b"wire",
+        )
+        .unwrap();
+    });
+    app.focused_wallet = Some(app.wallets[0].id);
+    app.refresh_detail_intents_blocking();
+
+    let out = render(&mut app);
+    assert!(
+        out.contains("signed"),
+        "signed status must appear in the history table:\n{out}"
+    );
+    assert!(
+        !out.contains("signing"),
+        "gerund 'signing' must not appear — only past-participle 'signed':\n{out}"
+    );
+}
