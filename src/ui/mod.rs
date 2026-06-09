@@ -273,8 +273,8 @@ fn footer_hints(app: &App) -> String {
              paste · esc cancel"
         }
         Route::Send => "tab field · enter review · ^V paste · esc cancel",
-        Route::History => "↑↓ scroll · c copy txid · t note · esc back",
-        Route::AuditLog => "↑↓ scroll · esc back",
+        Route::History => "↑↓ scroll · PgUp/PgDn · Home/End · c copy txid · t note · esc back",
+        Route::AuditLog => "↑↓ scroll · PgUp/PgDn · Home/End · esc back",
         Route::Settings => {
             "e edit RPC · u currency · p priority · +/- auto-lock · L lock now · esc back"
         }

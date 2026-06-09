@@ -917,7 +917,7 @@ fn status_style(s: IntentStatus, theme: &super::theme::Theme) -> (String, ratatu
         IntentStatus::Failed => ("failed".into(), theme.danger),
         IntentStatus::Expired => ("expired".into(), theme.warn),
         IntentStatus::Submitted => ("submitted ⏳".into(), theme.warn),
-        IntentStatus::Signed => ("signing ⏳".into(), theme.warn),
+        IntentStatus::Signed => ("signed ⏳".into(), theme.warn),
         IntentStatus::Created => ("pending ⏳".into(), theme.warn),
     }
 }
