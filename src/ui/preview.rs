@@ -861,6 +861,54 @@ fn import_shows_paste_hint_and_word_counter() {
     );
 }
 
+#[test]
+fn import_colors_valid_and_impossible_words() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.route = Route::Setup;
+    app.setup.stage = SetupStage::ImportEntry;
+    app.input.import_phrase = zeroize::Zeroizing::new("abandon zzzz".into());
+
+    let ok = app.theme.usd;
+    let bad = app.theme.danger;
+    assert!(
+        cell_fg_present(&mut app, "b", ok),
+        "a complete valid word must render in the ok color"
+    );
+    assert!(
+        cell_fg_present(&mut app, "z", bad),
+        "an impossible word must render in the danger color"
+    );
+    assert!(
+        !cell_fg_present(&mut app, "z", ok),
+        "an impossible word must not borrow the ok color"
+    );
+}
+
+#[test]
+fn import_leaves_valid_prefix_neutral() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.route = Route::Setup;
+    app.setup.stage = SetupStage::ImportEntry;
+    app.input.import_phrase = zeroize::Zeroizing::new("aban about".into());
+
+    let neutral = app.theme.text;
+    let bad = app.theme.danger;
+    assert!(
+        cell_fg_present(&mut app, "b", neutral),
+        "a valid prefix still being typed must stay neutral"
+    );
+    assert!(
+        !cell_fg_present(&mut app, "b", bad),
+        "a valid prefix must not be flagged as impossible while typing"
+    );
+    assert!(
+        !cell_fg_present(&mut app, "n", bad),
+        "no glyph of a prefix-only phrase may render in the danger color"
+    );
+}
+
 fn setup_stage_words() -> Vec<String> {
     "legal winner thank year wave sausage worth useful legal winner thank yellow"
         .split_whitespace()
