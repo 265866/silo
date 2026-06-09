@@ -383,7 +383,7 @@ fn wallet_list_keys(app: &mut App, key: KeyEvent) {
             app.refresh_audit();
         }
         KeyCode::Char('g') => app.route = Route::Settings,
-        KeyCode::Char('U') => copy_changelog(app),
+        KeyCode::Char('U') => copy_upgrade_command(app),
         KeyCode::Char('*') => app.celebrate_center(),
         _ => {}
     }
@@ -429,7 +429,7 @@ fn copy_addr(app: &mut App, addr: &str) {
     copy_text(app, addr, "Copied address", true);
 }
 
-fn copy_changelog(app: &mut App) {
+fn copy_upgrade_command(app: &mut App) {
     match app.update_available() {
         Some(_) => {
             let hint = app.install_method.upgrade_hint();
@@ -526,7 +526,7 @@ fn wallet_detail_keys(app: &mut App, key: KeyEvent) {
             app.route = Route::History;
             app.refresh_detail_intents();
         }
-        KeyCode::Char('U') => copy_changelog(app),
+        KeyCode::Char('U') => copy_upgrade_command(app),
         _ => {}
     }
 }
