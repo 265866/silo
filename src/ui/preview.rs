@@ -846,6 +846,51 @@ fn passphrase_shows_live_match_indicator() {
 }
 
 #[test]
+fn passphrase_boxes_keep_long_input_inside_their_borders() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.route = Route::Setup;
+    app.setup.stage = SetupStage::SetPassphrase;
+    app.input.passphrase = zeroize::Zeroizing::new("p".repeat(80));
+    app.input.passphrase2 = zeroize::Zeroizing::new("p".repeat(40));
+    app.input.focus = 0;
+
+    let backend = TestBackend::new(W, H);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+    let cursor = terminal.get_cursor_position().unwrap();
+    let buf = terminal.backend().buffer().clone();
+    let dump = buffer_to_string(&buf);
+    banner("SETUP — passphrase boxes with an 80-char passphrase");
+    print!("{dump}");
+
+    let mut box_inner = 0usize;
+    for line in dump.lines().filter(|l| l.contains('•')) {
+        let bullets = line.chars().filter(|c| *c == '•').count();
+        box_inner = box_inner.max(bullets);
+        let after = &line[line.find('•').unwrap()..];
+        assert!(
+            after.contains('│'),
+            "bullets must stay left of the box right border, never spill past it:\n{line}"
+        );
+    }
+    assert!(box_inner > 0, "the focused field must render bullets");
+
+    let on_bullet_row = (0..buf.area.height).any(|y| {
+        y == cursor.y
+            && (0..buf.area.width).any(|x| buf.cell((x, y)).is_some_and(|c| c.symbol() == "•"))
+    });
+    assert!(
+        on_bullet_row,
+        "the cursor must sit on the focused (bullet) row, not the confirm row"
+    );
+    assert!(
+        cursor.x < buf.area.width,
+        "the cursor must stay within the terminal width"
+    );
+}
+
+#[test]
 fn import_shows_paste_hint_and_word_counter() {
     let mut app = test_app();
     app.toasts.clear();
@@ -1358,6 +1403,44 @@ fn unlock_shows_inline_error_and_clears_field_on_failure() {
     assert!(
         cell_fg_present(&mut app, "I", danger),
         "the error line must render in the danger color"
+    );
+}
+
+#[test]
+fn unlock_renders_a_bordered_box_and_places_the_cursor_in_it() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.current_profile = Some("aaaa".into());
+    app.route = Route::Unlock;
+    app.input.passphrase = zeroize::Zeroizing::new("hunter2".into());
+    app.unlock_failed = false;
+
+    let backend = TestBackend::new(W, H);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+    let cursor = terminal.get_cursor_position().unwrap();
+    let buf = terminal.backend().buffer().clone();
+    let out = buffer_to_string(&buf);
+    banner("UNLOCK — bordered passphrase box");
+    print!("{out}");
+
+    assert!(
+        out.contains("Passphrase"),
+        "the unlock box must carry a Passphrase label:\n{out}"
+    );
+    assert_eq!(
+        out.matches('•').count(),
+        7,
+        "the box must mask the 7-char passphrase as bullets:\n{out}"
+    );
+    let last_bullet_x = (0..buf.area.width)
+        .rev()
+        .find(|&x| buf.cell((x, cursor.y)).is_some_and(|c| c.symbol() == "•"))
+        .expect("the cursor row must contain the masked bullets");
+    assert_eq!(
+        cursor.x,
+        last_bullet_x + 1,
+        "the cursor must sit just past the last visible bullet"
     );
 }
 
