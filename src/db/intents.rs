@@ -105,6 +105,13 @@ fn u64_from_i64(value: i64, column: usize, field: &'static str) -> rusqlite::Res
     Ok(value as u64)
 }
 
+struct TransitionContexts {
+    start: &'static str,
+    update: &'static str,
+    audit: &'static str,
+    commit: &'static str,
+}
+
 fn transition_miss(
     tx: &rusqlite::Transaction<'_>,
     id: i64,
@@ -221,6 +228,42 @@ impl Db {
         })
     }
 
+    fn transition(
+        &mut self,
+        id: i64,
+        ctx: TransitionContexts,
+        update: impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<usize>,
+        event: AuditEvent,
+        details: &serde_json::Value,
+    ) -> Result<IntentTransitionOutcome, IntentTransitionError> {
+        let key = self
+            .require_audit_key()
+            .map_err(IntentTransitionError::AuditKeyLocked)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| IntentTransitionError::Db {
+                context: ctx.start,
+                source,
+            })?;
+        let n = update(&tx).map_err(|source| IntentTransitionError::Db {
+            context: ctx.update,
+            source,
+        })?;
+        if n == 0 {
+            return transition_miss(&tx, id);
+        }
+        append_audit(&tx, &key, event, details).map_err(|source| IntentTransitionError::Db {
+            context: ctx.audit,
+            source,
+        })?;
+        tx.commit().map_err(|source| IntentTransitionError::Db {
+            context: ctx.commit,
+            source,
+        })?;
+        Ok(IntentTransitionOutcome::Applied)
+    }
+
     pub fn mark_signed(
         &mut self,
         id: i64,
@@ -240,53 +283,33 @@ impl Db {
             i64::try_from(fee_lamports).map_err(|_| IntentTransitionError::ValueOutOfRange {
                 field: "fee_lamports",
             })?;
-        let key = self
-            .require_audit_key()
-            .map_err(IntentTransitionError::AuditKeyLocked)?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|source| IntentTransitionError::Db {
-                context: "starting signed intent transition",
-                source,
-            })?;
-        let n = tx
-            .execute(
-                "UPDATE tx_intents SET status='signed', signature=?1, recent_blockhash=?2,
+        self.transition(
+            id,
+            TransitionContexts {
+                start: "starting signed intent transition",
+                update: "marking intent signed",
+                audit: "appending signed intent audit",
+                commit: "committing signed intent transition",
+            },
+            |tx| {
+                tx.execute(
+                    "UPDATE tx_intents SET status='signed', signature=?1, recent_blockhash=?2,
              last_valid_block_height=?3, fee_lamports=?4, signed_tx=?5, updated_at=?6
              WHERE id=?7 AND status='created'",
-                params![
-                    signature,
-                    recent_blockhash,
-                    last_valid_block_height,
-                    fee_lamports,
-                    signed_tx,
-                    now,
-                    id
-                ],
-            )
-            .map_err(|source| IntentTransitionError::Db {
-                context: "marking intent signed",
-                source,
-            })?;
-        if n == 0 {
-            return transition_miss(&tx, id);
-        }
-        append_audit(
-            &tx,
-            &key,
+                    params![
+                        signature,
+                        recent_blockhash,
+                        last_valid_block_height,
+                        fee_lamports,
+                        signed_tx,
+                        now,
+                        id
+                    ],
+                )
+            },
             AuditEvent::IntentSigned,
             &json!({"id": id, "signature": signature}),
         )
-        .map_err(|source| IntentTransitionError::Db {
-            context: "appending signed intent audit",
-            source,
-        })?;
-        tx.commit().map_err(|source| IntentTransitionError::Db {
-            context: "committing signed intent transition",
-            source,
-        })?;
-        Ok(IntentTransitionOutcome::Applied)
     }
 
     #[cfg(test)]
@@ -303,40 +326,24 @@ impl Db {
         id: i64,
     ) -> Result<IntentTransitionOutcome, IntentTransitionError> {
         let now = now_ms();
-        let key = self
-            .require_audit_key()
-            .map_err(IntentTransitionError::AuditKeyLocked)?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|source| IntentTransitionError::Db {
-                context: "starting intent transition",
-                source,
-            })?;
-        let n = tx
-            .execute(
-                "UPDATE tx_intents SET status='submitted', updated_at=?1
-             WHERE id=?2 AND status='signed'",
-                params![now, id],
-            )
-            .map_err(|source| IntentTransitionError::Db {
-                context: "marking intent submitted",
-                source,
-            })?;
-        if n == 0 {
-            return transition_miss(&tx, id);
-        }
-        append_audit(&tx, &key, AuditEvent::IntentSubmitted, &json!({"id": id})).map_err(
-            |source| IntentTransitionError::Db {
-                context: "appending transition audit",
-                source,
+        self.transition(
+            id,
+            TransitionContexts {
+                start: "starting intent transition",
+                update: "marking intent submitted",
+                audit: "appending transition audit",
+                commit: "committing intent transition",
             },
-        )?;
-        tx.commit().map_err(|source| IntentTransitionError::Db {
-            context: "committing intent transition",
-            source,
-        })?;
-        Ok(IntentTransitionOutcome::Applied)
+            |tx| {
+                tx.execute(
+                    "UPDATE tx_intents SET status='submitted', updated_at=?1
+             WHERE id=?2 AND status='signed'",
+                    params![now, id],
+                )
+            },
+            AuditEvent::IntentSubmitted,
+            &json!({"id": id}),
+        )
     }
 
     pub fn mark_terminal(
@@ -353,44 +360,24 @@ impl Db {
             _ => AuditEvent::IntentFailed,
         };
         let now = now_ms();
-        let key = self
-            .require_audit_key()
-            .map_err(IntentTransitionError::AuditKeyLocked)?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|source| IntentTransitionError::Db {
-                context: "starting intent transition",
-                source,
-            })?;
-        let n = tx
-            .execute(
-                "UPDATE tx_intents SET status=?1, error=?2, updated_at=?3
+        self.transition(
+            id,
+            TransitionContexts {
+                start: "starting intent transition",
+                update: "marking intent terminal",
+                audit: "appending transition audit",
+                commit: "committing intent transition",
+            },
+            |tx| {
+                tx.execute(
+                    "UPDATE tx_intents SET status=?1, error=?2, updated_at=?3
              WHERE id=?4 AND status NOT IN ('confirmed','failed','expired')",
-                params![status.as_str(), error, now, id],
-            )
-            .map_err(|source| IntentTransitionError::Db {
-                context: "marking intent terminal",
-                source,
-            })?;
-        if n == 0 {
-            return transition_miss(&tx, id);
-        }
-        append_audit(
-            &tx,
-            &key,
+                    params![status.as_str(), error, now, id],
+                )
+            },
             event,
             &json!({"id": id, "status": status.as_str(), "error": error}),
         )
-        .map_err(|source| IntentTransitionError::Db {
-            context: "appending transition audit",
-            source,
-        })?;
-        tx.commit().map_err(|source| IntentTransitionError::Db {
-            context: "committing intent transition",
-            source,
-        })?;
-        Ok(IntentTransitionOutcome::Applied)
     }
 
     pub fn set_intent_note(&mut self, id: i64, note: Option<&str>) -> Result<()> {
