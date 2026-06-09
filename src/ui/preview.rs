@@ -1202,6 +1202,110 @@ fn audit_log_footer_shows_scroll_key_hints() {
 }
 
 #[test]
+fn unlock_shows_inline_error_and_clears_field_on_failure() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.current_profile = Some("aaaa".into());
+    app.route = Route::Unlock;
+    app.input.passphrase = zeroize::Zeroizing::new(String::new());
+    app.unlock_failed = true;
+
+    let out = render(&mut app);
+    assert!(
+        out.contains("Incorrect passphrase"),
+        "failed unlock must render a persistent inline error:\n{out}"
+    );
+    assert!(
+        !out.contains('•'),
+        "the masked field must be cleared after a failed attempt:\n{out}"
+    );
+    let danger = app.theme.danger;
+    assert!(
+        cell_fg_present(&mut app, "I", danger),
+        "the error line must render in the danger color"
+    );
+}
+
+#[test]
+fn unlock_names_the_selected_profile() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.current_profile = Some("bbbb".into());
+    app.route = Route::Unlock;
+    let out = render(&mut app);
+    assert!(
+        out.contains("Trading desk"),
+        "unlock panel must name the profile being unlocked:\n{out}"
+    );
+    assert!(
+        out.contains("only the recovery phrase can"),
+        "unlock panel must warn that a lost passphrase is unrecoverable:\n{out}"
+    );
+}
+
+#[test]
+fn unlock_reserves_error_row_so_height_is_stable() {
+    let panel_geom = |app: &mut App| -> (usize, usize) {
+        let out = render(app);
+        let border_rows = out.lines().filter(|l| l.contains('╭') || l.contains('╰'));
+        let bordered = out.lines().filter(|l| l.contains('│')).count();
+        (border_rows.count(), bordered)
+    };
+
+    let mut clean = test_app();
+    clean.toasts.clear();
+    clean.current_profile = Some("aaaa".into());
+    clean.route = Route::Unlock;
+    clean.unlock_failed = false;
+    let clean_geom = panel_geom(&mut clean);
+
+    let mut failed = test_app();
+    failed.toasts.clear();
+    failed.current_profile = Some("aaaa".into());
+    failed.route = Route::Unlock;
+    failed.unlock_failed = true;
+    let failed_geom = panel_geom(&mut failed);
+
+    assert_eq!(
+        clean_geom, failed_geom,
+        "unlock panel must reserve the error row so its height never jumps between attempts"
+    );
+}
+
+#[test]
+fn profile_select_uses_profile_term_with_gloss_and_footer() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.latest_version = None;
+    app.route = Route::ProfileSelect;
+    let out = render(&mut app);
+    assert!(
+        out.contains("Choose a profile"),
+        "profile select body must use the profile term:\n{out}"
+    );
+    assert!(
+        out.contains("silo — profiles"),
+        "profile select title must use the profile term, not 'wallets':\n{out}"
+    );
+    assert!(
+        !out.contains("wallet profile"),
+        "title and body must not clash on profile vs wallet:\n{out}"
+    );
+    assert!(
+        out.contains("Each profile is a separate wallet with its own recovery phrase"),
+        "profile select must gloss what a profile is:\n{out}"
+    );
+    assert!(
+        out.contains("n new profile"),
+        "footer must label n as creating a new profile, matching what it does:\n{out}"
+    );
+    assert!(
+        !out.to_lowercase().contains("vault"),
+        "profile select must not surface the word 'vault':\n{out}"
+    );
+}
+
+#[test]
 fn status_style_signed_is_past_participle_not_gerund() {
     let mut app = test_app();
     app.toasts.clear();

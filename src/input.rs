@@ -1256,6 +1256,53 @@ mod tests {
     }
 
     #[test]
+    fn failed_unlock_sets_flag_empties_buffer_and_keystroke_clears_it() {
+        let mut h = harness(true);
+        h.app.route = Route::Unlock;
+        h.app.input.passphrase = Zeroizing::new("typed-while-waiting".to_string());
+
+        h.app.apply_app_event(AppEvent::UnlockComplete {
+            result: crate::app::UnlockResult::WrongPassphrase,
+            generation: h.app.generation.load(Ordering::SeqCst),
+        });
+        assert!(h.app.unlock_failed, "failed unlock must set the flag");
+        assert!(
+            h.app.input.passphrase.is_empty(),
+            "failed unlock must scrub the passphrase buffer"
+        );
+
+        unlock_keys(
+            &mut h.app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        assert!(
+            !h.app.unlock_failed,
+            "the next keystroke must clear the failed-unlock flag"
+        );
+        assert_eq!(h.app.input.passphrase.as_str(), "x");
+    }
+
+    #[test]
+    fn successful_unlock_clears_failed_flag() {
+        let mut h = harness(true);
+        h.app.route = Route::Unlock;
+        h.app.unlock_failed = true;
+        let seed = crypto::seed_from_mnemonic(&crypto::parse_mnemonic(TEST_MNEMONIC).unwrap());
+
+        h.app.apply_app_event(AppEvent::UnlockComplete {
+            result: crate::app::UnlockResult::Unlocked {
+                seed,
+                wallets: vec![],
+            },
+            generation: h.app.generation.load(Ordering::SeqCst),
+        });
+        assert!(
+            !h.app.unlock_failed,
+            "a successful unlock must clear the failed-unlock flag"
+        );
+    }
+
+    #[test]
     fn stale_fiat_price_cannot_compose_send_amount() {
         let mut h = harness(true);
         h.app.input.send_in_fiat = true;
