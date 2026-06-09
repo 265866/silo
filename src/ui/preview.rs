@@ -234,7 +234,7 @@ fn preview_all_screens() {
         kind: PromptKind::Note(app.wallets[2].id),
         title: "Set note".into(),
     });
-    banner("NOTE EDITOR — multi-line (ctrl+s save · enter newline · esc cancel)");
+    banner("NOTE EDITOR — multi-line (^S save · enter newline · esc cancel)");
     print!("{}", render(&mut app));
     app.modal = None;
     app.input.prompt_text.clear();
@@ -1337,4 +1337,129 @@ fn status_style_signed_is_past_participle_not_gerund() {
         !out.contains("signing"),
         "gerund 'signing' must not appear — only past-participle 'signed':\n{out}"
     );
+}
+
+#[test]
+fn authenticated_footers_advertise_ctrl_l_lock() {
+    let cases = [
+        (Route::Send, "send"),
+        (Route::History, "history"),
+        (Route::AuditLog, "audit log"),
+        (Route::Settings, "settings"),
+    ];
+    for (route, name) in cases {
+        let mut app = test_app();
+        app.toasts.clear();
+        app.latest_version = None;
+        app.route = route;
+        let out = render_sized(&mut app, 110, 24);
+        assert!(
+            out.contains("^L lock"),
+            "{name} footer must advertise ^L lock:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn error_modal_hint_exposes_esc() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.route = Route::WalletList;
+    app.modal = Some(Modal::Error {
+        title: "Send failed".into(),
+        body: "the network rejected this transaction".into(),
+    });
+    let out = render(&mut app);
+    assert!(
+        out.contains("enter / esc dismiss"),
+        "error modal must let esc dismiss, not only enter:\n{out}"
+    );
+    assert!(
+        !out.contains("press Enter"),
+        "error modal must drop the old enter-only phrasing:\n{out}"
+    );
+}
+
+#[test]
+fn footers_use_slash_arrows_not_bare_pair() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.latest_version = None;
+    app.route = Route::History;
+    let out = render_sized(&mut app, 110, 24);
+    assert!(
+        out.contains("↑/↓"),
+        "scroll hint must use the slash arrow form:\n{out}"
+    );
+    assert!(
+        !out.contains("↑↓"),
+        "no footer may carry the bare arrow pair:\n{out}"
+    );
+}
+
+#[test]
+fn scroll_and_move_footers_surface_vim_jk() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.latest_version = None;
+
+    app.route = Route::History;
+    let history = render_sized(&mut app, 110, 24);
+    assert!(
+        history.contains("↑/↓ jk scroll"),
+        "history scroll hint must surface vim jk:\n{history}"
+    );
+
+    app.route = Route::ProfileSelect;
+    let profiles = render_sized(&mut app, 110, 24);
+    assert!(
+        profiles.contains("↑/↓ jk move"),
+        "profile-select move hint must surface vim jk:\n{profiles}"
+    );
+}
+
+#[test]
+fn settings_drops_redundant_in_screen_hint_line() {
+    let mut app = test_app();
+    app.toasts.clear();
+    app.latest_version = None;
+    app.route = Route::Settings;
+    let out = render_sized(&mut app, 110, 24);
+    assert!(
+        !out.contains("lock now"),
+        "the redundant in-screen settings hint line must be gone:\n{out}"
+    );
+    assert!(
+        out.contains("(u to cycle)") && out.contains("(+/- to adjust)"),
+        "per-row inline hints must stay:\n{out}"
+    );
+    assert!(
+        out.contains("^L lock"),
+        "settings footer still advertises the lock key:\n{out}"
+    );
+}
+
+#[test]
+fn authenticated_footers_wrap_to_at_most_two_lines_at_width_80() {
+    let routes = [
+        Route::WalletList,
+        Route::WalletDetail,
+        Route::Send,
+        Route::History,
+        Route::AuditLog,
+        Route::Settings,
+    ];
+    for route in routes {
+        let mut app = test_app();
+        app.latest_version = Some("9.9.9".into());
+        app.focused_wallet = Some(app.wallets[0].id);
+        app.input.focus = 1;
+        app.route = route;
+        let hints = super::footer_hints(&app);
+        let lines = super::footer_height(&hints, 80);
+        assert!(
+            lines <= 2,
+            "{route:?} footer must wrap to at most 2 lines at width 80, got {lines}: {hints}"
+        );
+    }
 }
