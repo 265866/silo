@@ -532,6 +532,7 @@ pub struct SetupState {
     pub mnemonic_words: Vec<String>,
     pub confirm_words: Vec<String>,
     pub confirm_focus: usize,
+    pub confirm_mismatch: Option<usize>,
 }
 
 impl Default for SetupState {
@@ -542,6 +543,7 @@ impl Default for SetupState {
             mnemonic_words: Vec::new(),
             confirm_words: Vec::new(),
             confirm_focus: 0,
+            confirm_mismatch: None,
         }
     }
 }
@@ -559,6 +561,14 @@ impl SetupState {
         }
         self.confirm_words.clear();
         self.confirm_focus = 0;
+        self.confirm_mismatch = None;
+    }
+
+    pub fn first_confirm_mismatch(&self, expected: &[String]) -> Option<usize> {
+        self.confirm_words
+            .iter()
+            .zip(expected.iter())
+            .position(|(got, want)| got != want)
     }
 }
 

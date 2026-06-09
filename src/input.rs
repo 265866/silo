@@ -162,8 +162,12 @@ fn confirm_mnemonic_keys(app: &mut App, key: KeyEvent) {
                 app.setup.scrub_confirm();
                 app.setup.stage = SetupStage::SetPassphrase;
                 app.input.focus = 0;
+            } else if let Some(i) = app.setup.first_confirm_mismatch(&app.setup.mnemonic_words) {
+                app.setup.confirm_mismatch = Some(i);
+                app.setup.confirm_focus = i;
+                app.toast_err(format!("word {} doesn't match", i + 1));
             } else {
-                app.toast_err("Phrase doesn't match — check your backup");
+                app.toast_err("Recovery phrase doesn't match — check your backup");
             }
         }
         KeyCode::Esc => {
@@ -172,6 +176,7 @@ fn confirm_mnemonic_keys(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char(c) if c.is_ascii_alphabetic() => {
             let i = app.setup.confirm_focus;
+            app.setup.confirm_mismatch = None;
             app.setup.confirm_words[i].push(c.to_ascii_lowercase());
             let prefix = app.setup.confirm_words[i].clone();
             let sugg = crypto::word_suggestions(&prefix);
@@ -180,12 +185,16 @@ fn confirm_mnemonic_keys(app: &mut App, key: KeyEvent) {
                 advance_confirm_slot(app);
             }
         }
-        KeyCode::Char(' ') | KeyCode::Tab | KeyCode::Right => commit_confirm_slot(app),
+        KeyCode::Char(' ') | KeyCode::Tab => commit_confirm_slot(app),
         KeyCode::Left => {
             app.setup.confirm_focus = app.setup.confirm_focus.saturating_sub(1);
         }
+        KeyCode::Right => {
+            advance_confirm_slot(app);
+        }
         KeyCode::Backspace => {
             let i = app.setup.confirm_focus;
+            app.setup.confirm_mismatch = None;
             if app.setup.confirm_words[i].is_empty() {
                 app.setup.confirm_focus = i.saturating_sub(1);
             } else {
@@ -198,7 +207,12 @@ fn confirm_mnemonic_keys(app: &mut App, key: KeyEvent) {
 
 fn commit_confirm_slot(app: &mut App) {
     let i = app.setup.confirm_focus;
+    app.setup.confirm_mismatch = None;
     let cur = app.setup.confirm_words[i].clone();
+    if crypto::word_is_valid(&cur) {
+        advance_confirm_slot(app);
+        return;
+    }
     if !cur.is_empty()
         && let Some(w) = crypto::word_suggestions(&cur).first()
     {
@@ -952,11 +966,11 @@ fn modal_keys(app: &mut App, key: KeyEvent) {
     if let Some(Modal::Confirm { action, .. }) = &app.modal {
         let action = action.clone();
         match key.code {
-            KeyCode::Enter => {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
                 app.modal = None;
                 run_confirm_action(app, action);
             }
-            KeyCode::Esc => {
+            KeyCode::Enter | KeyCode::Esc => {
                 app.modal = None;
                 app.toast_info("Cancelled");
             }
