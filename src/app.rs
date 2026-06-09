@@ -1280,62 +1280,34 @@ impl App {
         SPINNER[self.spinner_frame]
     }
 
+    pub fn wallet_list_iter(&self) -> impl Iterator<Item = WalletListRow> + '_ {
+        let any_archived = self.wallets.iter().any(|w| w.archived);
+        let active = self
+            .wallets
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| !w.archived)
+            .map(|(i, _)| WalletListRow::Wallet(i));
+        let header = any_archived.then_some(WalletListRow::ArchivedHeader);
+        let archived = self
+            .wallets
+            .iter()
+            .enumerate()
+            .filter(move |(_, w)| any_archived && self.archived_expanded && w.archived)
+            .map(|(i, _)| WalletListRow::Wallet(i));
+        active.chain(header).chain(archived)
+    }
+
     pub fn wallet_list_rows(&self) -> Vec<WalletListRow> {
-        let mut rows = Vec::with_capacity(self.wallets.len() + 1);
-        for (i, w) in self.wallets.iter().enumerate() {
-            if !w.archived {
-                rows.push(WalletListRow::Wallet(i));
-            }
-        }
-        if self.wallets.iter().any(|w| w.archived) {
-            rows.push(WalletListRow::ArchivedHeader);
-            if self.archived_expanded {
-                for (i, w) in self.wallets.iter().enumerate() {
-                    if w.archived {
-                        rows.push(WalletListRow::Wallet(i));
-                    }
-                }
-            }
-        }
-        rows
+        self.wallet_list_iter().collect()
     }
 
     pub fn wallet_list_len(&self) -> usize {
-        self.wallets.iter().filter(|w| !w.archived).count()
-            + usize::from(self.wallets.iter().any(|w| w.archived))
-            + if self.archived_expanded {
-                self.wallets.iter().filter(|w| w.archived).count()
-            } else {
-                0
-            }
+        self.wallet_list_iter().count()
     }
 
-    fn wallet_list_row_at(&self, mut pos: usize) -> Option<WalletListRow> {
-        for (i, w) in self.wallets.iter().enumerate() {
-            if !w.archived {
-                if pos == 0 {
-                    return Some(WalletListRow::Wallet(i));
-                }
-                pos -= 1;
-            }
-        }
-        if self.wallets.iter().any(|w| w.archived) {
-            if pos == 0 {
-                return Some(WalletListRow::ArchivedHeader);
-            }
-            pos -= 1;
-            if self.archived_expanded {
-                for (i, w) in self.wallets.iter().enumerate() {
-                    if w.archived {
-                        if pos == 0 {
-                            return Some(WalletListRow::Wallet(i));
-                        }
-                        pos -= 1;
-                    }
-                }
-            }
-        }
-        None
+    fn wallet_list_row_at(&self, pos: usize) -> Option<WalletListRow> {
+        self.wallet_list_iter().nth(pos)
     }
 
     pub fn selected_wallet(&self) -> Option<&WalletRow> {
