@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/265866/silo/compare/v0.1.7...v0.1.8) - 2026-06-09
+
+### Added
+
+- *(ui)* color import phrase words by validity ([#205](https://github.com/265866/silo/pull/205))
+- *(ui)* rework unlock screen with profile name and recovery note ([#202](https://github.com/265866/silo/pull/202))
+- *(ui)* de-jargon transfers and audit log screens ([#201](https://github.com/265866/silo/pull/201))
+- *(ui)* wallet-list empty state, master role, and footer hints ([#200](https://github.com/265866/silo/pull/200))
+- *(ui)* improve setup guidance, validation, and import errors ([#199](https://github.com/265866/silo/pull/199))
+- *(ui)* surface denomination, spendable floor, and max in send ([#198](https://github.com/265866/silo/pull/198))
+- *(ui)* clarify confirm-send money review and external sends ([#197](https://github.com/265866/silo/pull/197))
+- check for updates and nudge to upgrade ([#193](https://github.com/265866/silo/pull/193))
+
+### Fixed
+
+- *(ui)* give master star its own column to keep names aligned ([#206](https://github.com/265866/silo/pull/206))
+- *(ui)* guard minimum terminal size and prevent clipping ([#196](https://github.com/265866/silo/pull/196))
+
+### Other
+
+- drop blanket dead_code allows for targeted ones ([#209](https://github.com/265866/silo/pull/209))
+- remove dead functions and unused imports ([#208](https://github.com/265866/silo/pull/208))
+- *(ui)* rename copy_changelog and drop dead changelog_url ([#207](https://github.com/265866/silo/pull/207))
+- *(ui)* normalize toast copy and de-jargon status text ([#204](https://github.com/265866/silo/pull/204))
+- *(ui)* normalize key notation and surface lock and scroll hints ([#203](https://github.com/265866/silo/pull/203))
+- *(ui)* unify column widths, label alignment, and loading states ([#195](https://github.com/265866/silo/pull/195))
+- *(ui)* distinguish master role color and unify status legends ([#194](https://github.com/265866/silo/pull/194))
+- ignore agent tooling files ([#191](https://github.com/265866/silo/pull/191))
+
 ## [0.1.7](https://github.com/265866/silo/compare/v0.1.6...v0.1.7) - 2026-06-08
 
 ### Added
