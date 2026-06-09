@@ -152,7 +152,7 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn get_wallet(&self, id: i64) -> Result<Option<WalletRow>> {
         let sql = format!("{SELECT_WALLET} WHERE w.id = ?1");
         Ok(self

@@ -34,7 +34,7 @@ impl SignatureStatus {
     pub fn is_finalized(&self) -> bool {
         matches!(self.confirmation_status.as_deref(), Some("finalized"))
     }
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn is_confirmed_or_finalized(&self) -> bool {
         self.is_confirmed() || self.is_finalized()
     }
