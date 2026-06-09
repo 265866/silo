@@ -4,6 +4,9 @@ mod preview;
 mod screens;
 pub mod theme;
 
+pub(super) const LABEL_W: usize = 12;
+pub(super) const LABEL_TEXT_W: usize = LABEL_W - 2;
+
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -177,9 +180,15 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(theme.warn),
         ));
     }
-    if app.inflight > 0 {
+    let loading_balances = app.wallets.iter().any(|w| w.balance_lamports.is_none());
+    if app.inflight > 0 || loading_balances {
+        let label = if loading_balances {
+            "loading balances"
+        } else {
+            ""
+        };
         left.push(Span::styled(
-            format!("  {} ", app.spinner()),
+            format!("  {} {label}", app.spinner()),
             Style::default().fg(theme.accent),
         ));
     }
@@ -480,7 +489,12 @@ fn render_confirm_send(f: &mut Frame, app: &App, area: Rect) {
         ))
         .style(Style::default().bg(theme.surface));
 
-    let label = |s: &str| Span::styled(format!("  {s:<7}"), Style::default().fg(theme.text_muted));
+    let label = |s: &str| {
+        Span::styled(
+            format!("  {s:<w$}", w = LABEL_TEXT_W),
+            Style::default().fg(theme.text_muted),
+        )
+    };
     let val = |s: String| Span::styled(s, Style::default().fg(theme.text));
     let lines = vec![
         Line::from(""),
@@ -499,12 +513,12 @@ fn render_confirm_send(f: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(vec![label("from"), val(from_label)]),
         Line::from(vec![
-            Span::styled("         ", Style::default()),
+            Span::styled(format!("{:w$}", "", w = LABEL_W), Style::default()),
             Span::styled(from_addr, Style::default().fg(theme.text)),
         ]),
         Line::from(vec![label("to"), val(dest_label)]),
         Line::from(vec![
-            Span::styled("         ", Style::default()),
+            Span::styled(format!("{:w$}", "", w = LABEL_W), Style::default()),
             Span::styled(ps.to.clone(), Style::default().fg(theme.text)),
         ]),
         Line::from(vec![
