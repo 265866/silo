@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9](https://github.com/265866/silo/compare/v0.1.8...v0.1.9) - 2026-06-16
+
+### Added
+
+- *(ui)* status-bar host label, footer upgrade notice, passphrase box ([#220](https://github.com/265866/silo/pull/220))
+
+### Fixed
+
+- *(db)* make mark_terminal reject non-terminal status by type ([#216](https://github.com/265866/silo/pull/216))
+
+### Other
+
+- *(deps)* bump release-plz/action from 0.5.129 to 0.5.130 ([#221](https://github.com/265866/silo/pull/221))
+- *(deps)* bump solana-message from 4.2.0 to 4.2.1 in the cargo-minor-patch group ([#222](https://github.com/265866/silo/pull/222))
+- *(app)* derive wallet-list len and row from one iterator ([#219](https://github.com/265866/silo/pull/219))
+- *(ui)* extract shared span helpers and dedup render ([#218](https://github.com/265866/silo/pull/218))
+- *(worker)* replace wallet-mismatch string sentinel with enum ([#217](https://github.com/265866/silo/pull/217))
+- *(db)* extract shared intent transition helper ([#215](https://github.com/265866/silo/pull/215))
+- *(solana)* share the confirmation-decision logic ([#214](https://github.com/265866/silo/pull/214))
+- *(worker)* unify the broadcast submit/poll path ([#213](https://github.com/265866/silo/pull/213))
+- *(types)* narrow blanket dead_code allows to fields ([#211](https://github.com/265866/silo/pull/211))
+- gate test-only helpers behind cfg(test) ([#210](https://github.com/265866/silo/pull/210))
+
 ## [0.1.8](https://github.com/265866/silo/compare/v0.1.7...v0.1.8) - 2026-06-09
 
 ### Added
