@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10](https://github.com/265866/silo/compare/v0.1.9...v0.1.10) - 2026-08-21
+
+### Fixed
+
+- *(deps)* bump wayland-scanner to pull patched quick-xml ([#239](https://github.com/265866/silo/pull/239))
+
+### Other
+
+- *(deps)* bump the cargo-minor-patch group across 1 directory with 13 updates ([#238](https://github.com/265866/silo/pull/238))
+- *(deps)* bump Swatinem/rust-cache from e18b497796c12c097a38f9edb9d0641fb99eee32 to f0d9c3887740aee45f6153b24b3a6b815192ec16 ([#237](https://github.com/265866/silo/pull/237))
+- *(deps)* bump chacha20poly1305 from 0.10.1 to 0.11.0 ([#228](https://github.com/265866/silo/pull/228))
+- *(deps)* bump quinn-proto from 0.11.14 to 0.11.16 ([#235](https://github.com/265866/silo/pull/235))
+- *(deps)* bump actions/checkout from 7.0.0 to 7.0.1 ([#233](https://github.com/265866/silo/pull/233))
+- *(deps)* bump EmbarkStudios/cargo-deny-action from 2.0.20 to 2.1.1 ([#231](https://github.com/265866/silo/pull/231))
+- *(deps)* bump release-plz/action from 0.5.130 to 0.5.131 ([#230](https://github.com/265866/silo/pull/230))
+- *(deps)* bump the cargo-minor-patch group across 1 directory with 4 updates ([#225](https://github.com/265866/silo/pull/225))
+- *(deps)* bump actions/checkout from 6.0.3 to 7.0.0 ([#224](https://github.com/265866/silo/pull/224))
+
 ## [0.1.9](https://github.com/265866/silo/compare/v0.1.8...v0.1.9) - 2026-06-16
 
 ### Added
