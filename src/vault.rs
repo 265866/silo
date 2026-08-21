@@ -7,7 +7,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use bip39::Mnemonic;
 use chacha20poly1305::{
     KeyInit, XChaCha20Poly1305, XNonce,
-    aead::{Aead, AeadCore, OsRng, rand_core::RngCore},
+    aead::{Aead, Generate},
 };
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -82,10 +82,8 @@ pub fn create_vault(path: &Path, mnemonic: &Mnemonic, passphrase: &str) -> Resul
         ));
     }
 
-    let mut rng = OsRng;
-
     let mut salt = [0u8; SALT_LEN];
-    rng.fill_bytes(&mut salt);
+    crate::crypto::random_bytes(&mut salt);
 
     let key = derive_key(
         passphrase,
@@ -97,7 +95,7 @@ pub fn create_vault(path: &Path, mnemonic: &Mnemonic, passphrase: &str) -> Resul
     let cipher =
         XChaCha20Poly1305::new_from_slice(&*key).map_err(|e| anyhow!("cipher init failed: {e}"))?;
 
-    let nonce = XChaCha20Poly1305::generate_nonce(&mut rng);
+    let nonce = XNonce::try_generate().map_err(|e| anyhow!("failed to generate nonce: {e}"))?;
 
     let plaintext = Zeroizing::new(mnemonic.to_string());
     let ciphertext = cipher
@@ -153,9 +151,8 @@ pub fn unlock_vault_keyed(path: &Path, passphrase: &str) -> Result<(Mnemonic, Va
     let nonce_bytes = bs58::decode(&vault.nonce_b58)
         .into_vec()
         .context("corrupt nonce")?;
-    if nonce_bytes.len() != NONCE_LEN {
-        return Err(anyhow!("corrupt nonce: expected {NONCE_LEN} bytes"));
-    }
+    let nonce = XNonce::try_from(nonce_bytes.as_slice())
+        .map_err(|_| anyhow!("corrupt nonce: expected {NONCE_LEN} bytes"))?;
     let ciphertext = bs58::decode(&vault.ciphertext_b58)
         .into_vec()
         .context("corrupt ciphertext")?;
@@ -164,10 +161,9 @@ pub fn unlock_vault_keyed(path: &Path, passphrase: &str) -> Result<(Mnemonic, Va
     let cipher =
         XChaCha20Poly1305::new_from_slice(&*key).map_err(|e| anyhow!("cipher init failed: {e}"))?;
 
-    let nonce = XNonce::from_slice(&nonce_bytes);
     let plaintext = Zeroizing::new(
         cipher
-            .decrypt(nonce, ciphertext.as_ref())
+            .decrypt(&nonce, ciphertext.as_ref())
             .map_err(|_| anyhow!("wrong passphrase or corrupted vault"))?,
     );
 
@@ -364,7 +360,7 @@ mod tests {
         let key = derive_key("legacy-pw", &salt, legacy_m, legacy_t, legacy_p).unwrap();
         let cipher = XChaCha20Poly1305::new_from_slice(&*key).unwrap();
         let nonce_bytes = [9u8; NONCE_LEN];
-        let nonce = XNonce::from_slice(&nonce_bytes);
+        let nonce = <&XNonce>::from(&nonce_bytes);
         let ciphertext = cipher
             .encrypt(nonce, mnemonic.to_string().as_bytes())
             .unwrap();
@@ -517,7 +513,7 @@ mod tests {
         let key = derive_key("pw", &salt, m_cost, t_cost, p_cost).unwrap();
         let cipher = XChaCha20Poly1305::new_from_slice(&*key).unwrap();
         let nonce_bytes = [3u8; NONCE_LEN];
-        let nonce = XNonce::from_slice(&nonce_bytes);
+        let nonce = <&XNonce>::from(&nonce_bytes);
         let ciphertext = cipher
             .encrypt(nonce, [0xff, 0xfe, 0x80, 0x00].as_ref())
             .unwrap();

@@ -36,9 +36,10 @@ pub fn parse_mnemonic(phrase: &str) -> Result<Mnemonic> {
 }
 
 pub fn random_bytes(buf: &mut [u8]) {
-    use chacha20poly1305::aead::{OsRng, rand_core::RngCore};
-    let mut rng = OsRng;
-    rng.fill_bytes(buf);
+    // Re-exported from crypto-common via aead; enabled by chacha20poly1305's
+    // default `getrandom` feature.
+    use chacha20poly1305::aead::common::getrandom;
+    getrandom::fill(buf).expect("the OS random number generator is always available");
 }
 
 pub fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8], okm: &mut [u8]) -> Result<()> {
