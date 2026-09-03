@@ -258,20 +258,20 @@ impl Rpc {
                         continue;
                     }
                     if !status.is_success() {
-                        let body = resp
-                            .text()
-                            .await
-                            .map_err(|source| RpcError::Body { method, source })?;
+                        let body = resp.text().await.map_err(|source| RpcError::Body {
+                            method,
+                            source: source.without_url(),
+                        })?;
                         return Err(RpcError::NonRetryHttp {
                             method,
                             status,
                             body,
                         });
                     }
-                    let body = resp
-                        .text()
-                        .await
-                        .map_err(|source| RpcError::Body { method, source })?;
+                    let body = resp.text().await.map_err(|source| RpcError::Body {
+                        method,
+                        source: source.without_url(),
+                    })?;
                     let env: RpcEnvelope<T> = serde_json::from_str(&body)
                         .map_err(|source| RpcError::Decode { method, source })?;
                     if let Some(e) = env.error {
@@ -285,7 +285,10 @@ impl Rpc {
                 }
                 Err(e) => {
                     if attempt >= MAX_RETRIES {
-                        return Err(RpcError::Transport { method, source: e });
+                        return Err(RpcError::Transport {
+                            method,
+                            source: e.without_url(),
+                        });
                     }
                     let wait = backoff(attempt);
                     attempt += 1;
@@ -889,6 +892,33 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn transport_error_display_does_not_leak_rpc_url() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/v2/SECRETPATH?api-key=SECRETQUERY",
+            listener.local_addr().unwrap()
+        );
+        drop(listener);
+        let rpc = Rpc::new(reqwest::Client::new(), url);
+        let err = rpc.get_block_height().await.unwrap_err();
+        assert!(matches!(
+            err,
+            RpcError::Transport {
+                method: "getBlockHeight",
+                ..
+            }
+        ));
+        let rendered = err.to_string();
+        assert!(
+            rendered.starts_with("RPC getBlockHeight request failed: "),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("SECRETPATH"), "{rendered}");
+        assert!(!rendered.contains("SECRETQUERY"), "{rendered}");
+        assert!(!rendered.contains("127.0.0.1"), "{rendered}");
     }
 
     #[tokio::test]
