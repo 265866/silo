@@ -258,20 +258,20 @@ impl Rpc {
                         continue;
                     }
                     if !status.is_success() {
-                        let body = resp
-                            .text()
-                            .await
-                            .map_err(|source| RpcError::Body { method, source })?;
+                        let body = resp.text().await.map_err(|source| RpcError::Body {
+                            method,
+                            source: source.without_url(),
+                        })?;
                         return Err(RpcError::NonRetryHttp {
                             method,
                             status,
                             body,
                         });
                     }
-                    let body = resp
-                        .text()
-                        .await
-                        .map_err(|source| RpcError::Body { method, source })?;
+                    let body = resp.text().await.map_err(|source| RpcError::Body {
+                        method,
+                        source: source.without_url(),
+                    })?;
                     let env: RpcEnvelope<T> = serde_json::from_str(&body)
                         .map_err(|source| RpcError::Decode { method, source })?;
                     if let Some(e) = env.error {
@@ -285,7 +285,10 @@ impl Rpc {
                 }
                 Err(e) => {
                     if attempt >= MAX_RETRIES {
-                        return Err(RpcError::Transport { method, source: e });
+                        return Err(RpcError::Transport {
+                            method,
+                            source: e.without_url(),
+                        });
                     }
                     let wait = backoff(attempt);
                     attempt += 1;
@@ -481,6 +484,7 @@ mod tests {
         status: u16,
         headers: Vec<(&'static str, &'static str)>,
         body: String,
+        truncated: bool,
     }
 
     impl MockResponse {
@@ -489,11 +493,19 @@ mod tests {
                 status,
                 headers: Vec::new(),
                 body: body.into(),
+                truncated: false,
             }
         }
 
         fn header(mut self, name: &'static str, value: &'static str) -> Self {
             self.headers.push((name, value));
+            self
+        }
+
+        /// Advertise more bytes than are sent, then close, so the client's
+        /// body read fails after the status line has been accepted.
+        fn truncated(mut self) -> Self {
+            self.truncated = true;
             self
         }
     }
@@ -585,11 +597,10 @@ mod tests {
             500 => "Internal Server Error",
             _ => "OK",
         };
+        let declared_len = response.body.len() + if response.truncated { 16 } else { 0 };
         let mut head = format!(
             "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-            response.status,
-            reason,
-            response.body.len()
+            response.status, reason, declared_len
         );
         for (name, value) in response.headers {
             head.push_str(name);
@@ -889,6 +900,71 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    const SECRET_SUFFIX: &str = "/v2/SECRETPATH?api-key=SECRETQUERY";
+
+    fn assert_rendered_without_url(err: &RpcError, prefix: &str) {
+        let rendered = err.to_string();
+        assert!(rendered.starts_with(prefix), "{rendered}");
+        assert!(!rendered.contains("SECRETPATH"), "{rendered}");
+        assert!(!rendered.contains("SECRETQUERY"), "{rendered}");
+        assert!(!rendered.contains("127.0.0.1"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn transport_error_display_does_not_leak_rpc_url() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}{SECRET_SUFFIX}", listener.local_addr().unwrap());
+        drop(listener);
+        let rpc = Rpc::new(reqwest::Client::new(), url);
+        let err = rpc.get_block_height().await.unwrap_err();
+        assert!(matches!(
+            err,
+            RpcError::Transport {
+                method: "getBlockHeight",
+                ..
+            }
+        ));
+        assert_rendered_without_url(&err, "RPC getBlockHeight request failed: ");
+    }
+
+    #[tokio::test]
+    async fn body_error_on_success_status_does_not_leak_rpc_url() {
+        let server = MockServer::new(vec![
+            MockResponse::new(200, r#"{"jsonrpc":"2.0","id":1,"result":123}"#).truncated(),
+        ]);
+        let rpc = Rpc::new(
+            reqwest::Client::new(),
+            format!("{}{SECRET_SUFFIX}", server.url()),
+        );
+        let err = rpc.get_block_height().await.unwrap_err();
+        assert!(matches!(
+            err,
+            RpcError::Body {
+                method: "getBlockHeight",
+                ..
+            }
+        ));
+        assert_rendered_without_url(&err, "RPC getBlockHeight response body read failed: ");
+    }
+
+    #[tokio::test]
+    async fn body_error_on_non_success_status_does_not_leak_rpc_url() {
+        let server = MockServer::new(vec![MockResponse::new(404, "not here").truncated()]);
+        let rpc = Rpc::new(
+            reqwest::Client::new(),
+            format!("{}{SECRET_SUFFIX}", server.url()),
+        );
+        let err = rpc.get_block_height().await.unwrap_err();
+        assert!(matches!(
+            err,
+            RpcError::Body {
+                method: "getBlockHeight",
+                ..
+            }
+        ));
+        assert_rendered_without_url(&err, "RPC getBlockHeight response body read failed: ");
     }
 
     #[tokio::test]
