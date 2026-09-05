@@ -1602,7 +1602,7 @@ impl App {
                         self.modal = Some(Modal::Error {
                             title: "Cannot verify wallet database".into(),
                             body: format!(
-                                "Wallet metadata couldn't be read: {e}. Refusing to operate."
+                                "Wallet metadata couldn't be accessed: {e}. Refusing to operate."
                             ),
                         });
                     }

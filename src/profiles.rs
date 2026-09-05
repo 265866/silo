@@ -56,10 +56,23 @@ pub fn new_id() -> String {
     s
 }
 
+/// Recover sealed profiles while preserving registered metadata. Callers hold the
+/// config directory's instance lock and serialize registry operations.
 pub fn load(config_dir: &Path) -> Result<Vec<ProfileMeta>> {
     match std::fs::read(registry_path(config_dir)) {
         Ok(bytes) => match parse_registry(&bytes) {
-            Ok(list) => Ok(list),
+            Ok(mut list) => {
+                let original_len = list.len();
+                for profile in recoverable(config_dir) {
+                    if !list.iter().any(|known| known.id == profile.id) {
+                        list.push(profile);
+                    }
+                }
+                if list.len() != original_len {
+                    save(config_dir, &list)?;
+                }
+                Ok(list)
+            }
             Err(_) => recover_corrupt_registry(config_dir),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -114,14 +127,16 @@ pub fn save(config_dir: &Path, list: &[ProfileMeta]) -> Result<()> {
     crate::vault::write_atomic(&registry_path(config_dir), &json)
 }
 
+/// Persist setup metadata, replacing any entry recovered while sealing the vault.
 pub fn register(config_dir: &Path, meta: ProfileMeta) -> Result<()> {
     validate_id(&meta.id)?;
     let mut list = load(config_dir)?;
-    if !list.iter().any(|p| p.id == meta.id) {
+    if let Some(existing) = list.iter_mut().find(|p| p.id == meta.id) {
+        *existing = meta;
+    } else {
         list.push(meta);
-        save(config_dir, &list)?;
     }
-    Ok(())
+    save(config_dir, &list)
 }
 
 pub fn rename(config_dir: &Path, id: &str, name: &str) -> Result<()> {
@@ -329,6 +344,63 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, id);
         assert!(!corrupt_backup_exists(dir.path()));
+    }
+
+    #[test]
+    fn valid_registry_recovers_unregistered_vaults_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = ProfileMeta {
+            id: "0000000000000012".into(),
+            name: "Treasury".into(),
+            created_at: 42,
+        };
+        save(dir.path(), std::slice::from_ref(&existing)).unwrap();
+        for id in [&existing.id, "0000000000000013"] {
+            let path = dir_for(dir.path(), id).unwrap();
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("vault.json"), b"{}").unwrap();
+        }
+        let incomplete = dir_for(dir.path(), "0000000000000014").unwrap();
+        std::fs::create_dir_all(incomplete).unwrap();
+        let tombstone = dir.path().join("profiles/.delete-0000000000000015-123");
+        std::fs::create_dir_all(&tombstone).unwrap();
+        std::fs::write(tombstone.join("vault.json"), b"{}").unwrap();
+
+        let loaded = load(dir.path()).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].id, existing.id);
+        assert_eq!(loaded[0].name, "Treasury");
+        assert_eq!(loaded[0].created_at, 42);
+        assert_eq!(loaded[1].id, "0000000000000013");
+        assert!(loaded[1].name.starts_with("Recovered wallet"));
+        let persisted = std::fs::read(registry_path(dir.path())).unwrap();
+        assert_eq!(parse_registry(&persisted).unwrap().len(), 2);
+        assert_eq!(load(dir.path()).unwrap().len(), 2);
+        assert_eq!(std::fs::read(registry_path(dir.path())).unwrap(), persisted);
+        assert!(!corrupt_backup_exists(dir.path()));
+    }
+
+    #[test]
+    fn registering_sealed_vault_preserves_supplied_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        save(dir.path(), &[]).unwrap();
+        let id = "0000000000000016";
+        let path = dir_for(dir.path(), id).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("vault.json"), b"{}").unwrap();
+        register(
+            dir.path(),
+            ProfileMeta {
+                id: id.into(),
+                name: "Wallet 2".into(),
+                created_at: 123,
+            },
+        )
+        .unwrap();
+        let loaded = load(dir.path()).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "Wallet 2");
+        assert_eq!(loaded[0].created_at, 123);
     }
 
     #[cfg(unix)]
