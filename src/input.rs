@@ -643,9 +643,10 @@ fn toggle_send_denom(app: &mut App) {
         crate::money::fiat_to_lamports(&app.input.send_amount, price.value)
             .map(crate::money::format_lamports)
     } else {
-        crate::money::parse_sol_to_lamports(&app.input.send_amount).map(|lamports| {
+        crate::money::parse_sol_to_lamports(&app.input.send_amount).and_then(|lamports| {
             let fiat = crate::money::lamports_to_sol(lamports) * price.value;
-            format!("{fiat:.*}", price.currency.decimals())
+            let amount = format!("{fiat:.*}", price.currency.decimals());
+            crate::money::fiat_to_lamports(&amount, price.value).map(|_| amount)
         })
     };
     match amount {
@@ -1403,6 +1404,35 @@ mod tests {
 
                 assert_eq!(h.app.input.send_in_fiat, in_fiat);
                 assert_eq!(h.app.input.send_amount, amount);
+                assert!(h.app.toasts.last().unwrap().text.starts_with("Amount:"));
+            }
+        }
+    }
+
+    #[test]
+    fn toggle_send_denom_preserves_amount_with_unrepresentable_cached_prices() {
+        for value in [1e30, f64::MAX, 1e-12] {
+            for in_fiat in [false, true] {
+                let mut h = harness(true);
+                h.app.input.send_in_fiat = in_fiat;
+                h.app.input.send_amount = "2".into();
+                let cached = serde_json::json!({
+                    "value": value,
+                    "currency": "usd",
+                    "fetched_at": SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    "source": "coingecko",
+                });
+                let price = SolPrice::from_meta_json(&cached.to_string()).unwrap();
+                h.app.price.seed(price);
+                assert!(h.app.price_now().is_some());
+
+                toggle_send_denom(&mut h.app);
+
+                assert_eq!(h.app.input.send_in_fiat, in_fiat, "price {value}");
+                assert_eq!(h.app.input.send_amount, "2", "price {value}");
                 assert!(h.app.toasts.last().unwrap().text.starts_with("Amount:"));
             }
         }
