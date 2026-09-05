@@ -20,7 +20,7 @@ use crate::solana::reconcile::{
 };
 use crate::solana::rpc::Rpc;
 use crate::sync::MutexExt;
-use crate::types::{AuditEvent, IntentStatus, NetStatus, TerminalStatus, TransferOutcome};
+use crate::types::{AuditEvent, IntentStatus, TerminalStatus, TransferOutcome};
 
 const PRICE_POLL_BASE: Duration = Duration::from_secs(60);
 const PRICE_POLL_JITTER_MS: u64 = 10_000;
@@ -907,15 +907,15 @@ async fn handle_command(
         }
 
         Command::Reconcile => match reconcile_boot(&db, &rpc_now, &generation, cmd_gen).await {
-            Ok(resolved) => {
+            Ok(outcome) if outcome.deferred == 0 => {
                 let _ = evt
                     .send(AppEvent::ReconcileComplete {
-                        resolved,
+                        resolved: outcome.resolved,
                         generation: cmd_gen,
                     })
                     .await;
             }
-            Err(_) => {
+            Ok(_) | Err(_) => {
                 let _ = evt
                     .send(AppEvent::ReconcileFailedOffline {
                         generation: cmd_gen,
@@ -1018,12 +1018,6 @@ async fn handle_command(
                             generation: cmd_gen,
                         })
                         .await;
-                    let _ = evt
-                        .send(AppEvent::NetStatus {
-                            status: NetStatus::Online,
-                            generation: cmd_gen,
-                        })
-                        .await;
                 }
                 Err(e) => {
                     let _ = evt
@@ -1121,15 +1115,15 @@ async fn handle_command(
                 .await;
             let new_rpc = { rpc.lock_recover().clone() };
             match reconcile_boot(&db, &new_rpc, &generation, cmd_gen).await {
-                Ok(resolved) => {
+                Ok(outcome) if outcome.deferred == 0 => {
                     let _ = evt
                         .send(AppEvent::ReconcileComplete {
-                            resolved,
+                            resolved: outcome.resolved,
                             generation: cmd_gen,
                         })
                         .await;
                 }
-                Err(_) => {
+                Ok(_) | Err(_) => {
                     let _ = evt
                         .send(AppEvent::ReconcileFailedOffline {
                             generation: cmd_gen,
@@ -2646,6 +2640,9 @@ mod tests {
                             }
                         }
                     }
+                    if buf.is_empty() {
+                        break;
+                    }
                     let req = String::from_utf8_lossy(&buf);
                     let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
                     let method = match serde_json::from_str::<serde_json::Value>(body) {
@@ -2705,6 +2702,13 @@ mod tests {
             }
         }
 
+        fn finish(self) {
+            let stream =
+                std::net::TcpStream::connect(self.url.trim_start_matches("http://")).unwrap();
+            stream.shutdown(std::net::Shutdown::Both).unwrap();
+            self._worker.join().unwrap();
+        }
+
         fn methods(&self) -> Vec<String> {
             self.requests
                 .lock()
@@ -2713,6 +2717,202 @@ mod tests {
                 .map(|v| v["method"].as_str().unwrap_or("").to_string())
                 .collect()
         }
+    }
+
+    #[tokio::test]
+    async fn reconcile_rpc_failure_emits_offline_not_complete() {
+        let (db, sub_id) = storage_with_wallets();
+        db.call_blocking(move |d| {
+            let intent = d.create_intent(sub_id, "destination", 1000, None).unwrap();
+            d.mark_signed(intent.id, "Sig", "bh", 1000, 5000, b"wire")
+                .unwrap();
+        });
+        let server = RawMockServer::routed(vec![(
+            "getSignatureStatuses",
+            json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"offline"}}).to_string(),
+        )]);
+        let (rpc, price, client) = worker_deps();
+        *rpc.lock_recover() = Rpc::new(client.clone(), server.url.clone());
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_command(
+            1,
+            Command::Reconcile,
+            db,
+            rpc,
+            tx,
+            price,
+            client,
+            Arc::new(AtomicU64::new(1)),
+        )
+        .await;
+        let event = rx.try_recv().unwrap();
+        server.finish();
+        assert!(
+            matches!(event, AppEvent::ReconcileFailedOffline { generation: 1 }),
+            "{event:?}"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn reconcile_and_change_rpc_report_clean_partial_and_database_failure() {
+        for change_rpc in [false, true] {
+            for case in ["clean", "partial", "database_read", "database_write"] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("silo.db");
+                let mut db = crate::db::Db::open(&path).unwrap();
+                db.unlock_audit_key(&[7; 32]).unwrap();
+                let mut ids = Vec::new();
+                for index in 0..2 {
+                    let wallet = db
+                        .insert_wallet(
+                            index,
+                            if index == 0 {
+                                crate::types::Role::Master
+                            } else {
+                                crate::types::Role::Sub
+                            },
+                            &format!("Wallet{index}"),
+                            None,
+                        )
+                        .unwrap();
+                    let intent = db
+                        .create_intent(wallet.id, "destination", 1000, None)
+                        .unwrap();
+                    db.mark_signed(intent.id, &format!("Sig{index}"), "bh", 1000, 5000, b"wire")
+                        .unwrap();
+                    ids.push(intent.id);
+                }
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                match case {
+                    "database_read" => conn.execute_batch("DROP TABLE tx_intents;").unwrap(),
+                    "database_write" => conn.execute_batch("CREATE TRIGGER block_updates BEFORE UPDATE ON tx_intents BEGIN SELECT RAISE(ABORT, 'blocked intent update'); END;").unwrap(),
+                    _ => {}
+                }
+                drop(conn);
+                let db = Storage::new(db);
+                let finalized = json!({"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":[{"err":null,"confirmationStatus":"finalized"}]}}).to_string();
+                let height = json!({"jsonrpc":"2.0","id":1,"result":1000}).to_string();
+                let responses = if case == "partial" {
+                    vec![
+                        json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"offline"}})
+                            .to_string(),
+                        finalized,
+                        height,
+                    ]
+                } else {
+                    vec![finalized.clone(), height.clone(), finalized, height]
+                };
+                let server = RawMockServer::new(responses);
+                let (rpc, price, client) = worker_deps();
+                if !change_rpc {
+                    *rpc.lock_recover() = Rpc::new(client.clone(), server.url.clone());
+                }
+                let command = if change_rpc {
+                    Command::ChangeRpc {
+                        url: server.url.clone(),
+                    }
+                } else {
+                    Command::Reconcile
+                };
+                let (tx, mut rx) = mpsc::channel(8);
+                handle_command(
+                    1,
+                    command,
+                    db.clone(),
+                    rpc,
+                    tx,
+                    price,
+                    client,
+                    Arc::new(AtomicU64::new(1)),
+                )
+                .await;
+                let methods = server.methods();
+                let url = server.url.clone();
+                server.finish();
+                if change_rpc {
+                    assert!(
+                        matches!(rx.try_recv().unwrap(), AppEvent::RpcChanged { url: got, generation: 1 } if got == url),
+                        "ack must precede reconciliation: {case}"
+                    );
+                    assert_eq!(db.call(|d| d.get_meta("rpc_url")).await.unwrap(), Some(url));
+                }
+                let event = rx.try_recv().unwrap();
+                if case == "clean" {
+                    assert!(
+                        matches!(
+                            event,
+                            AppEvent::ReconcileComplete {
+                                resolved: 2,
+                                generation: 1
+                            }
+                        ),
+                        "{event:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(event, AppEvent::ReconcileFailedOffline { generation: 1 }),
+                        "{case}: {event:?}"
+                    );
+                }
+                assert!(rx.try_recv().is_err());
+                if case == "database_read" {
+                    assert!(methods.is_empty());
+                } else {
+                    let states = db
+                        .call(move |d| {
+                            ids.into_iter()
+                                .map(|id| d.get_intent(id).unwrap().unwrap().status)
+                                .collect::<Vec<_>>()
+                        })
+                        .await;
+                    assert_eq!(
+                        states,
+                        match case {
+                            "clean" => vec![IntentStatus::Confirmed, IntentStatus::Confirmed],
+                            "partial" => vec![IntentStatus::Signed, IntentStatus::Confirmed],
+                            _ => vec![IntentStatus::Signed, IntentStatus::Signed],
+                        }
+                    );
+                }
+                assert!(db.call(|d| d.verify_audit_chain()).await.unwrap());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_balances_emits_only_balances_on_success() {
+        let (db, _) = storage_with_wallets();
+        let server = RawMockServer::routed(vec![("getMultipleAccounts", json!({"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":[{"lamports":1000},{"lamports":2000}]}}).to_string())]);
+        let (rpc, price, client) = worker_deps();
+        *rpc.lock_recover() = Rpc::new(client.clone(), server.url.clone());
+        let wallets = db.call(|d| d.list_wallets()).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_command(
+            1,
+            Command::RefreshBalances {
+                include_archived: false,
+            },
+            db,
+            rpc,
+            tx,
+            price,
+            client,
+            Arc::new(AtomicU64::new(1)),
+        )
+        .await;
+        server.finish();
+        match rx.try_recv().unwrap() {
+            AppEvent::Balances {
+                list,
+                generation: 1,
+            } => assert_eq!(list, vec![(wallets[0].id, 1000), (wallets[1].id, 2000)]),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "no trailing Online event may overwrite a reconciliation failure"
+        );
     }
 
     #[tokio::test]

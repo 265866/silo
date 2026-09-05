@@ -319,10 +319,6 @@ pub enum AppEvent {
         url: String,
         generation: u64,
     },
-    NetStatus {
-        status: NetStatus,
-        generation: u64,
-    },
     UpdateStatus {
         latest: String,
     },
@@ -360,7 +356,6 @@ impl AppEvent {
             | AppEvent::IntentNoteSet { generation, .. }
             | AppEvent::ProfileRenamed { generation, .. }
             | AppEvent::RpcChanged { generation, .. }
-            | AppEvent::NetStatus { generation, .. }
             | AppEvent::Error { generation, .. } => *generation,
             AppEvent::UpdateStatus { .. } => 0,
         }
@@ -1447,18 +1442,18 @@ impl App {
                 self.request_balance_refresh();
             }
             AppEvent::ReconcileFailedOffline { .. } => {
+                self.reconcile_done = false;
                 self.net_status = NetStatus::Offline;
                 self.toast_err("Offline — reconcile pending, sends disabled");
             }
             AppEvent::Balances { list, .. } => {
+                let was_offline = self.net_status == NetStatus::Offline;
+                self.net_status = NetStatus::Online;
                 if self.inflight > 0 {
                     self.inflight -= 1;
                 }
-                if self.net_status == NetStatus::Offline {
-                    self.net_status = NetStatus::Online;
-                    if !self.reconcile_done && self.seed.is_some() {
-                        self.send_cmd(Command::Reconcile);
-                    }
+                if was_offline && !self.reconcile_done && self.seed.is_some() {
+                    self.send_cmd(Command::Reconcile);
                 }
                 let mut deposit = false;
                 for (id, lamports) in list {
@@ -1885,9 +1880,6 @@ impl App {
                 self.reconcile_done = false;
                 self.toast_info("RPC updated — syncing transfers");
             }
-            AppEvent::NetStatus { status, .. } => {
-                self.net_status = status;
-            }
             AppEvent::Error { message, .. } => {
                 self.toast_err(message);
             }
@@ -2225,10 +2217,6 @@ mod tests {
                 url: "https://other.example.com".into(),
                 generation: stale,
             },
-            AppEvent::NetStatus {
-                status: NetStatus::Offline,
-                generation: stale,
-            },
             AppEvent::Error {
                 message: "x".into(),
                 generation: stale,
@@ -2236,7 +2224,7 @@ mod tests {
         ];
         assert_eq!(
             events.len(),
-            27,
+            26,
             "the parametrized test must cover every AppEvent variant"
         );
 
@@ -2312,6 +2300,144 @@ mod tests {
         app.toasts.clear();
         app.confetti.clear();
         (app, wallet_id)
+    }
+
+    #[test]
+    fn reconcile_failure_clears_completion_and_waits_for_balance_recovery() {
+        let (mut app, wallet_id) = idle_unlocked_app();
+        let (tx, mut rx) = mpsc::channel(8);
+        app.cmd_tx = tx;
+        app.pending_send = Some(PendingSend {
+            from_id: wallet_id,
+            to: "destination".into(),
+            lamports: 1000,
+            blockhash: "bh".into(),
+            lvbh: 1000,
+            fee: 5000,
+            dest_balance: 0,
+            priority_micro: 0,
+            prepared_at: Instant::now(),
+        });
+        app.wallets[0].balance_lamports = Some(10_000_000);
+        app.rent_exempt_min = 0;
+        assert_eq!(app.evaluate_pending_send(), Ok(()));
+        app.apply_app_event(AppEvent::ReconcileFailedOffline { generation: 0 });
+        assert!(!app.reconcile_done);
+        assert_eq!(app.net_status, NetStatus::Offline);
+        assert_eq!(
+            app.evaluate_pending_send(),
+            Err(crate::types::SendGuardError::Reconciling.to_string())
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "failure must not queue an immediate balance refresh"
+        );
+        for _ in 0..2 {
+            app.apply_app_event(AppEvent::Balances {
+                list: vec![],
+                generation: 0,
+            });
+            assert_eq!(app.net_status, NetStatus::Online);
+            assert!(matches!(rx.try_recv().unwrap(), (0, Command::Reconcile)));
+            assert!(rx.try_recv().is_err());
+            app.apply_app_event(AppEvent::ReconcileFailedOffline { generation: 0 });
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn balance_recovery_retries_only_once_when_unlocked_and_pending() {
+        for (status, completed, unlocked, expected_retry) in [
+            (NetStatus::Offline, false, true, true),
+            (NetStatus::Offline, true, true, false),
+            (NetStatus::Offline, false, false, false),
+            (NetStatus::Online, false, true, false),
+            (NetStatus::Syncing, false, true, false),
+        ] {
+            let (mut app, id) = idle_unlocked_app();
+            let (tx, mut rx) = mpsc::channel(8);
+            app.cmd_tx = tx;
+            app.net_status = status;
+            app.reconcile_done = completed;
+            if !unlocked {
+                app.seed = None;
+            }
+            app.inflight = 1;
+            app.wallets[0].balance_lamports = Some(1000);
+            app.apply_app_event(AppEvent::Balances {
+                list: vec![(id, 2000)],
+                generation: 0,
+            });
+            assert_eq!(app.net_status, NetStatus::Online);
+            assert_eq!(app.inflight, 0);
+            assert_eq!(app.wallets[0].balance_lamports, Some(2000));
+            assert!(app.hot_until.is_some());
+            if expected_retry {
+                assert!(matches!(rx.try_recv().unwrap(), (0, Command::Reconcile)));
+            }
+            assert!(rx.try_recv().is_err());
+            app.apply_app_event(AppEvent::Balances {
+                list: vec![],
+                generation: 0,
+            });
+            assert_eq!(app.inflight, 0);
+            assert_eq!(app.net_status, NetStatus::Online);
+            assert!(
+                rx.try_recv().is_err(),
+                "repeated online balance success must not retry again"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_balance_success_sets_syncing_online_without_retry() {
+        let (mut app, _) = idle_unlocked_app();
+        let (tx, mut rx) = mpsc::channel(8);
+        app.cmd_tx = tx;
+        app.net_status = NetStatus::Syncing;
+        app.reconcile_done = false;
+        app.apply_app_event(AppEvent::Balances {
+            list: vec![],
+            generation: 0,
+        });
+        assert_eq!(app.net_status, NetStatus::Online);
+        assert!(!app.reconcile_done);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn clean_reconcile_completes_and_requests_balance_refresh() {
+        let (mut app, _) = idle_unlocked_app();
+        let (tx, mut rx) = mpsc::channel(8);
+        app.cmd_tx = tx;
+        app.reconcile_done = false;
+        app.net_status = NetStatus::Syncing;
+        app.apply_app_event(AppEvent::ReconcileComplete {
+            resolved: 1,
+            generation: 0,
+        });
+        assert!(app.reconcile_done);
+        assert_eq!(app.net_status, NetStatus::Online);
+        assert_eq!(app.toasts.len(), 1);
+        assert_eq!(app.inflight, 1);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            (0, Command::RefreshBalances { .. })
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn stale_reconcile_failure_cannot_reset_completed_generation() {
+        let (mut app, _) = idle_unlocked_app();
+        let (tx, mut rx) = mpsc::channel(8);
+        app.cmd_tx = tx;
+        app.generation.store(1, Ordering::SeqCst);
+        app.apply_app_event(AppEvent::ReconcileFailedOffline { generation: 0 });
+        assert!(app.reconcile_done);
+        assert_eq!(app.net_status, NetStatus::Online);
+        assert!(app.toasts.is_empty());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
