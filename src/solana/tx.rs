@@ -326,31 +326,37 @@ mod tests {
     }
 
     #[test]
-    fn signature_matches_official_solana_keypair() {
-        use ed25519_dalek::Signer;
-        use solana_derivation_path::DerivationPath;
-        use solana_keypair::seed_derivable::keypair_from_seed_and_derivation_path;
+    fn signatures_match_rfc8032_vectors() {
+        fn decode<const N: usize>(hex: &str) -> [u8; N] {
+            assert_eq!(hex.len(), N * 2);
+            std::array::from_fn(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
+        }
 
-        let seed = seed_from_mnemonic(&parse_mnemonic(TEST_MNEMONIC).unwrap());
-        let our_key = derive_signing_key(&seed, 0);
-        let from = our_key.verifying_key().to_bytes();
-        let to = derive_signing_key(&seed, 5).verifying_key().to_bytes();
-        let bh = [11u8; 32];
-        let msg = build_transfer_message(&from, &to, 7_000_000, &bh, None).unwrap();
-
-        let (_tx, our_sig) = sign_and_serialize(&msg, &our_key);
-
-        let kp = keypair_from_seed_and_derivation_path(
-            seed.seed_bytes(),
-            Some(DerivationPath::new_bip44(Some(0), Some(0))),
-        )
-        .unwrap();
-        let kp_bytes = kp.to_bytes();
-        let solana_secret =
-            ed25519_dalek::SigningKey::from_bytes(kp_bytes[..32].try_into().unwrap());
-        let solana_sig = solana_secret.sign(&msg).to_bytes();
-
-        assert_eq!(our_sig, solana_sig, "signature must match Solana's keypair");
+        // RFC8032 section 7.1, TEST 1 (empty message) and TEST 2.
+        // https://www.rfc-editor.org/rfc/rfc8032.html#section-7.1
+        let vectors = [
+            (
+                "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+                "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+                &b""[..],
+                "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+            ),
+            (
+                "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+                "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+                &[0x72][..],
+                "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00",
+            ),
+        ];
+        for (seed, public_key, message, signature) in vectors {
+            let key = SigningKey::from_bytes(&decode(seed));
+            assert_eq!(key.verifying_key().to_bytes(), decode(public_key));
+            let (tx, actual) = sign_and_serialize(message, &key);
+            assert_eq!(actual, decode(signature));
+            assert_eq!(tx[0], 1);
+            assert_eq!(&tx[1..65], &actual);
+            assert_eq!(&tx[65..], message);
+        }
     }
 
     #[test]

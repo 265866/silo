@@ -14,11 +14,6 @@ impl Seed {
     fn as_bytes(&self) -> &[u8; 64] {
         &self.0
     }
-
-    #[cfg(test)]
-    pub(crate) fn seed_bytes(&self) -> &[u8; 64] {
-        &self.0
-    }
 }
 
 impl std::fmt::Debug for Seed {
