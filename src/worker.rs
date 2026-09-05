@@ -1996,6 +1996,7 @@ mod tests {
     // Drive the real input and persistence paths, but leave their completion unapplied.
     async fn persisted_send_completion(
         existing_intent: bool,
+        lock_before_persistence: bool,
     ) -> (crate::app::App, mpsc::Receiver<(u64, Command)>, AppEvent) {
         use crate::app::{App, Modal, PendingSend, Route};
         use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -2047,6 +2048,9 @@ mod tests {
         let (cmd_gen, cmd) = cmd_rx.try_recv().unwrap();
         assert_eq!(cmd_gen, 7);
         assert!(matches!(cmd, Command::PersistSignedSend { .. }));
+        if lock_before_persistence {
+            app.lock();
+        }
         let (evt_tx, mut evt_rx) = mpsc::channel(8);
         handle_command(cmd_gen, cmd, db, rpc, evt_tx, price, client, generation).await;
         let completion = evt_rx.try_recv().unwrap();
@@ -2060,9 +2064,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_persistence_after_lock_before_write_fails_without_intent_or_broadcast() {
+        // Existing policy: locking removes the audit key required to create an intent.
+        let (mut app, mut rx, completion) = persisted_send_completion(false, true).await;
+        let reason = match &completion {
+            AppEvent::SendPersisted {
+                result: SendPersistResult::Failed(reason),
+                generation: 7,
+            } => reason.clone(),
+            other => panic!("unexpected completion: {other:?}"),
+        };
+        assert_eq!(
+            reason,
+            "Couldn't record transfer: audit key unavailable (vault locked)"
+        );
+
+        app.apply_app_event(completion);
+
+        assert_eq!(app.route, crate::app::Route::Unlock);
+        assert!(app.seed.is_none());
+        assert!(app.modal.is_none());
+        assert!(app.pending_send.is_none());
+        assert!(!app.blocking_input);
+        assert!(!app.preparing_send);
+        assert_eq!(app.generation.load(Ordering::SeqCst), 7);
+        assert!(
+            rx.try_recv().is_err(),
+            "failed persistence must not queue Broadcast"
+        );
+        let wallet_id = app.focused_wallet.unwrap();
+        assert!(
+            app.db
+                .call_blocking(move |d| d.list_intents_for_wallet(wallet_id, 10))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(app.toasts.iter().any(|t| t.text == reason));
+    }
+
+    #[tokio::test]
     async fn send_persistence_completion_after_lock_preserves_signed_intent_and_broadcast() {
         use crate::app::Route;
-        let (mut app, mut rx, completion) = persisted_send_completion(false).await;
+        let (mut app, mut rx, completion) = persisted_send_completion(false, false).await;
         let intent_id = match &completion {
             AppEvent::SendPersisted {
                 result: SendPersistResult::Signed { intent_id },
@@ -2113,7 +2156,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_persistence_completion_unlocked_routes_and_broadcasts() {
-        let (mut app, mut rx, completion) = persisted_send_completion(false).await;
+        let (mut app, mut rx, completion) = persisted_send_completion(false, false).await;
         let intent_id = match &completion {
             AppEvent::SendPersisted {
                 result: SendPersistResult::Signed { intent_id },
@@ -2142,7 +2185,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_persistence_failure_after_lock_does_not_broadcast() {
-        let (mut app, mut rx, completion) = persisted_send_completion(true).await;
+        let (mut app, mut rx, completion) = persisted_send_completion(true, false).await;
         let reason = match &completion {
             AppEvent::SendPersisted {
                 result: SendPersistResult::Failed(reason),
@@ -2167,7 +2210,7 @@ mod tests {
     async fn assert_send_completion_preserves_pending_unlock(existing_intent: bool) {
         use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
-        let (mut app, mut rx, completion) = persisted_send_completion(existing_intent).await;
+        let (mut app, mut rx, completion) = persisted_send_completion(existing_intent, false).await;
         let signed_intent = match &completion {
             AppEvent::SendPersisted {
                 result: SendPersistResult::Signed { intent_id },
@@ -2250,7 +2293,7 @@ mod tests {
     async fn send_persistence_completion_queue_errors_preserve_route() {
         for locked in [false, true] {
             for closed in [false, true] {
-                let (mut app, mut rx, completion) = persisted_send_completion(false).await;
+                let (mut app, mut rx, completion) = persisted_send_completion(false, false).await;
                 if locked {
                     app.lock();
                 }
