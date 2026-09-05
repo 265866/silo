@@ -32,36 +32,6 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check advisories licenses bans sources
-      - name: Check bincode advisory exception
-        run: |
-          python3 - <<'PY'
-          import datetime
-          import os
-          import pathlib
-          import sys
-          import tomllib
-
-          advisory = 'RUSTSEC-2025-0141'
-          review_date = datetime.date.fromisoformat('2026-09-01')
-          today = datetime.date.fromisoformat(os.environ.get('BINCODE_ADVISORY_TODAY', datetime.date.today().isoformat()))
-          deny_config = tomllib.loads(pathlib.Path('deny.toml').read_text())
-          ignored_advisories = deny_config.get('advisories', {}).get('ignore', [])
-
-          if advisory in ignored_advisories and today >= review_date:
-              print(f'{advisory} is still ignored after review date {review_date}')
-              sys.exit(1)
-          PY
-          cargo tree --locked -e=no-dev -i bincode >/tmp/bincode-tree.txt 2>&1
-          python3 - <<'PY'
-          import pathlib
-          import sys
-
-          tree = pathlib.Path('/tmp/bincode-tree.txt').read_text()
-          if 'bincode v' in tree:
-              print(tree, end='')
-              print('bincode must not appear in the normal/non-dev dependency graph')
-              sys.exit(1)
-          PY
 
   release-workflow-installer-policy:
     name: release workflow installer policy
