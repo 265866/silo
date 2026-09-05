@@ -1728,6 +1728,62 @@ mod tests {
         assert_eq!(h.app.route, Route::Send);
     }
 
+    #[test]
+    fn lock_during_send_persistence_clears_busy_flags_immediately() {
+        for auto_lock in [false, true] {
+            let mut h = harness(true);
+            let from_id = h.app.wallets[0].id;
+            h.app.pending_send = Some(pending(from_id, 0, Instant::now()));
+            execute_send(&mut h.app);
+            assert!(h.app.blocking_input);
+            h.app.preparing_send = true;
+            let generation = h.app.generation.load(Ordering::SeqCst);
+
+            if auto_lock {
+                h.app.auto_lock_after = Duration::ZERO;
+                h.app.maybe_auto_lock();
+            } else {
+                handle_event(
+                    &mut h.app,
+                    Event::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+                );
+            }
+
+            assert_eq!(h.app.route, Route::Unlock);
+            assert!(h.app.seed.is_none());
+            assert!(h.app.modal.is_none());
+            assert!(h.app.pending_send.is_none());
+            assert!(!h.app.blocking_input);
+            assert!(!h.app.preparing_send);
+            assert_eq!(h.app.generation.load(Ordering::SeqCst), generation);
+            let (queued_generation, cmd) = h.rx.try_recv().unwrap();
+            assert_eq!(queued_generation, generation);
+            assert!(matches!(cmd, Command::PersistSignedSend { .. }));
+            assert!(h.rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn lock_during_send_preparation_scrubs_modal_and_pending_send() {
+        let mut h = harness(true);
+        h.app.preparing_send = true;
+        h.app.pending_send = Some(pending(h.app.wallets[0].id, 0, Instant::now()));
+        h.app.input.passphrase = Zeroizing::new("unfinished passphrase".into());
+        let generation = h.app.generation.load(Ordering::SeqCst);
+
+        h.app.lock();
+
+        assert_eq!(h.app.route, Route::Unlock);
+        assert!(h.app.seed.is_none());
+        assert!(h.app.modal.is_none());
+        assert!(h.app.pending_send.is_none());
+        assert!(h.app.input.passphrase.is_empty());
+        assert!(!h.app.blocking_input);
+        assert!(!h.app.preparing_send);
+        assert_eq!(h.app.generation.load(Ordering::SeqCst), generation);
+        assert!(h.rx.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn execute_send_stale_pending_send_refreshes_without_intent() {
         let mut h = harness(true);
