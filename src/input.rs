@@ -626,21 +626,35 @@ fn fill_drain_amount(app: &mut App) {
 }
 
 fn toggle_send_denom(app: &mut App) {
-    if !app.input.send_in_fiat && app.price_now().is_none() {
-        app.toast_err("No price yet — can't switch to fiat");
+    let price = app.price_now();
+    if !app.input.send_in_fiat && price.is_none() {
+        app.toast_err("No fresh price. Can't switch to fiat");
         return;
     }
-    let lamports = app.compose_lamports().ok();
-    app.input.send_in_fiat = !app.input.send_in_fiat;
-    match (app.input.send_in_fiat, lamports, app.price_now()) {
-        (true, Some(l), Some(p)) => {
-            let fiat = crate::money::lamports_to_sol(l) * p.value;
-            app.input.send_amount = format!("{fiat:.*}", p.currency.decimals());
+    if app.input.send_amount.trim().is_empty() {
+        app.input.send_in_fiat = !app.input.send_in_fiat;
+        return;
+    }
+    let Some(price) = price else {
+        app.toast_err("No fresh price. Can't convert fiat amount");
+        return;
+    };
+    let amount = if app.input.send_in_fiat {
+        crate::money::fiat_to_lamports(&app.input.send_amount, price.value)
+            .map(crate::money::format_lamports)
+    } else {
+        crate::money::parse_sol_to_lamports(&app.input.send_amount).and_then(|lamports| {
+            let fiat = crate::money::lamports_to_sol(lamports) * price.value;
+            let amount = format!("{fiat:.*}", price.currency.decimals());
+            crate::money::fiat_to_lamports(&amount, price.value).map(|_| amount)
+        })
+    };
+    match amount {
+        Ok(amount) => {
+            app.input.send_amount = amount;
+            app.input.send_in_fiat = !app.input.send_in_fiat;
         }
-        (false, Some(l), _) => {
-            app.input.send_amount = crate::money::format_lamports(l);
-        }
-        _ => {}
+        Err(error) => app.toast_err(format!("Amount: {error}")),
     }
 }
 
@@ -1148,7 +1162,7 @@ fn handle_paste(app: &mut App, text: &str) {
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use tokio::sync::mpsc;
 
@@ -1298,6 +1312,170 @@ mod tests {
             source: PriceSource::CoinGecko,
         });
         assert!(h.app.compose_lamports().is_err());
+    }
+
+    #[test]
+    fn toggle_send_denom_converts_amount_in_both_directions() {
+        let mut h = harness(true);
+        h.app.modal = None;
+        h.app.input.focus = 1;
+        h.app.input.send_amount = "1.5".into();
+        h.app.price.set(SolPrice {
+            value: 100.0,
+            currency: crate::types::Currency::Usd,
+            fetched_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            source: PriceSource::CoinGecko,
+        });
+
+        handle_key(
+            &mut h.app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        );
+        assert!(h.app.input.send_in_fiat);
+        assert_eq!(h.app.input.send_amount, "150.00");
+        assert_eq!(h.app.compose_lamports().unwrap(), 1_500_000_000);
+
+        handle_key(
+            &mut h.app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        );
+        assert!(!h.app.input.send_in_fiat);
+        assert_eq!(h.app.input.send_amount, "1.5");
+        assert_eq!(h.app.compose_lamports().unwrap(), 1_500_000_000);
+        assert!(h.app.toasts.is_empty());
+        assert!(h.rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn toggle_send_denom_preserves_amount_and_unit_without_fresh_price() {
+        for stale in [false, true] {
+            for in_fiat in [false, true] {
+                let mut h = harness(true);
+                h.app.input.send_in_fiat = in_fiat;
+                h.app.input.send_amount = "150.00".into();
+                if stale {
+                    h.app.price.set(SolPrice {
+                        value: 100.0,
+                        currency: crate::types::Currency::Usd,
+                        fetched_at: 0,
+                        source: PriceSource::CoinGecko,
+                    });
+                }
+
+                toggle_send_denom(&mut h.app);
+
+                assert_eq!(h.app.input.send_in_fiat, in_fiat);
+                assert_eq!(h.app.input.send_amount, "150.00");
+                assert!(h.app.toasts.last().unwrap().text.contains("price"));
+                if in_fiat {
+                    assert_eq!(
+                        h.app.compose_lamports().unwrap_err(),
+                        "no fresh price; wait for a price or clear the amount, then press c to enter SOL"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn toggle_send_denom_preserves_invalid_amount_and_unit() {
+        for in_fiat in [false, true] {
+            for amount in [
+                "abc",
+                "1.2.3",
+                "-1",
+                "0.0000000001",
+                "999999999999999999999999999999999999999999",
+            ] {
+                let mut h = harness(true);
+                h.app.input.send_in_fiat = in_fiat;
+                h.app.input.send_amount = amount.into();
+                h.app.price.set(SolPrice {
+                    value: 100.0,
+                    currency: crate::types::Currency::Usd,
+                    fetched_at: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    source: PriceSource::CoinGecko,
+                });
+
+                toggle_send_denom(&mut h.app);
+
+                assert_eq!(h.app.input.send_in_fiat, in_fiat);
+                assert_eq!(h.app.input.send_amount, amount);
+                assert!(h.app.toasts.last().unwrap().text.starts_with("Amount:"));
+            }
+        }
+    }
+
+    #[test]
+    fn toggle_send_denom_preserves_amount_with_unrepresentable_cached_prices() {
+        for value in [1e30, f64::MAX, 1e-12] {
+            for in_fiat in [false, true] {
+                let mut h = harness(true);
+                h.app.input.send_in_fiat = in_fiat;
+                h.app.input.send_amount = "2".into();
+                let cached = serde_json::json!({
+                    "value": value,
+                    "currency": "usd",
+                    "fetched_at": SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    "source": "coingecko",
+                });
+                let price = SolPrice::from_meta_json(&cached.to_string()).unwrap();
+                h.app.price.seed(price);
+                assert!(h.app.price_now().is_some());
+
+                toggle_send_denom(&mut h.app);
+
+                assert_eq!(h.app.input.send_in_fiat, in_fiat, "price {value}");
+                assert_eq!(h.app.input.send_amount, "2", "price {value}");
+                assert!(h.app.toasts.last().unwrap().text.starts_with("Amount:"));
+            }
+        }
+    }
+
+    #[test]
+    fn toggle_send_denom_empty_amount_needs_price_only_to_enter_fiat() {
+        for fetched_at in [
+            None,
+            Some(0),
+            Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            ),
+        ] {
+            for in_fiat in [false, true] {
+                for amount in ["", "   "] {
+                    let mut h = harness(true);
+                    h.app.input.send_in_fiat = in_fiat;
+                    h.app.input.send_amount = amount.into();
+                    if let Some(fetched_at) = fetched_at {
+                        h.app.price.set(SolPrice {
+                            value: 100.0,
+                            currency: crate::types::Currency::Usd,
+                            fetched_at,
+                            source: PriceSource::CoinGecko,
+                        });
+                    }
+                    let can_toggle = in_fiat || h.app.price_now().is_some();
+
+                    toggle_send_denom(&mut h.app);
+
+                    assert_eq!(h.app.input.send_in_fiat, in_fiat ^ can_toggle);
+                    assert_eq!(h.app.input.send_amount, amount);
+                    assert_eq!(h.app.toasts.is_empty(), can_toggle);
+                }
+            }
+        }
     }
 
     #[tokio::test]
