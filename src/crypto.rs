@@ -43,7 +43,7 @@ pub fn random_bytes(buf: &mut [u8]) {
 }
 
 pub fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8], okm: &mut [u8]) -> Result<()> {
-    use hmac::{Hmac, KeyInit, Mac};
+    use hmac::{Hmac, KeyInit, Mac, digest::FixedOutput};
     use sha2::Sha256;
     type H = Hmac<Sha256>;
 
@@ -53,24 +53,27 @@ pub fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8], okm: &mut [u8]) -> Resu
 
     let mut ext = H::new_from_slice(salt).expect("HMAC accepts any key length");
     ext.update(ikm);
-    let prk = ext.finalize().into_bytes();
+    let mut prk = Zeroizing::new([0u8; 32]);
+    ext.finalize_into((&mut *prk).into());
 
-    let mut prev: Vec<u8> = Vec::new();
+    let mut prev = Zeroizing::new([0u8; 32]);
     let mut filled = 0usize;
     let mut counter: u8 = 1;
     while filled < okm.len() {
-        let mut h = H::new_from_slice(&prk).expect("HMAC accepts any key length");
-        h.update(&prev);
+        let mut h = H::new_from_slice(&*prk).expect("HMAC accepts any key length");
+        // T(0) is empty, not a block of zero bytes.
+        if filled != 0 {
+            h.update(&*prev);
+        }
         h.update(info);
         h.update(&[counter]);
-        let block = h.finalize().into_bytes();
-        let take = (okm.len() - filled).min(block.len());
-        okm[filled..filled + take].copy_from_slice(&block[..take]);
-        prev = block.to_vec();
+        prev.zeroize();
+        h.finalize_into((&mut *prev).into());
+        let take = (okm.len() - filled).min(prev.len());
+        okm[filled..filled + take].copy_from_slice(&prev[..take]);
         filled += take;
         counter = counter.saturating_add(1);
     }
-    prev.zeroize();
     Ok(())
 }
 
@@ -122,11 +125,68 @@ mod tests {
     }
 
     #[test]
-    fn hkdf_rejects_overlong_output() {
+    fn hkdf_matches_rfc5869_test_case_2_and_prefixes() {
+        let ikm: Vec<u8> = (0x00..=0x4f).collect();
+        let salt: Vec<u8> = (0x60..=0xaf).collect();
+        let info: Vec<u8> = (0xb0..=0xff).collect();
+        let expected = concat!(
+            "b11e398dc80327a1c8e7f78c596a4934",
+            "4f012eda2d4efad8a050cc4c19afa97c",
+            "59045a99cac7827271cb41c65e590e09",
+            "da3275600c2f09b8367793a9aca3db71",
+            "cc30c58179ec3e87c14c01d5c1f3434f",
+            "1d87",
+        );
+        for len in [0, 1, 31, 32, 33, 64, 65, 82] {
+            let mut okm = vec![0xa5; len];
+            hkdf_sha256(&ikm, &salt, &info, &mut okm).unwrap();
+            let got: String = okm.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(got, expected[..len * 2], "output length {len}");
+        }
+    }
+
+    #[test]
+    fn hkdf_matches_rfc5869_test_case_3() {
+        let ikm = [0x0b; 22];
+        let mut okm = [0u8; 42];
+        hkdf_sha256(&ikm, &[], &[], &mut okm).unwrap();
+        let expected = concat!(
+            "8da4e775a563c18f715f802a063c5a31",
+            "b8a11f5c5ee1879ec3454e5f3c738d2d",
+            "9d201395faa4b61a96c8",
+        );
+        let got: String = okm.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn hkdf_accepts_empty_output_without_mutating_backing_buffer() {
+        let mut backing = [0xa5; 32];
+        hkdf_sha256(&[], &[], &[], &mut backing[..0]).unwrap();
+        assert_eq!(backing, [0xa5; 32]);
+    }
+
+    #[test]
+    fn hkdf_accepts_maximum_output() {
         let mut okm = vec![0u8; 255 * 32];
         hkdf_sha256(b"ikm", b"salt", b"info", &mut okm).unwrap();
-        let mut too_long = vec![0u8; 255 * 32 + 1];
-        assert!(hkdf_sha256(b"ikm", b"salt", b"info", &mut too_long).is_err());
+        let mut prefix = [0u8; 65];
+        hkdf_sha256(b"ikm", b"salt", b"info", &mut prefix).unwrap();
+        assert_eq!(okm[..prefix.len()], prefix);
+        // OpenSSL HKDF-SHA256, key="ikm", salt="salt", info="info", length=8160.
+        let last_block: String = okm[254 * 32..].iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            last_block,
+            "f10be4d813d4647001096e6c6efca36a7ec49a08915e6f50d16fecad12b8e8b9"
+        );
+    }
+
+    #[test]
+    fn hkdf_rejects_overlong_output_without_mutating_destination() {
+        let mut too_long = vec![0xa5; 255 * 32 + 1];
+        let err = hkdf_sha256(b"ikm", b"salt", b"info", &mut too_long).unwrap_err();
+        assert_eq!(err.to_string(), "HKDF-SHA256 output is too long");
+        assert_eq!(too_long, vec![0xa5; 255 * 32 + 1]);
     }
 
     #[test]
