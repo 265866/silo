@@ -2209,6 +2209,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
+        let expected_error = db.call(|d| d.get_meta("currency")).await.unwrap_err();
         let (rpc, _, client) = worker_deps();
         handle_command(
             0,
@@ -2226,11 +2227,10 @@ mod tests {
                 message,
                 generation: 0,
             } => {
-                assert!(
-                    message.contains("price currency lookup failed"),
-                    "{message}"
+                assert_eq!(
+                    message,
+                    format!("price currency lookup failed: {expected_error:#}")
                 );
-                assert!(message.contains("no such table: meta"), "{message}");
             }
             other => panic!("expected database error, got {other:?}"),
         }
