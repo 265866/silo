@@ -1399,7 +1399,9 @@ impl App {
     }
 
     pub fn price_now(&self) -> Option<SolPrice> {
-        self.price.get().filter(|p| !p.is_stale())
+        self.price
+            .get()
+            .filter(|p| p.currency == self.currency && !p.is_stale())
     }
 
     pub fn reset_price_baseline(&mut self) {
@@ -1479,6 +1481,9 @@ impl App {
                 self.net_status = NetStatus::Offline;
             }
             AppEvent::Price { price: p, .. } => {
+                if p.currency != self.currency {
+                    return;
+                }
                 if let Some(prev) = self.last_price
                     && (p.value - prev).abs() > f64::EPSILON
                 {

@@ -1301,6 +1301,204 @@ mod tests {
     }
 
     #[test]
+    fn currency_price_guard_requires_matching_fresh_price_for_fiat_only() {
+        use crate::types::Currency;
+        let mut h = harness(true);
+        h.app.currency = Currency::Jpy;
+        h.app.input.send_in_fiat = true;
+        h.app.input.send_amount = "10000".into();
+        let usd = SolPrice {
+            value: 150.0,
+            currency: Currency::Usd,
+            fetched_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            source: PriceSource::CoinGecko,
+        };
+        h.app.price.set(usd);
+        assert!(
+            h.app.price_now().is_none(),
+            "fresh USD cannot price JPY input"
+        );
+        assert!(h.app.compose_lamports().is_err());
+        let jpy = SolPrice {
+            value: 20_000.0,
+            currency: Currency::Jpy,
+            ..usd
+        };
+        h.app.price.set(jpy);
+        assert_eq!(h.app.price_now().unwrap().currency, Currency::Jpy);
+        assert_eq!(h.app.compose_lamports().unwrap(), 500_000_000);
+        h.app.price.set(SolPrice {
+            fetched_at: 0,
+            ..jpy
+        });
+        assert!(h.app.price_now().is_none());
+        assert!(h.app.compose_lamports().is_err());
+        h.app.input.send_in_fiat = false;
+        h.app.input.send_amount = "1.25".into();
+        for cached in [
+            Some(usd),
+            Some(SolPrice {
+                fetched_at: 0,
+                ..jpy
+            }),
+            None,
+        ] {
+            if let Some(p) = cached {
+                h.app.price.set(p);
+            } else {
+                h.app.price.clear();
+            }
+            assert_eq!(h.app.compose_lamports().unwrap(), 1_250_000_000);
+        }
+    }
+
+    #[test]
+    fn currency_price_guard_ignores_mismatched_events_before_animation() {
+        use crate::types::Currency;
+        let mut h = harness(true);
+        h.app.currency = Currency::Jpy;
+        let price = SolPrice {
+            value: 150.0,
+            currency: Currency::Usd,
+            fetched_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            source: PriceSource::CoinGecko,
+        };
+        h.app.apply_app_event(AppEvent::Price {
+            price: SolPrice {
+                currency: Currency::Jpy,
+                value: 20_000.0,
+                ..price
+            },
+            generation: 0,
+        });
+        h.app.price_flash = 0.25;
+        h.app.price_up = true;
+        h.app.apply_app_event(AppEvent::Price {
+            price,
+            generation: 0,
+        });
+        assert_eq!(h.app.price_flash, 0.25);
+        assert!(h.app.price_up);
+        // An unchanged matching price must not flash: the baseline stayed JPY.
+        h.app.apply_app_event(AppEvent::Price {
+            price: SolPrice {
+                currency: Currency::Jpy,
+                value: 20_000.0,
+                ..price
+            },
+            generation: 0,
+        });
+        assert_eq!(h.app.price_flash, 0.25);
+        for (value, up) in [(21_000.0, true), (19_000.0, false)] {
+            h.app.price_flash = 0.25;
+            h.app.apply_app_event(AppEvent::Price {
+                price: SolPrice {
+                    currency: Currency::Jpy,
+                    value,
+                    ..price
+                },
+                generation: 0,
+            });
+            assert_eq!(h.app.price_flash, 1.0);
+            assert_eq!(h.app.price_up, up);
+        }
+    }
+
+    #[test]
+    fn currency_price_guard_settings_wait_for_ack_without_bumping_generation() {
+        use crate::app::SettingChange;
+        use crate::types::Currency;
+        let mut h = harness(true);
+        h.app.route = Route::Settings;
+        h.app.currency = Currency::Usd;
+        let price = SolPrice {
+            value: 150.0,
+            currency: Currency::Usd,
+            fetched_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            source: PriceSource::CoinGecko,
+        };
+        h.app.price.set(price);
+        h.app.apply_app_event(AppEvent::Price {
+            price,
+            generation: 0,
+        });
+        h.app.price_flash = 0.25;
+        h.app.price_up = true;
+        settings_keys(
+            &mut h.app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+        );
+        let (generation, command) = h.rx.try_recv().unwrap();
+        let Command::PersistSetting { change } = command else {
+            panic!("expected PersistSetting");
+        };
+        assert_eq!(change, SettingChange::Currency(Currency::Usd.next()));
+        assert_eq!(generation, 0);
+        assert_eq!(h.app.currency, Currency::Usd);
+        assert_eq!(
+            h.app.price.get().unwrap().to_meta_json(),
+            price.to_meta_json()
+        );
+        h.app.apply_app_event(AppEvent::Price {
+            price,
+            generation: 0,
+        });
+        assert_eq!(h.app.price_flash, 0.25);
+        assert!(h.app.price_up);
+        assert_eq!(h.app.generation.load(Ordering::SeqCst), 0);
+        h.app.apply_app_event(AppEvent::SettingPersisted {
+            change,
+            result: Err("write failed".into()),
+            generation: 0,
+        });
+        assert_eq!(h.app.currency, Currency::Usd);
+        assert_eq!(
+            h.app.price.get().unwrap().to_meta_json(),
+            price.to_meta_json()
+        );
+        h.app.apply_app_event(AppEvent::Price {
+            price,
+            generation: 0,
+        });
+        assert_eq!(h.app.price_flash, 0.25);
+        assert!(h.app.price_up);
+        assert!(h.rx.try_recv().is_err());
+        assert_eq!(h.app.generation.load(Ordering::SeqCst), 0);
+        h.app.apply_app_event(AppEvent::SettingPersisted {
+            change: SettingChange::Currency(Currency::Jpy),
+            result: Ok(()),
+            generation: 0,
+        });
+        assert_eq!(h.app.currency, Currency::Jpy);
+        assert!(h.app.price.get().is_none());
+        assert_eq!(h.app.price_flash, 0.0);
+        h.app.apply_app_event(AppEvent::Price {
+            price: SolPrice {
+                currency: Currency::Jpy,
+                value: 20_000.0,
+                ..price
+            },
+            generation: 0,
+        });
+        assert_eq!(
+            h.app.price_flash, 0.0,
+            "first JPY event establishes a new baseline"
+        );
+        assert_eq!(h.app.generation.load(Ordering::SeqCst), 0);
+        assert!(matches!(h.rx.try_recv().unwrap(), (0, Command::FetchPrice)));
+        assert!(h.rx.try_recv().is_err());
+    }
+
+    #[test]
     fn stale_fiat_price_cannot_compose_send_amount() {
         let mut h = harness(true);
         h.app.input.send_in_fiat = true;
