@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11](https://github.com/265866/silo/compare/v0.1.10...v0.1.11) - 2026-09-05
+
+### Fixed
+
+- avoid setup overflow and restore terminal before worker shutdown ([#278](https://github.com/265866/silo/pull/278))
+- *(vault)* report unlock diagnostics and enforce locked audit state ([#276](https://github.com/265866/silo/pull/276))
+- *(tui)* preserve amount precision and keep active content visible ([#277](https://github.com/265866/silo/pull/277))
+- *(update)* detect cargo installs on native windows ([#275](https://github.com/265866/silo/pull/275))
+- *(db)* zeroize audit keys across their lifetime ([#274](https://github.com/265866/silo/pull/274))
+- *(crypto)* zeroize HKDF intermediate buffers ([#273](https://github.com/265866/silo/pull/273))
+- *(worker)* compare mnemonics without plaintext strings ([#272](https://github.com/265866/silo/pull/272))
+- *(app)* scrub setup confirmation on exit ([#271](https://github.com/265866/silo/pull/271))
+- *(reconcile)* retry partially failed reconciliation ([#270](https://github.com/265866/silo/pull/270))
+- *(app)* preserve lock state after send persistence ([#269](https://github.com/265866/silo/pull/269))
+- *(price)* reject obsolete currency publications ([#268](https://github.com/265866/silo/pull/268))
+- *(input)* preserve send amount when conversion fails ([#267](https://github.com/265866/silo/pull/267))
+- *(profiles)* recover sealed vaults missing from registry ([#266](https://github.com/265866/silo/pull/266))
+- *(ci)* remove bincode and replace yanked chacha20 ([#265](https://github.com/265866/silo/pull/265))
+- *(rpc)* strip RPC URL from transport and body error messages ([#261](https://github.com/265866/silo/pull/261))
+
+### Other
+
+- *(deps)* bump argon2 from 0.5.3 to 0.6.0 ([#264](https://github.com/265866/silo/pull/264))
+- *(deps)* bump ed25519-dalek from 2.2.0 to 3.0.0 ([#260](https://github.com/265866/silo/pull/260))
+- *(deps)* bump solana-message from 4.5.0 to 4.6.0 in the cargo-minor-patch group across 1 directory ([#263](https://github.com/265866/silo/pull/263))
+- *(deps)* bump base64 from 0.22.1 to 0.23.1 ([#259](https://github.com/265866/silo/pull/259))
+
 ## [0.1.10](https://github.com/265866/silo/compare/v0.1.9...v0.1.10) - 2026-08-21
 
 ### Fixed
