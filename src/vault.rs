@@ -347,39 +347,32 @@ mod tests {
     }
 
     #[test]
-    fn legacy_param_vault_still_unlocks() {
+    fn argon2_053_vault_fixtures_still_unlock() {
+        // Generated with argon2 0.5.3 and chacha20poly1305 0.11.0, not the
+        // library under test: Argon2id v19, 32-byte output, password "legacy-pw",
+        // salt [7; 16], nonce [9; 24], and the mnemonic below. Cover both the
+        // historical (19456, 2, 1) and current (65536, 3, 1) stored costs.
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let fixtures = [
+            (
+                r#"{"magic":"silo-vault","version":1,"kdf":"argon2id","m_cost":19456,"t_cost":2,"p_cost":1,"salt_b58":"sLDDSz4DCdAn1W1xf36N2","nonce_b58":"pmuWZgV4nJVHaioT79ABVXxCGYGnWrUG","ciphertext_b58":"88i8dL9V5w7iyvVwNndKf7HzTbmA6qfS5C5GV8Sd1cZP4Y9pNYN52dWtiuShtnkcStkj9YaTbkgtKcRpBErBhFJd7pubG3Ya19PjUZoEJf76fV9CNtMyP9MdLBDRFzpigYQb4E6NBrFSYEvb6bPdJ"}"#,
+                "AztT36fz59WsWN9D7pqragcaZaCE2EFGYJ6UNSbbSjyf",
+            ),
+            (
+                r#"{"magic":"silo-vault","version":1,"kdf":"argon2id","m_cost":65536,"t_cost":3,"p_cost":1,"salt_b58":"sLDDSz4DCdAn1W1xf36N2","nonce_b58":"pmuWZgV4nJVHaioT79ABVXxCGYGnWrUG","ciphertext_b58":"S5VeKM82sFoW8TKX9WC94S1H8tdXeA79BfmVunhbXXiZymjKVSQhqyWfw9RM9qmRCVvaTR7f5y52bqrx7uDWgzdKDsas4WkHmfWhw1trcaZ5AzjjmtnYWoPAiE4DobM3eNE1ibb9EyJoFJzM3Gt1m"}"#,
+                "AxMyCTc6xHFG8n8Tgq7XaZZKSDUdTHrrUPHKJtc3fpAE",
+            ),
+        ];
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.json");
-        let mnemonic = generate_mnemonic().unwrap();
-
-        let legacy_m = 19_456;
-        let legacy_t = 2;
-        let legacy_p = 1;
-        let mut salt = [0u8; SALT_LEN];
-        crate::crypto::random_bytes(&mut salt);
-        let key = derive_key("legacy-pw", &salt, legacy_m, legacy_t, legacy_p).unwrap();
-        let cipher = XChaCha20Poly1305::new_from_slice(&*key).unwrap();
-        let nonce_bytes = [9u8; NONCE_LEN];
-        let nonce = <&XNonce>::from(&nonce_bytes);
-        let ciphertext = cipher
-            .encrypt(nonce, mnemonic.to_string().as_bytes())
-            .unwrap();
-
-        let vault = VaultFile {
-            magic: MAGIC.to_string(),
-            version: VERSION,
-            kdf: "argon2id".to_string(),
-            m_cost: legacy_m,
-            t_cost: legacy_t,
-            p_cost: legacy_p,
-            salt_b58: bs58::encode(salt).into_string(),
-            nonce_b58: bs58::encode(nonce_bytes).into_string(),
-            ciphertext_b58: bs58::encode(&ciphertext).into_string(),
-        };
-        fs::write(&path, serde_json::to_vec(&vault).unwrap()).unwrap();
-
-        let recovered = unlock_vault(&path, "legacy-pw").unwrap();
-        assert_eq!(recovered.to_string(), mnemonic.to_string());
+        for (json, expected_key) in fixtures {
+            fs::write(&path, json).unwrap();
+            let (recovered, key) = unlock_vault_keyed(&path, "legacy-pw").unwrap();
+            assert_eq!(recovered.to_string(), mnemonic);
+            assert_eq!(bs58::encode(key.as_bytes()).into_string(), expected_key);
+            assert!(unlock_vault_keyed(&path, "wrong-pw").is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), json);
+        }
     }
 
     #[test]
