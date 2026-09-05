@@ -1083,6 +1083,8 @@ impl App {
 
     pub fn lock(&mut self) {
         self.seed = None;
+        self.blocking_input = false;
+        self.preparing_send = false;
         self.input.zeroize_secrets();
         self.modal = None;
         self.pending_send = None;
@@ -1560,10 +1562,12 @@ impl App {
                 self.refresh_detail_intents();
             }
             AppEvent::SendPersisted { result, .. } => {
-                self.blocking_input = false;
+                if self.seed.is_some() {
+                    self.blocking_input = false;
+                }
                 match result {
                     SendPersistResult::Signed { intent_id } => {
-                        if self.send_cmd(Command::Broadcast { intent_id }) {
+                        if self.send_cmd(Command::Broadcast { intent_id }) && self.seed.is_some() {
                             self.route = Route::WalletDetail;
                             self.refresh_detail_intents();
                             self.toast_info("Signing & broadcasting…");

@@ -1993,6 +1993,299 @@ mod tests {
         )
     }
 
+    // Drive the real input and persistence paths, but leave their completion unapplied.
+    async fn persisted_send_completion(
+        existing_intent: bool,
+    ) -> (crate::app::App, mpsc::Receiver<(u64, Command)>, AppEvent) {
+        use crate::app::{App, Modal, PendingSend, Route};
+        use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        let (db, from_id) = storage_with_wallets();
+        db.call_blocking(|d| d.unlock_audit_key(&[7u8; 32]))
+            .unwrap();
+        let (rpc, price, client) = worker_deps();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let generation = Arc::new(AtomicU64::new(7));
+        let config_dir = std::env::temp_dir().join("silo-send-persistence-test");
+        let mut app = App::new(
+            db.clone(),
+            price.clone(),
+            cmd_tx,
+            generation.clone(),
+            rpc.clone(),
+            client.clone(),
+            config_dir.clone(),
+            "http://127.0.0.1:8899".into(),
+            config_dir.join("vault.json"),
+        );
+        app.wallets = db.call_blocking(|d| d.list_wallets()).unwrap();
+        app.seed = Some(test_seed());
+        app.focused_wallet = Some(from_id);
+        app.route = Route::Send;
+        app.modal = Some(Modal::ConfirmSend);
+        app.pending_send = Some(PendingSend {
+            from_id,
+            to: crate::crypto::derive_address(&test_seed(), 2),
+            lamports: 1_000,
+            blockhash: bs58::encode([3u8; 32]).into_string(),
+            lvbh: 100,
+            fee: 5_000,
+            dest_balance: 0,
+            priority_micro: 0,
+            prepared_at: std::time::Instant::now(),
+        });
+        if existing_intent {
+            let to = app.pending_send.as_ref().unwrap().to.clone();
+            db.call_blocking(move |d| d.create_intent(from_id, &to, 1_000, None))
+                .unwrap();
+        }
+        crate::input::handle_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+        assert!(app.blocking_input);
+        let (cmd_gen, cmd) = cmd_rx.try_recv().unwrap();
+        assert_eq!(cmd_gen, 7);
+        assert!(matches!(cmd, Command::PersistSignedSend { .. }));
+        let (evt_tx, mut evt_rx) = mpsc::channel(8);
+        handle_command(cmd_gen, cmd, db, rpc, evt_tx, price, client, generation).await;
+        let completion = evt_rx.try_recv().unwrap();
+        assert!(matches!(
+            completion,
+            AppEvent::SendPersisted { generation: 7, .. }
+        ));
+        assert!(evt_rx.try_recv().is_err());
+        assert!(cmd_rx.try_recv().is_err());
+        (app, cmd_rx, completion)
+    }
+
+    #[tokio::test]
+    async fn send_persistence_completion_after_lock_preserves_signed_intent_and_broadcast() {
+        use crate::app::Route;
+        let (mut app, mut rx, completion) = persisted_send_completion(false).await;
+        let intent_id = match &completion {
+            AppEvent::SendPersisted {
+                result: SendPersistResult::Signed { intent_id },
+                ..
+            } => *intent_id,
+            other => panic!("unexpected completion: {other:?}"),
+        };
+        let before = app
+            .db
+            .call_blocking(move |d| d.get_intent(intent_id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.status, crate::types::IntentStatus::Signed);
+        assert!(before.signature.as_ref().is_some_and(|s| !s.is_empty()));
+        assert!(
+            before
+                .signed_tx
+                .as_ref()
+                .is_some_and(|wire| !wire.is_empty())
+        );
+
+        app.lock();
+        app.apply_app_event(completion);
+
+        assert_eq!(app.route, Route::Unlock);
+        assert!(app.seed.is_none());
+        assert!(app.modal.is_none());
+        assert!(app.pending_send.is_none());
+        assert!(!app.blocking_input);
+        assert!(!app.preparing_send);
+        assert_eq!(app.generation.load(Ordering::SeqCst), 7);
+        assert!(
+            matches!(rx.try_recv().unwrap(), (7, Command::Broadcast { intent_id: id }) if id == intent_id)
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "locked completion must not refresh unlocked details"
+        );
+        let after = app
+            .db
+            .call_blocking(move |d| d.get_intent(intent_id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.status, crate::types::IntentStatus::Signed);
+        assert_eq!(after.signature, before.signature);
+        assert_eq!(after.signed_tx, before.signed_tx);
+    }
+
+    #[tokio::test]
+    async fn send_persistence_completion_unlocked_routes_and_broadcasts() {
+        let (mut app, mut rx, completion) = persisted_send_completion(false).await;
+        let intent_id = match &completion {
+            AppEvent::SendPersisted {
+                result: SendPersistResult::Signed { intent_id },
+                ..
+            } => *intent_id,
+            other => panic!("unexpected completion: {other:?}"),
+        };
+        app.apply_app_event(completion);
+        assert_eq!(app.route, crate::app::Route::WalletDetail);
+        assert!(app.seed.is_some());
+        assert!(!app.blocking_input);
+        assert_eq!(app.generation.load(Ordering::SeqCst), 7);
+        assert!(
+            matches!(rx.try_recv().unwrap(), (7, Command::Broadcast { intent_id: id }) if id == intent_id)
+        );
+        assert!(
+            matches!(rx.try_recv().unwrap(), (7, Command::LoadDetail { wallet_id }) if Some(wallet_id) == app.focused_wallet)
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(
+            app.toasts
+                .iter()
+                .any(|t| t.text == "Signing & broadcasting…")
+        );
+    }
+
+    #[tokio::test]
+    async fn send_persistence_failure_after_lock_does_not_broadcast() {
+        let (mut app, mut rx, completion) = persisted_send_completion(true).await;
+        let reason = match &completion {
+            AppEvent::SendPersisted {
+                result: SendPersistResult::Failed(reason),
+                ..
+            } => reason.clone(),
+            other => panic!("unexpected completion: {other:?}"),
+        };
+        assert_eq!(reason, "This wallet already has a transfer in progress");
+        app.lock();
+        app.apply_app_event(completion);
+        assert_eq!(app.route, crate::app::Route::Unlock);
+        assert!(app.seed.is_none());
+        assert!(app.modal.is_none());
+        assert!(app.pending_send.is_none());
+        assert!(!app.blocking_input);
+        assert!(!app.preparing_send);
+        assert_eq!(app.generation.load(Ordering::SeqCst), 7);
+        assert!(rx.try_recv().is_err());
+        assert!(app.toasts.iter().any(|t| t.text == reason));
+    }
+
+    async fn assert_send_completion_preserves_pending_unlock(existing_intent: bool) {
+        use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        let (mut app, mut rx, completion) = persisted_send_completion(existing_intent).await;
+        let signed_intent = match &completion {
+            AppEvent::SendPersisted {
+                result: SendPersistResult::Signed { intent_id },
+                ..
+            } => {
+                assert!(!existing_intent);
+                Some(*intent_id)
+            }
+            AppEvent::SendPersisted {
+                result: SendPersistResult::Failed(reason),
+                ..
+            } => {
+                assert!(existing_intent);
+                assert_eq!(reason, "This wallet already has a transfer in progress");
+                None
+            }
+            other => panic!("unexpected completion: {other:?}"),
+        };
+        app.lock();
+        assert!(!app.blocking_input);
+        crate::input::handle_event(&mut app, Event::Paste("test passphrase".into()));
+        crate::input::handle_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+        assert!(app.blocking_input);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            (7, Command::UnlockVault { vault_path, passphrase })
+                if vault_path == app.vault_path && passphrase.as_str() == "test passphrase"
+        ));
+        assert!(app.input.passphrase.is_empty());
+        assert!(rx.try_recv().is_err());
+
+        app.apply_app_event(completion);
+
+        assert!(
+            app.blocking_input,
+            "send completion must not clear a pending unlock"
+        );
+        assert_eq!(app.route, crate::app::Route::Unlock);
+        assert!(app.seed.is_none());
+        assert!(app.modal.is_none());
+        assert!(app.pending_send.is_none());
+        assert!(!app.preparing_send);
+        assert_eq!(app.generation.load(Ordering::SeqCst), 7);
+        if let Some(intent_id) = signed_intent {
+            assert!(
+                matches!(rx.try_recv().unwrap(), (7, Command::Broadcast { intent_id: id }) if id == intent_id)
+            );
+        }
+        assert!(rx.try_recv().is_err());
+        crate::input::handle_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+        assert!(app.blocking_input);
+        assert!(
+            rx.try_recv().is_err(),
+            "second Enter must not queue another unlock"
+        );
+        assert!(
+            app.toasts
+                .iter()
+                .any(|t| t.text == "Unlock already in progress")
+        );
+    }
+
+    #[tokio::test]
+    async fn send_persistence_success_preserves_pending_unlock() {
+        assert_send_completion_preserves_pending_unlock(false).await;
+    }
+
+    #[tokio::test]
+    async fn send_persistence_failure_preserves_pending_unlock() {
+        assert_send_completion_preserves_pending_unlock(true).await;
+    }
+
+    #[tokio::test]
+    async fn send_persistence_completion_queue_errors_preserve_route() {
+        for locked in [false, true] {
+            for closed in [false, true] {
+                let (mut app, mut rx, completion) = persisted_send_completion(false).await;
+                if locked {
+                    app.lock();
+                }
+                let route = app.route;
+                if closed {
+                    rx.close();
+                } else {
+                    for _ in 0..8 {
+                        assert!(app.send_cmd(Command::LoadWallets));
+                    }
+                }
+                app.apply_app_event(completion);
+                assert_eq!(app.route, route);
+                assert_eq!(app.seed.is_none(), locked);
+                assert!(app.modal.is_none());
+                assert!(app.pending_send.is_none());
+                assert!(!app.blocking_input);
+                assert!(!app.preparing_send);
+                assert_eq!(app.generation.load(Ordering::SeqCst), 7);
+                let expected = if closed {
+                    "Background worker stopped"
+                } else {
+                    "Command queue is full — try again"
+                };
+                assert!(app.toasts.iter().any(|t| t.text == expected));
+                if !closed {
+                    for _ in 0..8 {
+                        assert!(matches!(rx.try_recv().unwrap(), (7, Command::LoadWallets)));
+                    }
+                }
+                assert!(rx.try_recv().is_err());
+            }
+        }
+    }
+
     fn publication_price(currency: crate::types::Currency, value: f64) -> SolPrice {
         SolPrice {
             value,
