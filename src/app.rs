@@ -822,6 +822,7 @@ impl App {
         }
         self.input.zeroize_secrets();
         self.setup.mnemonic_words.zeroize();
+        self.setup.scrub_confirm();
     }
 
     pub fn send_cmd(&mut self, cmd: Command) -> bool {
@@ -2065,6 +2066,70 @@ mod tests {
         );
         app.wallets = vec![wallet.clone()];
         (app, pubkey, wallet.id)
+    }
+
+    fn populate_exit_secrets(app: &mut App) {
+        app.setup.mnemonic_words = TEST_MNEMONIC.split_whitespace().map(String::from).collect();
+        app.setup.begin_confirm(12);
+        app.setup.confirm_words[0] = "abandon".into();
+        app.setup.confirm_words[1] = "aban".into();
+        app.setup.confirm_focus = 1;
+        app.setup.confirm_mismatch = Some(1);
+        app.input.passphrase.push_str("test passphrase");
+        app.input.passphrase2.push_str("test passphrase");
+        app.input.import_phrase.push_str(TEST_MNEMONIC);
+        app.input.focus = 2;
+    }
+
+    fn assert_exit_secrets_cleared(app: &App) {
+        assert!(app.seed.is_none());
+        assert!(app.setup.confirm_words.is_empty());
+        assert_eq!(app.setup.confirm_focus, 0);
+        assert_eq!(app.setup.confirm_mismatch, None);
+        assert!(app.setup.mnemonic_words.is_empty());
+        assert!(app.input.passphrase.is_empty());
+        assert!(app.input.passphrase2.is_empty());
+        assert!(app.input.import_phrase.is_empty());
+        assert_eq!(app.input.focus, 0);
+    }
+
+    #[test]
+    fn scrub_for_exit_clears_partial_confirmation_without_seed() {
+        let (mut app, _, _) = stale_event_app();
+        app.route = Route::Setup;
+        app.setup.stage = SetupStage::ConfirmMnemonic;
+        populate_exit_secrets(&mut app);
+        assert!(app.seed.is_none());
+
+        app.scrub_for_exit();
+
+        assert_exit_secrets_cleared(&app);
+        assert_eq!(app.route, Route::Setup);
+    }
+
+    #[test]
+    fn scrub_for_exit_locks_unlocked_app_and_clears_secrets() {
+        let (mut app, _) = idle_unlocked_app();
+        populate_exit_secrets(&mut app);
+        assert!(app.seed.is_some());
+
+        app.scrub_for_exit();
+
+        assert_exit_secrets_cleared(&app);
+        assert_eq!(app.route, Route::Unlock);
+        app.scrub_for_exit();
+        assert_exit_secrets_cleared(&app);
+        assert_eq!(app.route, Route::Unlock);
+    }
+
+    #[test]
+    fn scrub_for_exit_is_idempotent_with_empty_secrets() {
+        let (mut app, _, _) = stale_event_app();
+        for _ in 0..2 {
+            app.scrub_for_exit();
+            assert_exit_secrets_cleared(&app);
+            assert_eq!(app.route, Route::ProfileSelect);
+        }
     }
 
     #[test]
