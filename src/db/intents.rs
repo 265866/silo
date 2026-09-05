@@ -3,7 +3,7 @@ use rusqlite::types::Type;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::json;
 
-use super::{Db, append_audit, now_ms};
+use super::{Db, append_audit, now_ms, require_audit_key};
 use crate::types::{AuditEvent, Intent, IntentStatus, TerminalStatus};
 
 #[derive(Debug, thiserror::Error)]
@@ -158,9 +158,7 @@ impl Db {
         let now = now_ms();
         let lamports_i64 = i64::try_from(lamports)
             .map_err(|_| CreateIntentError::ValueOutOfRange { field: "lamports" })?;
-        let key = self
-            .require_audit_key()
-            .map_err(CreateIntentError::AuditKeyLocked)?;
+        let key = require_audit_key(&self.audit_key).map_err(CreateIntentError::AuditKeyLocked)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -197,7 +195,7 @@ impl Db {
         let id = tx.last_insert_rowid();
         append_audit(
             &tx,
-            &key,
+            key,
             AuditEvent::IntentCreated,
             &json!({"id": id, "from_wallet": from_wallet, "to": to_address, "lamports": lamports}),
         )
@@ -236,9 +234,8 @@ impl Db {
         event: AuditEvent,
         details: &serde_json::Value,
     ) -> Result<IntentTransitionOutcome, IntentTransitionError> {
-        let key = self
-            .require_audit_key()
-            .map_err(IntentTransitionError::AuditKeyLocked)?;
+        let key =
+            require_audit_key(&self.audit_key).map_err(IntentTransitionError::AuditKeyLocked)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -253,7 +250,7 @@ impl Db {
         if n == 0 {
             return transition_miss(&tx, id);
         }
-        append_audit(&tx, &key, event, details).map_err(|source| IntentTransitionError::Db {
+        append_audit(&tx, key, event, details).map_err(|source| IntentTransitionError::Db {
             context: ctx.audit,
             source,
         })?;
@@ -379,7 +376,7 @@ impl Db {
     }
 
     pub fn set_intent_note(&mut self, id: i64, note: Option<&str>) -> Result<()> {
-        let key = self.require_audit_key()?;
+        let key = require_audit_key(&self.audit_key)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -399,7 +396,7 @@ impl Db {
             }
             bail!("transfer not found");
         }
-        append_audit(&tx, &key, AuditEvent::IntentNoted, &json!({"id": id}))?;
+        append_audit(&tx, key, AuditEvent::IntentNoted, &json!({"id": id}))?;
         tx.commit()?;
         Ok(())
     }
@@ -537,13 +534,64 @@ mod tests {
     }
 
     #[test]
-    fn locked_audit_key_is_typed_create_intent_error() {
-        let (mut d, m, _s) = db_with_two_wallets();
-        d.lock_audit_key();
-        assert!(matches!(
-            d.create_intent(m, "Dest11111111111111111111111111111111111111A", 1000, None),
-            Err(CreateIntentError::AuditKeyLocked(_))
-        ));
+    fn locked_audit_key_is_typed_intent_error_without_mutation() {
+        let mut d = Db::open_memory().unwrap();
+        let vk = [9u8; 32];
+        d.unlock_audit_key(&vk).unwrap();
+        let m = d.insert_wallet(0, Role::Master, "Master", None).unwrap();
+        let s = d.insert_wallet(1, Role::Sub, "Sub", None).unwrap();
+        let created = d
+            .create_intent(m.id, "DestA", 1000, Some("original"))
+            .unwrap();
+        let signed = d.create_intent(s.id, "DestB", 2000, None).unwrap();
+        d.mark_signed(signed.id, "SigB", "bh", 100, 5000, b"bytesB")
+            .unwrap();
+        let audit_count = d.list_audit(100).unwrap().len();
+        let audit_head = d.get_meta("audit_head_hash").unwrap();
+
+        for _ in 0..2 {
+            d.lock_audit_key();
+            assert!(matches!(
+                d.create_intent(m.id, "DestC", 1000, None),
+                Err(CreateIntentError::AuditKeyLocked(_))
+            ));
+            assert!(matches!(
+                d.mark_signed(created.id, "SigA", "bh", 100, 5000, b"bytesA"),
+                Err(IntentTransitionError::AuditKeyLocked(_))
+            ));
+            assert!(matches!(
+                d.mark_submitted(signed.id),
+                Err(IntentTransitionError::AuditKeyLocked(_))
+            ));
+            assert!(matches!(
+                d.mark_terminal(signed.id, TerminalStatus::Failed, Some("locked")),
+                Err(IntentTransitionError::AuditKeyLocked(_))
+            ));
+            assert!(d.set_intent_note(created.id, Some("changed")).is_err());
+            assert_eq!(d.get_open_intents().unwrap().len(), 2);
+            let unchanged = d.get_intent(created.id).unwrap().unwrap();
+            assert_eq!(unchanged.status, IntentStatus::Created);
+            assert_eq!(unchanged.note.as_deref(), Some("original"));
+            assert_eq!(unchanged.updated_at, created.updated_at);
+            assert!(unchanged.signature.is_none());
+            assert!(unchanged.signed_tx.is_none());
+            let unchanged = d.get_intent(signed.id).unwrap().unwrap();
+            assert_eq!(unchanged.status, IntentStatus::Signed);
+            assert_eq!(unchanged.signature.as_deref(), Some("SigB"));
+            assert_eq!(unchanged.signed_tx.as_deref(), Some(&b"bytesB"[..]));
+            assert!(unchanged.error.is_none());
+            assert_eq!(d.list_audit(100).unwrap().len(), audit_count);
+            assert_eq!(d.get_meta("audit_head_hash").unwrap(), audit_head);
+        }
+
+        d.unlock_audit_key(&vk).unwrap();
+        assert!(d.verify_audit_chain().unwrap());
+        assert_eq!(
+            d.mark_submitted(signed.id).unwrap(),
+            IntentTransitionOutcome::Applied
+        );
+        assert_eq!(d.list_audit(100).unwrap().len(), audit_count + 1);
+        assert!(d.verify_audit_chain().unwrap());
     }
 
     #[test]
