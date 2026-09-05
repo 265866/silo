@@ -85,8 +85,14 @@ impl Currency {
 
     pub fn decimals(&self) -> usize {
         match self {
-            Currency::Jpy | Currency::Cny => 0,
-            _ => 2,
+            Currency::Jpy => 0,
+            Currency::Usd
+            | Currency::Eur
+            | Currency::Gbp
+            | Currency::Cad
+            | Currency::Aud
+            | Currency::Chf
+            | Currency::Cny => 2,
         }
     }
 

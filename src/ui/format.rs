@@ -223,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_decimal_currencies_render_without_minor_units() {
+    fn currency_minor_units_keep_cny_fen_and_jpy_whole_yen() {
         let now = crate::db::now_ms() as u64 / 1000;
         let jpy = SolPrice {
             value: 21000.0,
@@ -240,8 +240,20 @@ mod tests {
             fetched_at: now,
             source: crate::price::PriceSource::CoinGecko,
         };
-        assert_eq!(fmt_usd(Some(cny), 124_500_000_000), "CN¥871,500");
-        assert_eq!(fmt_price(Some(cny)), "SOL CN¥7,000");
+        assert_eq!(fmt_usd(Some(cny), 124_500_000_000), "CN¥871,500.00");
+        assert_eq!(fmt_price(Some(cny)), "SOL CN¥7,000.00");
+        assert_eq!(fmt_usd(Some(cny), 100_000), "CN¥0.70");
+        assert_eq!(fmt_usd(Some(cny), 0), "CN¥0.00");
+        for currency in crate::types::Currency::ALL {
+            assert_eq!(
+                currency.decimals(),
+                if currency == crate::types::Currency::Jpy {
+                    0
+                } else {
+                    2
+                }
+            );
+        }
     }
 
     #[test]
