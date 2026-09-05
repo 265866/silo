@@ -372,8 +372,10 @@ pub enum PasteTarget {
 #[derive(Debug)]
 pub enum UnlockResult {
     Unlocked { seed: Seed, wallets: Vec<WalletRow> },
-    WrongPassphrase,
+    AuthenticationFailed,
+    VaultRead(String),
     AuditKey,
+    AuditWrite(String),
     WalletMismatch,
     WalletRead(String),
     AuditChainFailed,
@@ -1574,11 +1576,11 @@ impl App {
             }
             AppEvent::UnlockComplete { result, .. } => {
                 self.blocking_input = false;
+                self.unlock_failed = false;
                 match result {
                     UnlockResult::Unlocked { seed, wallets } => {
                         self.seed = Some(seed);
                         self.wallets = wallets;
-                        self.unlock_failed = false;
                         self.clamp_list_selection();
                         self.route = Route::WalletList;
                         self.note_activity();
@@ -1586,10 +1588,22 @@ impl App {
                         self.request_balance_refresh();
                         self.toast_ok("Unlocked");
                     }
-                    UnlockResult::WrongPassphrase => {
+                    UnlockResult::AuthenticationFailed => {
                         self.input.passphrase.zeroize();
                         self.unlock_failed = true;
-                        self.toast_err("Wrong passphrase");
+                        self.toast_err("Incorrect passphrase or corrupted vault");
+                    }
+                    UnlockResult::VaultRead(e) => {
+                        self.modal = Some(Modal::Error {
+                            title: "Cannot open vault".into(),
+                            body: e,
+                        });
+                    }
+                    UnlockResult::AuditWrite(e) => {
+                        self.modal = Some(Modal::Error {
+                            title: "Cannot write audit log".into(),
+                            body: format!("{e}. Refusing to operate."),
+                        });
                     }
                     UnlockResult::AuditKey => {
                         self.modal = Some(Modal::Error {
@@ -2218,7 +2232,7 @@ mod tests {
                 generation: stale,
             },
             AppEvent::UnlockComplete {
-                result: UnlockResult::WrongPassphrase,
+                result: UnlockResult::AuthenticationFailed,
                 generation: stale,
             },
             AppEvent::SetupComplete {

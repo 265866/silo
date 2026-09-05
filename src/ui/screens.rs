@@ -109,7 +109,7 @@ pub(super) fn unlock(f: &mut Frame, app: &App, area: Rect) {
     let block = panel(title, true, theme);
     let error_line = if app.unlock_failed {
         Line::from(Span::styled(
-            "  Incorrect passphrase — try again",
+            "  Incorrect passphrase or corrupted vault",
             Style::default().fg(theme.danger),
         ))
     } else {

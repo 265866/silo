@@ -263,7 +263,6 @@ pub enum NetStatus {
 pub enum AuditEvent {
     VaultCreated,
     VaultUnlocked,
-    VaultUnlockFailed,
     WalletDerived,
     WalletLabeled,
     WalletNoted,
@@ -288,7 +287,6 @@ impl AuditEvent {
         match self {
             VaultCreated => "vault_created",
             VaultUnlocked => "vault_unlocked",
-            VaultUnlockFailed => "vault_unlock_failed",
             WalletDerived => "wallet_derived",
             WalletLabeled => "wallet_labeled",
             WalletNoted => "wallet_noted",

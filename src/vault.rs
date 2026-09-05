@@ -26,6 +26,14 @@ const ARGON2_M_COST_MAX: u32 = 1 << 21;
 const ARGON2_T_COST_MAX: u32 = 64;
 const ARGON2_P_COST_MAX: u32 = 16;
 
+#[derive(Debug, thiserror::Error)]
+pub enum UnlockError {
+    #[error("wrong passphrase or corrupted vault")]
+    Authentication,
+    #[error(transparent)]
+    Read(#[from] anyhow::Error),
+}
+
 pub struct VaultKey(Zeroizing<[u8; KEY_LEN]>);
 
 impl VaultKey {
@@ -124,29 +132,35 @@ pub fn unlock_vault(path: &Path, passphrase: &str) -> Result<Mnemonic> {
     Ok(unlock_vault_keyed(path, passphrase)?.0)
 }
 
-pub fn unlock_vault_keyed(path: &Path, passphrase: &str) -> Result<(Mnemonic, VaultKey)> {
+pub fn unlock_vault_keyed(
+    path: &Path,
+    passphrase: &str,
+) -> std::result::Result<(Mnemonic, VaultKey), UnlockError> {
     let bytes = fs::read(path).with_context(|| format!("reading vault at {}", path.display()))?;
     let vault: VaultFile = serde_json::from_slice(&bytes).context("vault file is not valid")?;
 
     if vault.magic != MAGIC {
-        return Err(anyhow!("not a silo vault file"));
+        return Err(anyhow!("not a silo vault file").into());
     }
     if vault.version != VERSION {
-        return Err(anyhow!("unsupported vault version {}", vault.version));
+        return Err(anyhow!("unsupported vault version {}", vault.version).into());
+    }
+    if vault.kdf != "argon2id" {
+        return Err(anyhow!("unsupported vault KDF {}", vault.kdf).into());
     }
 
     if vault.m_cost > ARGON2_M_COST_MAX
         || vault.t_cost > ARGON2_T_COST_MAX
         || vault.p_cost > ARGON2_P_COST_MAX
     {
-        return Err(anyhow!("vault KDF parameters are out of bounds"));
+        return Err(anyhow!("vault KDF parameters are out of bounds").into());
     }
 
     let salt = bs58::decode(&vault.salt_b58)
         .into_vec()
         .context("corrupt salt")?;
     if salt.len() != SALT_LEN {
-        return Err(anyhow!("corrupt salt: expected {SALT_LEN} bytes"));
+        return Err(anyhow!("corrupt salt: expected {SALT_LEN} bytes").into());
     }
     let nonce_bytes = bs58::decode(&vault.nonce_b58)
         .into_vec()
@@ -156,6 +170,9 @@ pub fn unlock_vault_keyed(path: &Path, passphrase: &str) -> Result<(Mnemonic, Va
     let ciphertext = bs58::decode(&vault.ciphertext_b58)
         .into_vec()
         .context("corrupt ciphertext")?;
+    if ciphertext.len() < 16 {
+        return Err(anyhow!("corrupt ciphertext: missing authentication tag").into());
+    }
 
     let key = derive_key(passphrase, &salt, vault.m_cost, vault.t_cost, vault.p_cost)?;
     let cipher =
@@ -164,7 +181,7 @@ pub fn unlock_vault_keyed(path: &Path, passphrase: &str) -> Result<(Mnemonic, Va
     let plaintext = Zeroizing::new(
         cipher
             .decrypt(&nonce, ciphertext.as_ref())
-            .map_err(|_| anyhow!("wrong passphrase or corrupted vault"))?,
+            .map_err(|_| UnlockError::Authentication)?,
     );
 
     let phrase = Zeroizing::new(
@@ -382,7 +399,85 @@ mod tests {
         let mnemonic = generate_mnemonic().unwrap();
 
         create_vault(&path, &mnemonic, "right-passphrase").unwrap();
-        assert!(unlock_vault(&path, "wrong-passphrase").is_err());
+        assert!(matches!(
+            unlock_vault_keyed(&path, "wrong-passphrase"),
+            Err(UnlockError::Authentication)
+        ));
+    }
+
+    #[test]
+    fn unlock_classifies_file_and_structure_errors_as_read_failures() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.json");
+        let mnemonic = generate_mnemonic().unwrap();
+        create_vault(&path, &mnemonic, "pw").unwrap();
+        let original: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        for (field, value, diagnostic) in [
+            ("magic", serde_json::json!("other"), "not a silo vault"),
+            (
+                "version",
+                serde_json::json!(VERSION + 1),
+                "unsupported vault version",
+            ),
+            ("kdf", serde_json::json!("other"), "unsupported vault KDF"),
+            (
+                "m_cost",
+                serde_json::json!(ARGON2_M_COST_MAX + 1),
+                "out of bounds",
+            ),
+            (
+                "t_cost",
+                serde_json::json!(ARGON2_T_COST_MAX + 1),
+                "out of bounds",
+            ),
+            (
+                "p_cost",
+                serde_json::json!(ARGON2_P_COST_MAX + 1),
+                "out of bounds",
+            ),
+            ("m_cost", serde_json::json!(0), "invalid Argon2 params"),
+            ("t_cost", serde_json::json!(0), "invalid Argon2 params"),
+            ("p_cost", serde_json::json!(0), "invalid Argon2 params"),
+            ("salt_b58", serde_json::json!("0"), "corrupt salt"),
+            ("salt_b58", serde_json::json!("1"), "corrupt salt"),
+            ("nonce_b58", serde_json::json!("0"), "corrupt nonce"),
+            ("nonce_b58", serde_json::json!("1"), "corrupt nonce"),
+            (
+                "ciphertext_b58",
+                serde_json::json!("0"),
+                "corrupt ciphertext",
+            ),
+            (
+                "ciphertext_b58",
+                serde_json::json!("1"),
+                "missing authentication tag",
+            ),
+        ] {
+            let mut changed = original.clone();
+            changed[field] = value;
+            fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
+            let err = unlock_vault_keyed(&path, "pw").unwrap_err();
+            assert!(matches!(&err, UnlockError::Read(_)), "{field}: {err}");
+            assert!(err.to_string().contains(diagnostic), "{field}: {err}");
+        }
+
+        fs::write(&path, b"{\"magic\":").unwrap();
+        let err = unlock_vault_keyed(&path, "pw").unwrap_err();
+        assert!(matches!(&err, UnlockError::Read(_)));
+        assert!(err.to_string().contains("vault file is not valid"));
+
+        fs::remove_file(&path).unwrap();
+        let err = unlock_vault_keyed(&path, "pw").unwrap_err();
+        assert!(matches!(&err, UnlockError::Read(_)));
+        assert!(err.to_string().contains("reading vault at"));
+
+        // A directory is an actual unreadable vault path on both Windows and Unix.
+        fs::create_dir(&path).unwrap();
+        assert!(matches!(
+            unlock_vault_keyed(&path, "pw"),
+            Err(UnlockError::Read(_))
+        ));
     }
 
     #[test]
@@ -491,7 +586,10 @@ mod tests {
         vault.ciphertext_b58 = bs58::encode(ct).into_string();
         fs::write(&path, serde_json::to_vec(&vault).unwrap()).unwrap();
 
-        assert!(unlock_vault(&path, "pw").is_err());
+        assert!(matches!(
+            unlock_vault_keyed(&path, "pw"),
+            Err(UnlockError::Authentication)
+        ));
     }
 
     #[test]

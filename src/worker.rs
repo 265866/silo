@@ -354,56 +354,70 @@ fn unlock_vault_blocking(
     vault_path: std::path::PathBuf,
     passphrase: zeroize::Zeroizing<String>,
 ) -> UnlockResult {
-    let unlocked = crate::vault::unlock_vault_keyed(&vault_path, &passphrase);
-    drop(passphrase);
-    let (mnemonic, vault_key) = match unlocked {
-        Ok(v) => v,
-        Err(_) => {
-            db.call_blocking(|d| {
-                let _ = d.audit(AuditEvent::VaultUnlockFailed, &serde_json::json!({}));
-            });
-            return UnlockResult::WrongPassphrase;
+    let result = (|| {
+        let unlocked = crate::vault::unlock_vault_keyed(&vault_path, &passphrase);
+        drop(passphrase);
+        let (mnemonic, vault_key) = match unlocked {
+            Ok(v) => v,
+            Err(crate::vault::UnlockError::Authentication) => {
+                return UnlockResult::AuthenticationFailed;
+            }
+            Err(crate::vault::UnlockError::Read(e)) => {
+                return UnlockResult::VaultRead(format!("{e:#}"));
+            }
+        };
+        let seed = crate::crypto::seed_from_mnemonic(&mnemonic);
+        drop(mnemonic);
+        let key_ok = db.call_blocking(move |d| d.unlock_audit_key(vault_key.as_bytes()).is_ok());
+        if !key_ok {
+            return UnlockResult::AuditKey;
         }
-    };
-    let seed = crate::crypto::seed_from_mnemonic(&mnemonic);
-    drop(mnemonic);
-    let key_ok = db.call_blocking(move |d| d.unlock_audit_key(vault_key.as_bytes()).is_ok());
-    if !key_ok {
-        return UnlockResult::AuditKey;
-    }
-    let mut wallets = match wallet_consistency(&db, &seed) {
-        Ok(wallets) => wallets,
-        Err(WalletCheckError::Mismatch) => {
-            db.call_blocking(|d| {
-                let _ = d.audit(AuditEvent::IntegrityCheckFailed, &serde_json::json!({}));
-            });
-            return UnlockResult::WalletMismatch;
-        }
-        Err(WalletCheckError::Read(e)) => return UnlockResult::WalletRead(e),
-    };
-    match db.call_blocking(|d| d.verify_audit_chain()) {
-        Ok(true) => {
-            if wallets.is_empty() {
-                let address = crate::crypto::derive_address(&seed, 0);
-                match db.call_blocking(move |d| {
-                    d.insert_wallet(0, crate::types::Role::Master, &address, None)
+        let mut wallets = match wallet_consistency(&db, &seed) {
+            Ok(wallets) => wallets,
+            Err(WalletCheckError::Mismatch) => {
+                if let Err(e) = db.call_blocking(|d| {
+                    d.audit(AuditEvent::IntegrityCheckFailed, &serde_json::json!({}))
                 }) {
-                    Ok(master) => wallets.push(master),
-                    Err(e) => {
-                        return UnlockResult::WalletRead(format!(
-                            "initializing recovered master wallet: {e}"
-                        ));
+                    return UnlockResult::AuditWrite(format!(
+                        "Database / vault mismatch; couldn't record the integrity failure: {e:#}"
+                    ));
+                }
+                return UnlockResult::WalletMismatch;
+            }
+            Err(WalletCheckError::Read(e)) => return UnlockResult::WalletRead(e),
+        };
+        match db.call_blocking(|d| d.verify_audit_chain()) {
+            Ok(true) => {
+                if wallets.is_empty() {
+                    let address = crate::crypto::derive_address(&seed, 0);
+                    match db.call_blocking(move |d| {
+                        d.insert_wallet(0, crate::types::Role::Master, &address, None)
+                    }) {
+                        Ok(master) => wallets.push(master),
+                        Err(e) => {
+                            return UnlockResult::WalletRead(format!(
+                                "initializing recovered master wallet: {e}"
+                            ));
+                        }
                     }
                 }
+                if let Err(e) =
+                    db.call_blocking(|d| d.audit(AuditEvent::VaultUnlocked, &serde_json::json!({})))
+                {
+                    return UnlockResult::AuditWrite(format!(
+                        "Couldn't record vault unlock: {e:#}"
+                    ));
+                }
+                UnlockResult::Unlocked { seed, wallets }
             }
-            db.call_blocking(|d| {
-                let _ = d.audit(AuditEvent::VaultUnlocked, &serde_json::json!({}));
-            });
-            UnlockResult::Unlocked { seed, wallets }
+            Ok(false) => UnlockResult::AuditChainFailed,
+            Err(e) => UnlockResult::AuditChainRead(e.to_string()),
         }
-        Ok(false) => UnlockResult::AuditChainFailed,
-        Err(e) => UnlockResult::AuditChainRead(e.to_string()),
+    })();
+    if !matches!(result, UnlockResult::Unlocked { .. }) {
+        db.call_blocking(|d| d.lock_audit_key());
     }
+    result
 }
 
 fn finish_setup_blocking(
@@ -415,112 +429,118 @@ fn finish_setup_blocking(
     phrase: zeroize::Zeroizing<String>,
     passphrase: zeroize::Zeroizing<String>,
 ) -> SetupResult {
-    let mnemonic = match crate::crypto::parse_mnemonic(&phrase) {
-        Ok(m) => m,
-        Err(e) => return SetupResult::Failed(format!("invalid phrase: {e}")),
-    };
-    drop(phrase);
-    let seed = crate::crypto::seed_from_mnemonic(&mnemonic);
-    match wallet_consistency(&db, &seed) {
-        Ok(_) => {}
-        Err(WalletCheckError::Mismatch) => {
-            db.call_blocking(|d| {
-                let _ = d.audit(AuditEvent::IntegrityCheckFailed, &serde_json::json!({}));
-            });
-            return SetupResult::Failed(
+    let result = (|| {
+        let mnemonic = match crate::crypto::parse_mnemonic(&phrase) {
+            Ok(m) => m,
+            Err(e) => return SetupResult::Failed(format!("invalid phrase: {e}")),
+        };
+        drop(phrase);
+        let seed = crate::crypto::seed_from_mnemonic(&mnemonic);
+        match wallet_consistency(&db, &seed) {
+            Ok(_) => {}
+            Err(WalletCheckError::Mismatch) => {
+                // No authenticated audit key exists before setup opens or creates the vault.
+                return SetupResult::Failed(
                 "Existing wallet records don't match this recovery phrase. Refusing to proceed."
                     .to_string(),
             );
+            }
+            Err(WalletCheckError::Read(e)) => {
+                return SetupResult::Failed(format!(
+                    "Wallet metadata couldn't be read: {e}. Refusing to proceed."
+                ));
+            }
         }
-        Err(WalletCheckError::Read(e)) => {
-            return SetupResult::Failed(format!(
-                "Wallet metadata couldn't be read: {e}. Refusing to proceed."
-            ));
-        }
-    }
 
-    let profile_meta = if let Some(id) = current_profile {
+        let profile_meta = if let Some(id) = current_profile {
+            let profiles = match crate::profiles::load(&config_dir) {
+                Ok(profiles) => profiles,
+                Err(e) => return SetupResult::Failed(format!("Couldn't load profiles: {e}")),
+            };
+            Some(
+                profiles
+                    .iter()
+                    .find(|profile| profile.id == id)
+                    .cloned()
+                    .unwrap_or_else(|| crate::profiles::ProfileMeta {
+                        id,
+                        name: next_wallet_name(&profiles),
+                        created_at: crate::db::now_ms(),
+                    }),
+            )
+        } else {
+            None
+        };
+
+        let vault_key = if crate::vault::vault_exists(&vault_path) {
+            match crate::vault::unlock_vault_keyed(&vault_path, &passphrase) {
+                Ok((existing, key)) if existing == mnemonic => key,
+                Ok(_) => {
+                    return SetupResult::Failed(
+                        "This recovery phrase doesn't match the existing wallet".to_string(),
+                    );
+                }
+                Err(crate::vault::UnlockError::Authentication) => {
+                    return SetupResult::Failed(
+                        "Couldn't reopen the existing wallet: wrong passphrase or corrupted vault"
+                            .to_string(),
+                    );
+                }
+                Err(crate::vault::UnlockError::Read(e)) => {
+                    return SetupResult::Failed(format!(
+                        "Couldn't reopen the existing wallet: {e:#}"
+                    ));
+                }
+            }
+        } else {
+            match crate::vault::create_vault(&vault_path, &mnemonic, &passphrase) {
+                Ok(k) => k,
+                Err(e) => return SetupResult::Failed(format!("Couldn't create wallet: {e}")),
+            }
+        };
+        drop(passphrase);
+        drop(mnemonic);
+
+        let initialized = {
+            let master_addr = crate::crypto::derive_address(&seed, 0);
+            db.call_blocking(move |d| -> anyhow::Result<()> {
+                d.unlock_audit_key(vault_key.as_bytes())?;
+                d.audit(AuditEvent::VaultCreated, &serde_json::json!({}))?;
+                if !d.master_exists()? {
+                    d.insert_wallet(0, crate::types::Role::Master, &master_addr, None)?;
+                }
+                Ok(())
+            })
+        };
+        if let Err(e) = initialized {
+            return SetupResult::Failed(format!("Couldn't initialize the master wallet: {e:#}"));
+        }
+
+        if let Some(meta) = profile_meta
+            && let Err(e) = crate::profiles::register(&config_dir, meta)
+        {
+            return SetupResult::Failed(format!("Couldn't register profile: {e}"));
+        }
+
+        let wallets = match db.call_blocking(|d| d.list_wallets()) {
+            Ok(wallets) => wallets,
+            Err(e) => return SetupResult::Failed(format!("Couldn't load wallets: {e}")),
+        };
         let profiles = match crate::profiles::load(&config_dir) {
             Ok(profiles) => profiles,
             Err(e) => return SetupResult::Failed(format!("Couldn't load profiles: {e}")),
         };
-        Some(
-            profiles
-                .iter()
-                .find(|profile| profile.id == id)
-                .cloned()
-                .unwrap_or_else(|| crate::profiles::ProfileMeta {
-                    id,
-                    name: next_wallet_name(&profiles),
-                    created_at: crate::db::now_ms(),
-                }),
-        )
-    } else {
-        None
-    };
-
-    let vault_key = if crate::vault::vault_exists(&vault_path) {
-        match crate::vault::unlock_vault_keyed(&vault_path, &passphrase) {
-            Ok((existing, key)) if existing == mnemonic => key,
-            Ok(_) => {
-                return SetupResult::Failed(
-                    "This recovery phrase doesn't match the existing wallet".to_string(),
-                );
-            }
-            Err(e) => {
-                return SetupResult::Failed(format!("Couldn't reopen the existing wallet: {e}"));
-            }
+        let _ = creating;
+        SetupResult::Finished {
+            seed,
+            wallets,
+            profiles,
         }
-    } else {
-        match crate::vault::create_vault(&vault_path, &mnemonic, &passphrase) {
-            Ok(k) => k,
-            Err(e) => return SetupResult::Failed(format!("Couldn't create wallet: {e}")),
-        }
-    };
-    drop(passphrase);
-    drop(mnemonic);
-
-    let master_ok = {
-        let master_addr = crate::crypto::derive_address(&seed, 0);
-        db.call_blocking(move |d| {
-            let key_ok = d.unlock_audit_key(vault_key.as_bytes()).is_ok();
-            let _ = d.audit(AuditEvent::VaultCreated, &serde_json::json!({}));
-            key_ok
-                && match d.master_exists() {
-                    Ok(true) => true,
-                    Ok(false) => d
-                        .insert_wallet(0, crate::types::Role::Master, &master_addr, None)
-                        .is_ok(),
-                    Err(_) => false,
-                }
-        })
-    };
-    if !master_ok {
-        return SetupResult::Failed(
-            "Couldn't initialize the master wallet — please retry".to_string(),
-        );
+    })();
+    if matches!(result, SetupResult::Failed(_)) {
+        db.call_blocking(|d| d.lock_audit_key());
     }
-
-    if let Some(meta) = profile_meta
-        && let Err(e) = crate::profiles::register(&config_dir, meta)
-    {
-        return SetupResult::Failed(format!("Couldn't register profile: {e}"));
-    }
-
-    let wallets = match db.call_blocking(|d| d.list_wallets()) {
-        Ok(wallets) => wallets,
-        Err(e) => return SetupResult::Failed(format!("Couldn't load wallets: {e}")),
-    };
-    let profiles = match crate::profiles::load(&config_dir) {
-        Ok(profiles) => profiles,
-        Err(e) => return SetupResult::Failed(format!("Couldn't load profiles: {e}")),
-    };
-    let _ = creating;
-    SetupResult::Finished {
-        seed,
-        wallets,
-        profiles,
-    }
+    result
 }
 
 fn persist_signed_send_blocking(
@@ -1751,6 +1771,307 @@ mod tests {
     const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
     #[test]
+    fn unlock_worker_distinguishes_authentication_from_vault_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.json");
+        let mnemonic = crate::crypto::parse_mnemonic(TEST_MNEMONIC).unwrap();
+        crate::vault::create_vault(&path, &mnemonic, "pw").unwrap();
+        let mut vault: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let db = Storage::new(crate::db::Db::open(&dir.path().join("silo.db")).unwrap());
+        assert!(matches!(
+            unlock_vault_blocking(
+                db.clone(),
+                path.clone(),
+                zeroize::Zeroizing::new("wrong".into())
+            ),
+            UnlockResult::AuthenticationFailed
+        ));
+        let mut ciphertext = bs58::decode(vault["ciphertext_b58"].as_str().unwrap())
+            .into_vec()
+            .unwrap();
+        ciphertext[0] ^= 1;
+        vault["ciphertext_b58"] = json!(bs58::encode(ciphertext).into_string());
+        std::fs::write(&path, serde_json::to_vec(&vault).unwrap()).unwrap();
+        assert!(matches!(
+            unlock_vault_blocking(
+                db.clone(),
+                path.clone(),
+                zeroize::Zeroizing::new("pw".into())
+            ),
+            UnlockResult::AuthenticationFailed
+        ));
+        for contents in [Some(b"{\"magic\":".as_slice()), None] {
+            if let Some(contents) = contents {
+                std::fs::write(&path, contents).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+            let result = unlock_vault_blocking(
+                db.clone(),
+                path.clone(),
+                zeroize::Zeroizing::new("pw".into()),
+            );
+            let UnlockResult::VaultRead(message) = result else {
+                panic!("expected vault diagnostic, got {result:?}");
+            };
+            assert!(message.contains(if contents.is_some() {
+                "vault file is not valid"
+            } else {
+                "reading vault at"
+            }));
+        }
+        db.call_blocking(|d| {
+            assert!(d.list_audit(10).unwrap().is_empty());
+            assert!(d.get_meta("audit_head_hash").unwrap().is_none());
+            assert!(d.verify_audit_chain().is_err());
+            assert!(d.list_wallets().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn decrypted_vault_diagnostics_are_typed_and_do_not_expose_secrets() {
+        use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.json");
+        let passphrase = "secret-passphrase-sentinel-3927";
+        let plaintext_sentinel = "secret-plaintext-sentinel-5841";
+        let mnemonic = crate::crypto::parse_mnemonic(TEST_MNEMONIC).unwrap();
+        let key = crate::vault::create_vault(&path, &mnemonic, passphrase).unwrap();
+        let mut vault: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let cipher = XChaCha20Poly1305::new_from_slice(key.as_bytes()).unwrap();
+        let nonce_bytes = [7u8; 24];
+        let nonce = <&XNonce>::from(&nonce_bytes);
+        vault["nonce_b58"] = json!(bs58::encode(nonce_bytes).into_string());
+        let db = Storage::new(crate::db::Db::open(&dir.path().join("silo.db")).unwrap());
+        let mut non_utf8 = plaintext_sentinel.as_bytes().to_vec();
+        non_utf8.push(0xff);
+        // Twelve invalid words exercise mnemonic parsing, not merely the word-count check.
+        let invalid_mnemonic = [plaintext_sentinel; 12].join(" ").into_bytes();
+        for (plaintext, context) in [
+            (non_utf8, "decrypted data is not valid UTF-8"),
+            (invalid_mnemonic, "decrypted mnemonic is invalid"),
+        ] {
+            let ciphertext = cipher.encrypt(nonce, plaintext.as_slice()).unwrap();
+            vault["ciphertext_b58"] = json!(bs58::encode(ciphertext).into_string());
+            std::fs::write(&path, serde_json::to_vec(&vault).unwrap()).unwrap();
+            let error = crate::vault::unlock_vault_keyed(&path, passphrase).unwrap_err();
+            let crate::vault::UnlockError::Read(error) = error else {
+                panic!("authenticated invalid plaintext was classified as authentication failure");
+            };
+            let diagnostic = format!("{error:#}");
+            assert!(diagnostic.contains(context));
+            assert!(!diagnostic.contains(passphrase));
+            assert!(!diagnostic.contains(plaintext_sentinel));
+            let result = unlock_vault_blocking(
+                db.clone(),
+                path.clone(),
+                zeroize::Zeroizing::new(passphrase.into()),
+            );
+            let UnlockResult::VaultRead(message) = result else {
+                panic!("invalid plaintext lost its diagnostic: {result:?}");
+            };
+            assert_eq!(message, diagnostic);
+            assert!(!message.contains(passphrase));
+            assert!(!message.contains(plaintext_sentinel));
+            db.call_blocking(|d| {
+                assert!(d.verify_audit_chain().is_err());
+                assert!(d.audit(AuditEvent::VaultUnlocked, &json!({})).is_err());
+                assert!(d.list_audit(10).unwrap().is_empty());
+            });
+        }
+    }
+
+    #[test]
+    fn setup_retry_preserves_existing_vault_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.json");
+        std::fs::write(&path, b"{\"magic\":").unwrap();
+        let db = Storage::new(crate::db::Db::open(&dir.path().join("silo.db")).unwrap());
+        let result = finish_setup_blocking(
+            db.clone(),
+            path.clone(),
+            dir.path().to_path_buf(),
+            None,
+            false,
+            zeroize::Zeroizing::new(TEST_MNEMONIC.into()),
+            zeroize::Zeroizing::new("pw".into()),
+        );
+        let SetupResult::Failed(message) = result else {
+            panic!("malformed vault accepted");
+        };
+        assert!(message.contains("Couldn't reopen the existing wallet: vault file is not valid"));
+        assert!(!message.contains("passphrase"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"magic\":");
+        assert!(db.call_blocking(|d| d.list_audit(10)).unwrap().is_empty());
+        assert!(db.call_blocking(|d| d.list_wallets()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn setup_mismatch_before_key_does_not_attempt_audit_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.json");
+        let mut database = crate::db::Db::open(&dir.path().join("silo.db")).unwrap();
+        database.unlock_audit_key(&[9; 32]).unwrap();
+        database
+            .insert_wallet(0, crate::types::Role::Master, "different-address", None)
+            .unwrap();
+        let head = database.get_meta("audit_head_hash").unwrap();
+        database.lock_audit_key();
+        let db = Storage::new(database);
+        let result = finish_setup_blocking(
+            db.clone(),
+            path.clone(),
+            dir.path().to_path_buf(),
+            None,
+            false,
+            zeroize::Zeroizing::new(TEST_MNEMONIC.into()),
+            zeroize::Zeroizing::new("pw".into()),
+        );
+        let SetupResult::Failed(message) = result else {
+            panic!("mismatched database accepted");
+        };
+        assert!(message.contains("Existing wallet records don't match"));
+        assert!(!path.exists());
+        db.call_blocking(move |d| {
+            assert_eq!(d.list_audit(10).unwrap().len(), 1);
+            assert_eq!(d.get_meta("audit_head_hash").unwrap(), head);
+            assert!(d.verify_audit_chain().is_err());
+        });
+    }
+
+    #[test]
+    fn unlock_and_setup_report_audit_write_failure_and_allow_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.json");
+        let db_path = dir.path().join("silo.db");
+        let mnemonic = crate::crypto::parse_mnemonic(TEST_MNEMONIC).unwrap();
+        let key = crate::vault::create_vault(&path, &mnemonic, "pw").unwrap();
+        let mut database = crate::db::Db::open(&db_path).unwrap();
+        database.unlock_audit_key(key.as_bytes()).unwrap();
+        database
+            .insert_wallet(
+                0,
+                crate::types::Role::Master,
+                &crate::crypto::derive_address(&test_seed(), 0),
+                None,
+            )
+            .unwrap();
+        let head = database.get_meta("audit_head_hash").unwrap();
+        database.lock_audit_key();
+        let db = Storage::new(database);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER deny_audit_insert BEFORE INSERT ON audit_log
+             BEGIN SELECT RAISE(ABORT, 'audit writes denied'); END;",
+        )
+        .unwrap();
+
+        let result = unlock_vault_blocking(
+            db.clone(),
+            path.clone(),
+            zeroize::Zeroizing::new("pw".into()),
+        );
+        let UnlockResult::AuditWrite(message) = result else {
+            panic!("unlock ignored audit write failure: {result:?}");
+        };
+        assert!(message.contains("audit writes denied"));
+        let expected_head = head.clone();
+        db.call_blocking(move |d| {
+            assert!(
+                d.verify_audit_chain().is_err(),
+                "failed unlock retained the audit key"
+            );
+            assert!(d.audit(AuditEvent::VaultUnlocked, &json!({})).is_err());
+            assert_eq!(d.get_meta("audit_head_hash").unwrap(), expected_head);
+            assert_eq!(d.list_audit(10).unwrap().len(), 1);
+        });
+        let result = finish_setup_blocking(
+            db.clone(),
+            path.clone(),
+            dir.path().to_path_buf(),
+            None,
+            false,
+            zeroize::Zeroizing::new(TEST_MNEMONIC.into()),
+            zeroize::Zeroizing::new("pw".into()),
+        );
+        let SetupResult::Failed(message) = result else {
+            panic!("setup ignored audit write failure");
+        };
+        assert!(message.contains("audit writes denied"));
+        db.call_blocking(move |d| {
+            assert!(
+                d.verify_audit_chain().is_err(),
+                "failed setup retained the audit key"
+            );
+            assert!(d.audit(AuditEvent::VaultCreated, &json!({})).is_err());
+            assert_eq!(d.get_meta("audit_head_hash").unwrap(), head);
+            assert_eq!(d.list_audit(10).unwrap().len(), 1);
+        });
+
+        conn.execute_batch("DROP TRIGGER deny_audit_insert;")
+            .unwrap();
+        assert!(matches!(
+            unlock_vault_blocking(
+                db.clone(),
+                path.clone(),
+                zeroize::Zeroizing::new("pw".into())
+            ),
+            UnlockResult::Unlocked { .. }
+        ));
+        db.call_blocking(|d| d.lock_audit_key());
+        assert!(matches!(
+            finish_setup_blocking(
+                db.clone(),
+                path,
+                dir.path().to_path_buf(),
+                None,
+                false,
+                zeroize::Zeroizing::new(TEST_MNEMONIC.into()),
+                zeroize::Zeroizing::new("pw".into()),
+            ),
+            SetupResult::Finished { .. }
+        ));
+        db.call_blocking(|d| {
+            assert_eq!(d.list_wallets().unwrap().len(), 1);
+            assert_eq!(d.list_audit(10).unwrap().len(), 3);
+            assert!(d.verify_audit_chain().unwrap());
+        });
+    }
+
+    #[test]
+    fn setup_registration_failure_clears_audit_key_after_initialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.json");
+        let db = Storage::new(crate::db::Db::open(&dir.path().join("silo.db")).unwrap());
+        let result = finish_setup_blocking(
+            db.clone(),
+            path,
+            dir.path().to_path_buf(),
+            Some("invalid-profile-id".into()),
+            true,
+            zeroize::Zeroizing::new(TEST_MNEMONIC.into()),
+            zeroize::Zeroizing::new("pw".into()),
+        );
+        let SetupResult::Failed(message) = result else {
+            panic!("invalid profile registration succeeded");
+        };
+        assert!(message.contains("Couldn't register profile"));
+        db.call_blocking(|d| {
+            // Initialization succeeded before the later registration failure.
+            assert_eq!(d.list_wallets().unwrap().len(), 1);
+            let head = d.get_meta("audit_head_hash").unwrap();
+            let rows = d.list_audit(10).unwrap().len();
+            assert!(d.verify_audit_chain().is_err());
+            assert!(d.audit(AuditEvent::VaultCreated, &json!({})).is_err());
+            assert_eq!(d.get_meta("audit_head_hash").unwrap(), head);
+            assert_eq!(d.list_audit(10).unwrap().len(), rows);
+        });
+    }
+
+    #[test]
     fn recovered_vault_initializes_master_only_after_unlock() {
         for audit_created in [false, true] {
             let dir = tempfile::tempdir().unwrap();
@@ -1778,7 +2099,7 @@ mod tests {
                     vault_path.clone(),
                     zeroize::Zeroizing::new("wrong".into())
                 ),
-                UnlockResult::WrongPassphrase
+                UnlockResult::AuthenticationFailed
             ));
             assert!(db.call_blocking(|d| d.list_wallets()).unwrap().is_empty());
             for _ in 0..2 {
@@ -1825,7 +2146,11 @@ mod tests {
             zeroize::Zeroizing::new("test passphrase".into()),
         );
         assert!(matches!(result, UnlockResult::AuditChainFailed));
-        assert!(db.call_blocking(|d| d.list_wallets()).unwrap().is_empty());
+        db.call_blocking(|d| {
+            assert!(d.list_wallets().unwrap().is_empty());
+            assert!(d.verify_audit_chain().is_err());
+            assert!(d.audit(AuditEvent::VaultUnlocked, &json!({})).is_err());
+        });
     }
 
     #[test]
