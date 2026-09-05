@@ -66,10 +66,18 @@ fn is_homebrew_path(exe: &Path) -> bool {
 }
 
 fn cargo_bin_dir() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("CARGO_HOME") {
+    cargo_bin_dir_from(|k| std::env::var_os(k))
+}
+
+fn cargo_bin_dir_from(mut var: impl FnMut(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    if let Some(home) = var("CARGO_HOME") {
         return Some(PathBuf::from(home).join("bin"));
     }
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo").join("bin"))
+    #[cfg(windows)]
+    let home = var("USERPROFILE");
+    #[cfg(not(windows))]
+    let home = var("HOME");
+    home.map(|h| PathBuf::from(h).join(".cargo").join("bin"))
 }
 
 fn dist_receipt_path() -> Option<PathBuf> {
@@ -170,6 +178,109 @@ mod tests {
             Some(PathBuf::from("/home/u/.cargo/bin")),
         );
         assert_eq!(m, InstallMethod::Cargo);
+    }
+
+    fn cargo_bin_from_env(vars: &[(&str, &str)]) -> Option<PathBuf> {
+        cargo_bin_dir_from(|key| {
+            vars.iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| (*value).into())
+        })
+    }
+
+    #[test]
+    fn cargo_home_overrides_home_and_userprofile() {
+        assert_eq!(
+            cargo_bin_from_env(&[
+                ("CARGO_HOME", "/custom/cargo"),
+                ("HOME", "/home/u"),
+                ("USERPROFILE", "C:/Users/u"),
+            ]),
+            Some(PathBuf::from("/custom/cargo/bin"))
+        );
+    }
+
+    #[test]
+    fn cargo_home_works_without_a_home_directory() {
+        assert_eq!(
+            cargo_bin_from_env(&[("CARGO_HOME", "/custom/cargo")]),
+            Some(PathBuf::from("/custom/cargo/bin"))
+        );
+    }
+
+    #[test]
+    fn missing_cargo_and_home_directories_leave_install_manual() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_bin = cargo_bin_from_env(&[]);
+        assert_eq!(cargo_bin, None);
+        assert_eq!(
+            detect_from(Some(dir.path().join("silo")), false, cargo_bin),
+            InstallMethod::Manual
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn userprofile_overrides_home_on_windows() {
+        assert_eq!(
+            cargo_bin_from_env(&[("USERPROFILE", "C:/Users/u"), ("HOME", "C:/other")]),
+            Some(PathBuf::from("C:/Users/u/.cargo/bin"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn home_alone_is_not_used_on_windows() {
+        assert_eq!(cargo_bin_from_env(&[("HOME", "C:/other")]), None);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn home_is_used_instead_of_userprofile_off_windows() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join(".cargo/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("silo");
+        std::fs::write(&exe, b"").unwrap();
+        for userprofile in [None, Some("/other")] {
+            let cargo_bin = cargo_bin_dir_from(|key| match key {
+                "HOME" => Some(home.path().as_os_str().to_owned()),
+                "USERPROFILE" => userprofile.map(Into::into),
+                _ => None,
+            });
+            assert_eq!(cargo_bin.as_ref(), Some(&bin));
+            assert_eq!(
+                detect_from(Some(exe.clone()), false, cargo_bin),
+                InstallMethod::Cargo
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn userprofile_alone_is_not_used_off_windows() {
+        assert_eq!(cargo_bin_from_env(&[("USERPROFILE", "/other")]), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn userprofile_only_detects_cargo_and_upgrade_command() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join(".cargo/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("silo.exe");
+        std::fs::write(&exe, b"").unwrap();
+        let cargo_bin = cargo_bin_dir_from(|key| match key {
+            "USERPROFILE" => Some(home.path().as_os_str().to_owned()),
+            _ => None,
+        });
+        assert_eq!(cargo_bin.as_ref(), Some(&bin));
+        let method = detect_from(Some(exe), false, cargo_bin);
+        assert_eq!(method, InstallMethod::Cargo);
+        assert_eq!(
+            method.upgrade_command(),
+            "cargo install --locked --git https://github.com/265866/silo --force"
+        );
     }
 
     #[test]
