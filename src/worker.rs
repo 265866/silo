@@ -379,6 +379,26 @@ fn finish_setup_blocking(
         }
     }
 
+    let profile_meta = if let Some(id) = current_profile {
+        let profiles = match crate::profiles::load(&config_dir) {
+            Ok(profiles) => profiles,
+            Err(e) => return SetupResult::Failed(format!("Couldn't load profiles: {e}")),
+        };
+        Some(
+            profiles
+                .iter()
+                .find(|profile| profile.id == id)
+                .cloned()
+                .unwrap_or_else(|| crate::profiles::ProfileMeta {
+                    id,
+                    name: next_wallet_name(&profiles),
+                    created_at: crate::db::now_ms(),
+                }),
+        )
+    } else {
+        None
+    };
+
     let vault_key = if crate::vault::vault_exists(&vault_path) {
         match crate::vault::unlock_vault_keyed(&vault_path, &passphrase) {
             Ok((existing, key)) if existing.to_string() == mnemonic.to_string() => key,
@@ -421,22 +441,10 @@ fn finish_setup_blocking(
         );
     }
 
-    if let Some(id) = current_profile {
-        let profiles = match crate::profiles::load(&config_dir) {
-            Ok(profiles) => profiles,
-            Err(e) => return SetupResult::Failed(format!("Couldn't load profiles: {e}")),
-        };
-        let name = next_wallet_name(&profiles);
-        if let Err(e) = crate::profiles::register(
-            &config_dir,
-            crate::profiles::ProfileMeta {
-                id,
-                name,
-                created_at: crate::db::now_ms(),
-            },
-        ) {
-            return SetupResult::Failed(format!("Couldn't register profile: {e}"));
-        }
+    if let Some(meta) = profile_meta
+        && let Err(e) = crate::profiles::register(&config_dir, meta)
+    {
+        return SetupResult::Failed(format!("Couldn't register profile: {e}"));
     }
 
     let wallets = match db.call_blocking(|d| d.list_wallets()) {
@@ -1684,6 +1692,54 @@ mod tests {
     }
 
     const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    #[test]
+    fn setup_preserves_profile_metadata_on_creation_and_retry() {
+        for registered in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let id = "0000000000000017";
+            let profile = crate::profiles::dir_for(dir.path(), id).unwrap();
+            crate::profiles::ensure_private_dir(&profile).unwrap();
+            let initial = if registered {
+                vec![crate::profiles::ProfileMeta {
+                    id: id.into(),
+                    name: "Treasury".into(),
+                    created_at: 42,
+                }]
+            } else {
+                Vec::new()
+            };
+            crate::profiles::save(dir.path(), &initial).unwrap();
+            let db = Storage::new(crate::db::Db::open(&profile.join("silo.db")).unwrap());
+            let mut first_created_at = None;
+            for _ in 0..2 {
+                let result = finish_setup_blocking(
+                    db.clone(),
+                    profile.join("vault.json"),
+                    dir.path().to_path_buf(),
+                    Some(id.into()),
+                    true,
+                    zeroize::Zeroizing::new(TEST_MNEMONIC.into()),
+                    zeroize::Zeroizing::new("test passphrase".into()),
+                );
+                let SetupResult::Finished { profiles, .. } = result else {
+                    panic!("setup failed");
+                };
+                assert_eq!(profiles.len(), 1);
+                assert_eq!(
+                    profiles[0].name,
+                    if registered { "Treasury" } else { "Wallet 1" }
+                );
+                if registered {
+                    assert_eq!(profiles[0].created_at, 42);
+                }
+                assert_eq!(
+                    *first_created_at.get_or_insert(profiles[0].created_at),
+                    profiles[0].created_at
+                );
+            }
+        }
+    }
 
     fn test_seed() -> crate::crypto::Seed {
         crate::crypto::seed_from_mnemonic(&crate::crypto::parse_mnemonic(TEST_MNEMONIC).unwrap())
