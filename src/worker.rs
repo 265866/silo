@@ -461,7 +461,7 @@ fn finish_setup_blocking(
 
     let vault_key = if crate::vault::vault_exists(&vault_path) {
         match crate::vault::unlock_vault_keyed(&vault_path, &passphrase) {
-            Ok((existing, key)) if existing.to_string() == mnemonic.to_string() => key,
+            Ok((existing, key)) if existing == mnemonic => key,
             Ok(_) => {
                 return SetupResult::Failed(
                     "This recovery phrase doesn't match the existing wallet".to_string(),
@@ -1874,6 +1874,107 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn setup_existing_vault_accepts_matching_phrase_with_empty_wallets() {
+        for phrase in [
+            TEST_MNEMONIC.to_string(),
+            format!(" \t{}\n", TEST_MNEMONIC.replace(' ', "  \t")),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let vault_path = dir.path().join("vault.json");
+            let mnemonic = crate::crypto::parse_mnemonic(TEST_MNEMONIC).unwrap();
+            crate::vault::create_vault(&vault_path, &mnemonic, "test passphrase").unwrap();
+            let original_vault = std::fs::read(&vault_path).unwrap();
+            let db = Storage::new(crate::db::Db::open(&dir.path().join("silo.db")).unwrap());
+            assert!(db.call_blocking(|d| d.list_wallets()).unwrap().is_empty());
+
+            let result = finish_setup_blocking(
+                db.clone(),
+                vault_path.clone(),
+                dir.path().to_path_buf(),
+                None,
+                false,
+                zeroize::Zeroizing::new(phrase),
+                zeroize::Zeroizing::new("test passphrase".into()),
+            );
+            let SetupResult::Finished { seed, wallets, .. } = result else {
+                panic!("matching existing vault did not finish setup");
+            };
+            let expected_address = crate::crypto::derive_address(&test_seed(), 0);
+            assert_eq!(crate::crypto::derive_address(&seed, 0), expected_address);
+            assert_eq!(wallets.len(), 1);
+            assert_eq!(wallets[0].account_index, 0);
+            assert_eq!(wallets[0].role, crate::types::Role::Master);
+            assert_eq!(wallets[0].pubkey, expected_address);
+            let stored = db.call_blocking(|d| d.list_wallets()).unwrap();
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].pubkey, expected_address);
+            assert_eq!(std::fs::read(&vault_path).unwrap(), original_vault);
+        }
+    }
+
+    #[test]
+    fn setup_existing_vault_rejects_different_phrase_with_empty_wallets() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault_path = dir.path().join("vault.json");
+        let mnemonic = crate::crypto::parse_mnemonic(TEST_MNEMONIC).unwrap();
+        let different = bip39::Mnemonic::from_entropy(&[1u8; 16]).unwrap();
+        assert_ne!(mnemonic, different);
+        crate::vault::create_vault(&vault_path, &mnemonic, "test passphrase").unwrap();
+        let original_vault = std::fs::read(&vault_path).unwrap();
+        let db = Storage::new(crate::db::Db::open(&dir.path().join("silo.db")).unwrap());
+        assert!(db.call_blocking(|d| d.list_wallets()).unwrap().is_empty());
+
+        let result = finish_setup_blocking(
+            db.clone(),
+            vault_path.clone(),
+            dir.path().to_path_buf(),
+            None,
+            false,
+            zeroize::Zeroizing::new(different.to_string()),
+            zeroize::Zeroizing::new("test passphrase".into()),
+        );
+        let SetupResult::Failed(message) = result else {
+            panic!("different phrase was accepted for an existing vault");
+        };
+        assert_eq!(
+            message,
+            "This recovery phrase doesn't match the existing wallet"
+        );
+        assert!(db.call_blocking(|d| d.list_wallets()).unwrap().is_empty());
+        assert_eq!(std::fs::read(&vault_path).unwrap(), original_vault);
+    }
+
+    #[test]
+    fn setup_existing_vault_rejects_wrong_passphrase_with_empty_wallets() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault_path = dir.path().join("vault.json");
+        let mnemonic = crate::crypto::parse_mnemonic(TEST_MNEMONIC).unwrap();
+        crate::vault::create_vault(&vault_path, &mnemonic, "test passphrase").unwrap();
+        let original_vault = std::fs::read(&vault_path).unwrap();
+        let db = Storage::new(crate::db::Db::open(&dir.path().join("silo.db")).unwrap());
+        assert!(db.call_blocking(|d| d.list_wallets()).unwrap().is_empty());
+
+        let result = finish_setup_blocking(
+            db.clone(),
+            vault_path.clone(),
+            dir.path().to_path_buf(),
+            None,
+            false,
+            zeroize::Zeroizing::new(TEST_MNEMONIC.into()),
+            zeroize::Zeroizing::new("wrong passphrase".into()),
+        );
+        let SetupResult::Failed(message) = result else {
+            panic!("wrong passphrase was accepted for an existing vault");
+        };
+        assert_eq!(
+            message,
+            "Couldn't reopen the existing wallet: wrong passphrase or corrupted vault"
+        );
+        assert!(db.call_blocking(|d| d.list_wallets()).unwrap().is_empty());
+        assert_eq!(std::fs::read(&vault_path).unwrap(), original_vault);
     }
 
     fn test_seed() -> crate::crypto::Seed {
