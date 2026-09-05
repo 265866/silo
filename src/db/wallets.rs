@@ -3,7 +3,7 @@ use rusqlite::types::Type;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::json;
 
-use super::{Db, append_audit, now_ms};
+use super::{Db, append_audit, now_ms, require_audit_key};
 use crate::types::{AuditEvent, Role, WalletRow};
 
 fn row_to_wallet(r: &rusqlite::Row) -> rusqlite::Result<WalletRow> {
@@ -114,7 +114,7 @@ impl Db {
         label: Option<&str>,
     ) -> Result<WalletRow> {
         let now = now_ms();
-        let key = self.require_audit_key()?;
+        let key = require_audit_key(&self.audit_key)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -126,7 +126,7 @@ impl Db {
         let id = tx.last_insert_rowid();
         append_audit(
             &tx,
-            &key,
+            key,
             AuditEvent::WalletDerived,
             &json!({"id": id, "account_index": account_index, "role": role.as_str(), "pubkey": pubkey}),
         )?;
@@ -162,7 +162,7 @@ impl Db {
     }
 
     pub fn set_label(&mut self, id: i64, label: Option<&str>) -> Result<()> {
-        let key = self.require_audit_key()?;
+        let key = require_audit_key(&self.audit_key)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -171,13 +171,13 @@ impl Db {
             params![label, id],
         )?;
         reject_unchanged_wallet_update(&tx, n, id, "wallet label")?;
-        append_audit(&tx, &key, AuditEvent::WalletLabeled, &json!({"id": id})).map(|_| ())?;
+        append_audit(&tx, key, AuditEvent::WalletLabeled, &json!({"id": id})).map(|_| ())?;
         tx.commit()?;
         Ok(())
     }
 
     pub fn set_note(&mut self, id: i64, note: Option<&str>) -> Result<()> {
-        let key = self.require_audit_key()?;
+        let key = require_audit_key(&self.audit_key)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -186,7 +186,7 @@ impl Db {
             params![note, id],
         )?;
         reject_unchanged_wallet_update(&tx, n, id, "wallet note")?;
-        append_audit(&tx, &key, AuditEvent::WalletNoted, &json!({"id": id}))?;
+        append_audit(&tx, key, AuditEvent::WalletNoted, &json!({"id": id}))?;
         tx.commit()?;
         Ok(())
     }
@@ -195,7 +195,7 @@ impl Db {
         if archived && self.has_open_intent(id)? {
             bail!("cannot archive a wallet with a transfer in progress");
         }
-        let key = self.require_audit_key()?;
+        let key = require_audit_key(&self.audit_key)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -206,7 +206,7 @@ impl Db {
         reject_unchanged_wallet_update(&tx, n, id, "wallet archived state")?;
         append_audit(
             &tx,
-            &key,
+            key,
             AuditEvent::WalletArchived,
             &json!({"id": id, "archived": archived}),
         )?;

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use zeroize::Zeroizing;
 
 use crate::types::{AuditEntry, AuditEvent, Network};
 
@@ -122,7 +123,8 @@ fn verify_durability_pragmas(
 
 pub struct Db {
     conn: Connection,
-    audit_key: Option<[u8; 32]>,
+    // Keep the derived key at a stable address and wipe it before deallocation.
+    audit_key: Option<Box<Zeroizing<[u8; 32]>>>,
 }
 
 impl Db {
@@ -211,7 +213,7 @@ impl Db {
         };
         db.migrate()?;
         db.ensure_audit_salt()?;
-        db.audit_key = Some([0x42u8; 32]);
+        db.audit_key = Some(Box::new(Zeroizing::new([0x42u8; 32])));
         Ok(db)
     }
 
@@ -320,22 +322,14 @@ impl Db {
             .get_meta("audit_key_salt")?
             .context("missing audit_key_salt")?;
         let salt = from_hex32(&salt_hex).context("corrupt audit_key_salt")?;
-        let mut k = [0u8; 32];
-        crate::crypto::hkdf_sha256(vault_key, &salt, b"silo-audit-key-v1", &mut k)?;
+        let mut k = Box::new(Zeroizing::new([0u8; 32]));
+        crate::crypto::hkdf_sha256(vault_key, &salt, b"silo-audit-key-v1", &mut **k)?;
         self.audit_key = Some(k);
         Ok(())
     }
 
-    fn require_audit_key(&self) -> Result<[u8; 32]> {
-        self.audit_key
-            .context("audit key unavailable (vault locked)")
-    }
-
     pub fn lock_audit_key(&mut self) {
-        use zeroize::Zeroize;
-        if let Some(mut k) = self.audit_key.take() {
-            k.zeroize();
-        }
+        self.audit_key = None;
     }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
@@ -364,7 +358,7 @@ impl Db {
         event: AuditEvent,
         details: &serde_json::Value,
     ) -> Result<()> {
-        let audit_key = self.require_audit_key()?;
+        let audit_key = require_audit_key(&self.audit_key)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -373,19 +367,19 @@ impl Db {
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             params![key, value],
         )?;
-        append_audit(&tx, &audit_key, event, details)?;
+        append_audit(&tx, audit_key, event, details)?;
         tx.commit()?;
         Ok(())
     }
 
     pub fn audit(&mut self, event: AuditEvent, details: &serde_json::Value) -> Result<()> {
-        let Some(key) = self.audit_key else {
+        let Some(key) = self.audit_key.as_deref() else {
             return Ok(());
         };
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        append_audit(&tx, &key, event, details)?;
+        append_audit(&tx, key, event, details)?;
         tx.commit()?;
         Ok(())
     }
@@ -416,7 +410,7 @@ impl Db {
     }
 
     pub fn verify_audit_chain(&self) -> Result<bool> {
-        let key = self.require_audit_key()?;
+        let key = require_audit_key(&self.audit_key)?;
         let mut stmt = self
             .conn
             .prepare("SELECT id, ts, event_type, details, prev_hash, row_hash FROM audit_log ORDER BY id ASC")?;
@@ -434,7 +428,7 @@ impl Db {
                 return Ok(false);
             }
             let canonical = canonical_bytes(id, ts, &event_type, &details);
-            let computed = hmac_hex(&key, &canonical, prev_hash.as_deref());
+            let computed = hmac_hex(key, &canonical, prev_hash.as_deref());
             if computed != row_hash {
                 return Ok(false);
             }
@@ -450,6 +444,12 @@ impl Db {
         }
         Ok(head == last_hash)
     }
+}
+
+fn require_audit_key(key: &Option<Box<Zeroizing<[u8; 32]>>>) -> Result<&[u8; 32]> {
+    key.as_deref()
+        .map(|key| &**key)
+        .context("audit key unavailable (vault locked)")
 }
 
 type Job = Box<dyn FnOnce(&mut Db) + Send>;
@@ -1060,7 +1060,6 @@ mod tests {
         let mut d = db();
         let vk = [9u8; 32];
         d.unlock_audit_key(&vk).unwrap();
-        let derived = d.audit_key;
         d.insert_wallet(
             0,
             Role::Master,
@@ -1071,27 +1070,203 @@ mod tests {
         assert!(d.verify_audit_chain().unwrap());
 
         d.unlock_audit_key(&vk).unwrap();
-        assert_eq!(derived, d.audit_key);
         assert!(d.verify_audit_chain().unwrap());
 
         d.unlock_audit_key(&[1u8; 32]).unwrap();
-        assert_ne!(derived, d.audit_key);
         assert!(!d.verify_audit_chain().unwrap());
+
+        // Do not append with the wrong key: returning to the original key must
+        // validate the untouched chain and allow another authenticated write.
+        d.unlock_audit_key(&vk).unwrap();
+        assert!(d.verify_audit_chain().unwrap());
+        d.audit(AuditEvent::SettingsChanged, &serde_json::json!({}))
+            .unwrap();
+        assert_eq!(d.list_audit(10).unwrap().len(), 2);
+        assert!(d.verify_audit_chain().unwrap());
     }
 
     #[test]
     fn locked_db_refuses_audited_writes() {
-        let mut d = Db::open_memory().unwrap();
-        d.audit_key = None;
-        assert!(
-            d.insert_wallet(
-                0,
-                Role::Master,
-                "M111111111111111111111111111111111111111111B",
-                None,
+        let mut d = db();
+        let vk = [9u8; 32];
+        d.unlock_audit_key(&vk).unwrap();
+        let wallet = d
+            .insert_wallet(0, Role::Master, "Master", Some("original"))
+            .unwrap();
+        d.set_note(wallet.id, Some("original note")).unwrap();
+        d.set_meta_audited(
+            "currency",
+            "usd",
+            AuditEvent::SettingsChanged,
+            &serde_json::json!({"currency":"usd"}),
+        )
+        .unwrap();
+        let audit_count = d.list_audit(100).unwrap().len();
+        let audit_head = d.get_meta("audit_head_hash").unwrap();
+
+        for _ in 0..2 {
+            d.lock_audit_key();
+            assert!(require_audit_key(&d.audit_key).is_err());
+            assert!(d.verify_audit_chain().is_err());
+            assert!(d.insert_wallet(1, Role::Sub, "Sub", None).is_err());
+            assert!(d.set_label(wallet.id, Some("changed")).is_err());
+            assert!(d.set_note(wallet.id, Some("changed")).is_err());
+            assert!(d.set_archived(wallet.id, true).is_err());
+            assert!(
+                d.set_meta_audited(
+                    "currency",
+                    "eur",
+                    AuditEvent::SettingsChanged,
+                    &serde_json::json!({"currency":"eur"}),
+                )
+                .is_err()
+            );
+            assert_eq!(d.list_wallets().unwrap().len(), 1);
+            let unchanged = d.get_wallet(wallet.id).unwrap().unwrap();
+            assert_eq!(unchanged.label.as_deref(), Some("original"));
+            assert_eq!(unchanged.note.as_deref(), Some("original note"));
+            assert!(!unchanged.archived);
+            assert_eq!(d.get_meta("currency").unwrap().as_deref(), Some("usd"));
+            // Preserve the bare audit call's locked no-op policy for this change.
+            d.audit(
+                AuditEvent::SettingsChanged,
+                &serde_json::json!({"locked":true}),
             )
-            .is_err()
-        );
+            .unwrap();
+            assert_eq!(d.list_audit(100).unwrap().len(), audit_count);
+            assert_eq!(d.get_meta("audit_head_hash").unwrap(), audit_head);
+        }
+
+        d.unlock_audit_key(&vk).unwrap();
+        assert!(d.verify_audit_chain().unwrap());
+        d.set_label(wallet.id, Some("unlocked")).unwrap();
+        assert_eq!(d.list_audit(100).unwrap().len(), audit_count + 1);
+        assert!(d.verify_audit_chain().unwrap());
+    }
+
+    #[test]
+    fn invalid_audit_salt_preserves_current_key() {
+        let mut d = db();
+        d.unlock_audit_key(&[9u8; 32]).unwrap();
+        d.audit(AuditEvent::SettingsChanged, &serde_json::json!({}))
+            .unwrap();
+        let salt = d.get_meta("audit_key_salt").unwrap().unwrap();
+        d.set_meta("audit_key_salt", "invalid").unwrap();
+        let err = d.unlock_audit_key(&[1u8; 32]).unwrap_err();
+        assert_eq!(err.to_string(), "corrupt audit_key_salt");
+        assert!(d.verify_audit_chain().unwrap());
+        d.audit(AuditEvent::SettingsChanged, &serde_json::json!({}))
+            .unwrap();
+        d.set_meta("audit_key_salt", &salt).unwrap();
+        d.unlock_audit_key(&[9u8; 32]).unwrap();
+        assert_eq!(d.list_audit(10).unwrap().len(), 2);
+        assert!(d.verify_audit_chain().unwrap());
+    }
+
+    #[test]
+    fn unlocked_db_drop_reopens_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("silo.db");
+        let vk = [9u8; 32];
+        let mut d = Db::open(&path).unwrap();
+        d.unlock_audit_key(&vk).unwrap();
+        let wallet = d.insert_wallet(0, Role::Master, "Master", None).unwrap();
+        assert!(d.verify_audit_chain().unwrap());
+        drop(d); // No explicit lock before dropping the live key.
+
+        let mut d = Db::open(&path).unwrap();
+        assert!(require_audit_key(&d.audit_key).is_err());
+        assert!(d.verify_audit_chain().is_err());
+        assert!(d.set_label(wallet.id, Some("locked")).is_err());
+        assert_eq!(d.list_audit(10).unwrap().len(), 1);
+        assert!(d.get_wallet(wallet.id).unwrap().unwrap().label.is_none());
+        d.unlock_audit_key(&vk).unwrap();
+        assert!(d.verify_audit_chain().unwrap());
+        d.set_label(wallet.id, Some("unlocked")).unwrap();
+        assert_eq!(d.list_audit(10).unwrap().len(), 2);
+        assert!(d.verify_audit_chain().unwrap());
+    }
+
+    #[test]
+    fn storage_replacement_uses_only_the_new_databases_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = dir.path().join("a.db");
+        let path_b = dir.path().join("b.db");
+        let locked_path = dir.path().join("locked.db");
+        let mut a = Db::open(&path_a).unwrap();
+        a.unlock_audit_key(&[9u8; 32]).unwrap();
+        a.set_meta_audited(
+            "profile",
+            "A",
+            AuditEvent::SettingsChanged,
+            &serde_json::json!({"profile":"A"}),
+        )
+        .unwrap();
+        assert!(a.verify_audit_chain().unwrap());
+        let mut b = Db::open(&path_b).unwrap();
+        b.unlock_audit_key(&[1u8; 32]).unwrap();
+        b.set_meta_audited(
+            "profile",
+            "B",
+            AuditEvent::SettingsChanged,
+            &serde_json::json!({"profile":"B"}),
+        )
+        .unwrap();
+        assert!(b.verify_audit_chain().unwrap());
+
+        let storage = Storage::new(a);
+        storage.call_blocking(|d| {
+            assert_eq!(d.get_meta("profile").unwrap().as_deref(), Some("A"));
+            assert!(d.verify_audit_chain().unwrap());
+        });
+        storage.replace(b);
+        storage.call_blocking(|d| {
+            assert_eq!(d.get_meta("profile").unwrap().as_deref(), Some("B"));
+            assert_eq!(d.list_audit(10).unwrap().len(), 1);
+            assert!(d.verify_audit_chain().unwrap());
+            d.audit(
+                AuditEvent::SettingsChanged,
+                &serde_json::json!({"append":"B"}),
+            )
+            .unwrap();
+            assert_eq!(d.list_audit(10).unwrap().len(), 2);
+            assert!(d.verify_audit_chain().unwrap());
+        });
+
+        storage.replace(Db::open(&locked_path).unwrap());
+        storage.call_blocking(|d| {
+            assert!(require_audit_key(&d.audit_key).is_err());
+            assert!(d.verify_audit_chain().is_err());
+            assert!(d.get_meta("profile").unwrap().is_none());
+            assert!(d.insert_wallet(0, Role::Master, "Locked", None).is_err());
+            assert!(
+                d.set_meta_audited(
+                    "profile",
+                    "inherited",
+                    AuditEvent::SettingsChanged,
+                    &serde_json::json!({}),
+                )
+                .is_err()
+            );
+            assert!(d.get_meta("profile").unwrap().is_none());
+            assert!(d.list_wallets().unwrap().is_empty());
+            assert!(d.list_audit(10).unwrap().is_empty());
+            assert!(d.get_meta("audit_head_hash").unwrap().is_none());
+        });
+
+        // replace returns after dropping the displaced Db, unlike drop(Storage),
+        // which does not join the actor. Move the final file-backed Db out too.
+        storage.replace(Db::open_memory().unwrap());
+        for (path, vk, profile, count) in
+            [(&path_a, [9u8; 32], "A", 1), (&path_b, [1u8; 32], "B", 2)]
+        {
+            let mut d = Db::open(path).unwrap();
+            assert!(d.verify_audit_chain().is_err());
+            assert_eq!(d.get_meta("profile").unwrap().as_deref(), Some(profile));
+            assert_eq!(d.list_audit(10).unwrap().len(), count);
+            d.unlock_audit_key(&vk).unwrap();
+            assert!(d.verify_audit_chain().unwrap());
+        }
     }
 
     #[test]
