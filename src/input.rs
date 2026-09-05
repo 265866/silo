@@ -1371,7 +1371,10 @@ mod tests {
                 assert_eq!(h.app.input.send_amount, "150.00");
                 assert!(h.app.toasts.last().unwrap().text.contains("price"));
                 if in_fiat {
-                    assert!(h.app.compose_lamports().is_err());
+                    assert_eq!(
+                        h.app.compose_lamports().unwrap_err(),
+                        "no fresh price; wait for a price or clear the amount, then press c to enter SOL"
+                    );
                 }
             }
         }

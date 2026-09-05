@@ -1409,9 +1409,9 @@ impl App {
 
     pub fn compose_lamports(&self) -> Result<u64, String> {
         if self.input.send_in_fiat {
-            let price = self
-                .price_now()
-                .ok_or("no price yet — press c to enter SOL")?;
+            let price = self.price_now().ok_or(
+                "no fresh price; wait for a price or clear the amount, then press c to enter SOL",
+            )?;
             crate::money::fiat_to_lamports(&self.input.send_amount, price.value)
                 .map_err(|e| e.to_string())
         } else {
