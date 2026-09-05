@@ -71,15 +71,22 @@ fn applied(outcome: IntentTransitionOutcome) -> usize {
     usize::from(matches!(outcome, IntentTransitionOutcome::Applied))
 }
 
+/// Applied transitions and intents deferred by RPC errors in one reconciliation pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReconcileOutcome {
+    pub resolved: usize,
+    pub deferred: usize,
+}
+
 pub async fn reconcile_boot(
     db: &Storage,
     rpc: &Rpc,
     generation: &std::sync::Arc<std::sync::atomic::AtomicU64>,
     cmd_gen: u64,
-) -> Result<usize> {
+) -> Result<ReconcileOutcome> {
     use std::sync::atomic::Ordering;
     if generation.load(Ordering::SeqCst) != cmd_gen {
-        return Ok(0);
+        return Ok(ReconcileOutcome::default());
     }
 
     let open = match db
@@ -94,7 +101,7 @@ pub async fn reconcile_boot(
         .await
     {
         Some(r) => r?,
-        None => return Ok(0),
+        None => return Ok(ReconcileOutcome::default()),
     };
 
     let mut resolved = 0usize;
@@ -104,7 +111,7 @@ pub async fn reconcile_boot(
         ($f:expr) => {
             match db.call_current(generation.clone(), cmd_gen, $f).await {
                 Some(r) => r,
-                None => return Ok(resolved),
+                None => return Ok(ReconcileOutcome { resolved, deferred }),
             }
         };
     }
@@ -220,7 +227,7 @@ pub async fn reconcile_boot(
                             resolved += applied(guarded!(move |d| d.mark_submitted(intent_id))?);
                         }
                     }
-                    Err(_) => {}
+                    Err(_) => deferred += 1,
                 }
             }
         }
@@ -237,7 +244,7 @@ pub async fn reconcile_boot(
     {
         r?;
     }
-    Ok(resolved)
+    Ok(ReconcileOutcome { resolved, deferred })
 }
 
 #[cfg(test)]
@@ -428,7 +435,7 @@ mod tests {
         db.call_blocking(move |d| d.mark_signed(id, &sig, "bh", lvbh, 5000, b"wire").unwrap());
     }
 
-    async fn run(db: &Storage, rpc: &Rpc) -> usize {
+    async fn run(db: &Storage, rpc: &Rpc) -> ReconcileOutcome {
         let generation = Arc::new(AtomicU64::new(1));
         reconcile_boot(db, rpc, &generation, 1).await.unwrap()
     }
@@ -460,7 +467,7 @@ mod tests {
         let rpc = Rpc::new(reqwest::Client::new(), "http://127.0.0.1:0");
         let generation = Arc::new(AtomicU64::new(7));
         let resolved = reconcile_boot(&db, &rpc, &generation, 6).await.unwrap();
-        assert_eq!(resolved, 0);
+        assert_eq!(resolved, ReconcileOutcome::default());
         assert_eq!(db.call_blocking(|d| d.get_open_intents().unwrap().len()), 1);
     }
 
@@ -468,7 +475,13 @@ mod tests {
     async fn created_intent_is_abandoned_without_rpc_calls() {
         let (db, id) = db_with_intent();
         let rpc = Rpc::new(reqwest::Client::new(), "http://127.0.0.1:0");
-        assert_eq!(run(&db, &rpc).await, 1);
+        assert_eq!(
+            run(&db, &rpc).await,
+            ReconcileOutcome {
+                resolved: 1,
+                deferred: 0
+            }
+        );
         let got = intent(&db, id);
         assert_eq!(got.status, IntentStatus::Failed);
         assert_eq!(got.error.as_deref(), Some("abandoned before signing"));
@@ -484,7 +497,13 @@ mod tests {
             json!({"context":{"slot":1},"value":[null]}),
             json!(1000),
         ]);
-        assert_eq!(run(&db, &server.rpc()).await, 1);
+        assert_eq!(
+            run(&db, &server.rpc()).await,
+            ReconcileOutcome {
+                resolved: 1,
+                deferred: 0
+            }
+        );
         let got = intent(&db, id);
         assert_eq!(got.status, IntentStatus::Failed);
         assert_eq!(
@@ -506,7 +525,13 @@ mod tests {
             json!(1000),
             json!("Sig"),
         ]);
-        assert_eq!(run(&db, &server.rpc()).await, 1);
+        assert_eq!(
+            run(&db, &server.rpc()).await,
+            ReconcileOutcome {
+                resolved: 1,
+                deferred: 0
+            }
+        );
         assert_eq!(intent(&db, id).status, IntentStatus::Submitted);
         assert_eq!(
             server.methods(),
@@ -523,7 +548,13 @@ mod tests {
             json!({"context":{"slot":1},"value":[status_value(Value::Null, "confirmed")]}),
             json!(1000),
         ]);
-        assert_eq!(run(&db, &server.rpc()).await, 0);
+        assert_eq!(
+            run(&db, &server.rpc()).await,
+            ReconcileOutcome {
+                resolved: 0,
+                deferred: 0
+            }
+        );
         assert_eq!(intent(&db, id).status, IntentStatus::Submitted);
     }
 
@@ -536,7 +567,13 @@ mod tests {
             json!({"context":{"slot":1},"value":[status_value(Value::Null, "finalized")]}),
             json!(1000),
         ]);
-        assert_eq!(run(&db, &server.rpc()).await, 1);
+        assert_eq!(
+            run(&db, &server.rpc()).await,
+            ReconcileOutcome {
+                resolved: 1,
+                deferred: 0
+            }
+        );
         assert_eq!(intent(&db, id).status, IntentStatus::Confirmed);
     }
 
@@ -549,7 +586,13 @@ mod tests {
             json!(1151),
             json!({"context":{"slot":1},"value":[null]}),
         ]);
-        assert_eq!(run(&db, &server.rpc()).await, 1);
+        assert_eq!(
+            run(&db, &server.rpc()).await,
+            ReconcileOutcome {
+                resolved: 1,
+                deferred: 0
+            }
+        );
         let got = intent(&db, id);
         assert_eq!(got.status, IntentStatus::Expired);
         assert_eq!(
@@ -574,7 +617,13 @@ mod tests {
             json!({"context":{"slot":1},"value":[status_value(json!({"InstructionError":[0,"Custom"]}), "confirmed")]}),
             json!(1000),
         ]);
-        assert_eq!(run(&db, &server.rpc()).await, 1);
+        assert_eq!(
+            run(&db, &server.rpc()).await,
+            ReconcileOutcome {
+                resolved: 1,
+                deferred: 0
+            }
+        );
         let got = intent(&db, id);
         assert_eq!(got.status, IntentStatus::Failed);
         assert_eq!(got.error.as_deref(), Some("on-chain error"));
@@ -589,7 +638,13 @@ mod tests {
             json!(1000),
             json!("OtherSig"),
         ]);
-        assert_eq!(run(&db, &server.rpc()).await, 1);
+        assert_eq!(
+            run(&db, &server.rpc()).await,
+            ReconcileOutcome {
+                resolved: 1,
+                deferred: 0
+            }
+        );
         let got = intent(&db, id);
         assert_eq!(got.status, IntentStatus::Failed);
         assert_eq!(
@@ -607,14 +662,28 @@ mod tests {
         signed(&db, id1, "Sig1", 1000);
         signed(&db, id2, "Sig2", 1000);
         let server = MockServer::new(vec![
+            rpc_error(),
             json!({"context":{"slot":1},"value":[status_value(Value::Null, "finalized")]}),
             json!(1000),
-            rpc_error(),
         ]);
-        assert_eq!(run(&db, &server.rpc()).await, 1);
-        assert_eq!(intent(&db, id1).status, IntentStatus::Confirmed);
-        assert_eq!(intent(&db, id2).status, IntentStatus::Signed);
+        assert_eq!(
+            run(&db, &server.rpc()).await,
+            ReconcileOutcome {
+                resolved: 1,
+                deferred: 1
+            }
+        );
+        assert_eq!(intent(&db, id1).status, IntentStatus::Signed);
+        assert_eq!(intent(&db, id2).status, IntentStatus::Confirmed);
         assert!(audit_events(&db).contains(&"reconcile_resolved".to_string()));
+        assert_reconcile_audit(
+            &db,
+            ReconcileOutcome {
+                resolved: 1,
+                deferred: 1,
+            },
+        );
+        server._worker.join().unwrap();
     }
 
     #[tokio::test]
@@ -628,7 +697,13 @@ mod tests {
             json!({"context":{"slot":1},"value":[status_value(Value::Null, "finalized")]}),
             json!(1000),
         ]);
-        assert_eq!(run(&db, &server.rpc()).await, 1);
+        assert_eq!(
+            run(&db, &server.rpc()).await,
+            ReconcileOutcome {
+                resolved: 1,
+                deferred: 1
+            }
+        );
         assert_eq!(intent(&db, id1).status, IntentStatus::Signed);
         assert_eq!(intent(&db, id2).status, IntentStatus::Confirmed);
         assert!(audit_events(&db).contains(&"reconcile_resolved".to_string()));
@@ -646,10 +721,166 @@ mod tests {
             json!({"context":{"slot":1},"value":[status_value(Value::Null, "finalized")]}),
             json!(1000),
         ]);
-        assert_eq!(run(&db, &server.rpc()).await, 1);
+        assert_eq!(
+            run(&db, &server.rpc()).await,
+            ReconcileOutcome {
+                resolved: 1,
+                deferred: 1
+            }
+        );
         assert_eq!(intent(&db, id1).status, IntentStatus::Signed);
         assert_eq!(intent(&db, id2).status, IntentStatus::Confirmed);
         assert!(audit_events(&db).contains(&"reconcile_resolved".to_string()));
+    }
+
+    #[tokio::test]
+    async fn all_status_probes_failing_reports_every_deferred_intent() {
+        let (db, id1, id2) = db_with_two_intents();
+        signed(&db, id1, "Sig1", 1000);
+        signed(&db, id2, "Sig2", 1000);
+        let server = MockServer::new(vec![rpc_error(), rpc_error()]);
+        let outcome = run(&db, &server.rpc()).await;
+        assert_eq!(
+            server.methods(),
+            vec!["getSignatureStatuses", "getSignatureStatuses"]
+        );
+        server._worker.join().unwrap();
+        assert_eq!(
+            outcome,
+            ReconcileOutcome {
+                resolved: 0,
+                deferred: 2
+            }
+        );
+        assert_eq!(intent(&db, id1).status, IntentStatus::Signed);
+        assert_eq!(intent(&db, id2).status, IntentStatus::Signed);
+        assert_reconcile_audit(&db, outcome);
+    }
+
+    fn assert_reconcile_audit(db: &Storage, outcome: ReconcileOutcome) {
+        db.call_blocking(move |d| {
+            assert!(d.verify_audit_chain().unwrap());
+            let entries = d.list_audit(50).unwrap();
+            let entry = entries
+                .iter()
+                .find(|a| a.event_type == "reconcile_resolved")
+                .unwrap();
+            assert_eq!(
+                entry.details,
+                json!({"resolved": outcome.resolved, "deferred": outcome.deferred})
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn each_rpc_error_defers_without_changing_signed_intent() {
+        let unknown = json!({"context":{"slot":1},"value":[null]});
+        let preflight = json!({"jsonrpc":"2.0","id":1,"error":{
+            "code":-32002,"message":"Transaction simulation failed: Blockhash not found",
+            "data":{"err":"BlockhashNotFound","logs":[]}
+        }});
+        let cases = [
+            (vec![rpc_error()], vec!["getSignatureStatuses"]),
+            (
+                vec![unknown.clone(), rpc_error()],
+                vec!["getSignatureStatuses", "getBlockHeight"],
+            ),
+            (
+                vec![unknown.clone(), json!(1151), rpc_error()],
+                vec![
+                    "getSignatureStatuses",
+                    "getBlockHeight",
+                    "getSignatureStatuses",
+                ],
+            ),
+            (
+                vec![unknown.clone(), json!(1000), rpc_error()],
+                vec!["getSignatureStatuses", "getBlockHeight", "sendTransaction"],
+            ),
+            (
+                vec![unknown, json!(1000), preflight],
+                vec!["getSignatureStatuses", "getBlockHeight", "sendTransaction"],
+            ),
+        ];
+        for (responses, methods) in cases {
+            let (db, id) = db_with_intent();
+            signed(&db, id, "Sig", 1000);
+            let server = MockServer::new(responses);
+            let outcome = run(&db, &server.rpc()).await;
+            assert_eq!(server.methods(), methods);
+            server._worker.join().unwrap();
+            assert_eq!(
+                outcome,
+                ReconcileOutcome {
+                    resolved: 0,
+                    deferred: 1
+                }
+            );
+            let got = intent(&db, id);
+            assert_eq!(got.status, IntentStatus::Signed);
+            assert_eq!(got.signed_tx.as_deref(), Some(b"wire".as_slice()));
+            assert!(got.error.is_none());
+            assert_reconcile_audit(&db, outcome);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_and_terminal_only_passes_have_no_deferred_work() {
+        let (db, id) = db_with_intent();
+        db.call_blocking(move |d| {
+            d.mark_terminal(id, TerminalStatus::Failed, Some("already failed"))
+        })
+        .unwrap();
+        let rpc = Rpc::new(reqwest::Client::new(), "http://127.0.0.1:0");
+        assert_eq!(run(&db, &rpc).await, ReconcileOutcome::default());
+        assert_eq!(intent(&db, id).status, IntentStatus::Failed);
+        let empty = Storage::new(Db::open_memory().unwrap());
+        assert_eq!(run(&empty, &rpc).await, ReconcileOutcome::default());
+    }
+
+    #[tokio::test]
+    async fn expiry_recheck_confirmed_keeps_open_without_deferral() {
+        let (db, id) = db_with_intent();
+        signed(&db, id, "Sig", 1000);
+        let server = MockServer::new(vec![
+            json!({"context":{"slot":1},"value":[null]}),
+            json!(1151),
+            json!({"context":{"slot":1},"value":[status_value(Value::Null, "confirmed")]}),
+        ]);
+        let outcome = run(&db, &server.rpc()).await;
+        assert_eq!(
+            server.methods(),
+            vec![
+                "getSignatureStatuses",
+                "getBlockHeight",
+                "getSignatureStatuses"
+            ]
+        );
+        server._worker.join().unwrap();
+        assert_eq!(outcome, ReconcileOutcome::default());
+        assert_eq!(intent(&db, id).status, IntentStatus::Signed);
+        assert_reconcile_audit(&db, outcome);
+    }
+
+    #[tokio::test]
+    async fn submitted_rebroadcast_success_has_no_transition_or_deferral() {
+        let (db, id) = db_with_intent();
+        signed(&db, id, "Sig", 1000);
+        db.call_blocking(move |d| d.mark_submitted(id)).unwrap();
+        let server = MockServer::new(vec![
+            json!({"context":{"slot":1},"value":[null]}),
+            json!(1000),
+            json!("Sig"),
+        ]);
+        let outcome = run(&db, &server.rpc()).await;
+        assert_eq!(
+            server.methods(),
+            vec!["getSignatureStatuses", "getBlockHeight", "sendTransaction"]
+        );
+        server._worker.join().unwrap();
+        assert_eq!(outcome, ReconcileOutcome::default());
+        assert_eq!(intent(&db, id).status, IntentStatus::Submitted);
+        assert_reconcile_audit(&db, outcome);
     }
 
     fn status(err: bool, conf: Option<&str>) -> SignatureStatus {
