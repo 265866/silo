@@ -438,6 +438,8 @@ fn renders_every_size_without_panicking() {
         SetupStage::Choose,
         SetupStage::ShowMnemonic,
         SetupStage::ConfirmMnemonic,
+        SetupStage::ImportEntry,
+        SetupStage::SetPassphrase,
     ];
     for w in (20u16..=120).step_by(7) {
         for h in (6u16..=30).step_by(3) {
@@ -738,6 +740,173 @@ fn send_avail_fee_line_never_leads_with_separator_when_loading() {
         assert!(
             !t.starts_with('·'),
             "no rendered line may lead with the separator:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn regression_send_fee_is_exact_for_all_presets_and_balance_states() {
+    let mut app = test_app();
+    let id = send_from_master(&mut app);
+    for (_, priority) in crate::money::PRIORITY_PRESETS {
+        app.priority_micro = priority;
+        if priority == 0 {
+            assert_eq!(app.send_fee(), 5000);
+        }
+        if priority == crate::money::DEFAULT_PRIORITY_FEE_MICRO {
+            assert_eq!(app.send_fee(), 5023);
+        }
+        for balance in [
+            None,
+            Some(0),
+            Some(124_500_000_000),
+            Some(1_000_000_000_000),
+            Some(1_000_000_000_000_000),
+            Some(u64::MAX),
+        ] {
+            app.wallets
+                .iter_mut()
+                .find(|w| w.id == id)
+                .unwrap()
+                .balance_lamports = balance;
+            for amount in ["", "0.0001", "1.23456789"] {
+                app.input.send_amount = amount.into();
+                app.input.focus = 1;
+                for (width, height) in [(60, 16), (72, 16), (96, 28)] {
+                    let out = render_sized(&mut app, width, height);
+                    let expected =
+                        format!("fee ≈ {} SOL", super::format::fmt_sol_exact(app.send_fee()));
+                    assert!(
+                        out.contains(&expected),
+                        "priority {priority}, balance {balance:?}, amount {amount} at {width}x{height}:\n{out}"
+                    );
+                    let available = match balance {
+                        Some(balance) => {
+                            format!("available {} SOL", super::format::fmt_sol(balance))
+                        }
+                        None => "available …".into(),
+                    };
+                    assert!(
+                        out.contains(&available),
+                        "available balance clipped:\n{out}"
+                    );
+                    assert!(
+                        out.contains(&format!("{amount}▏")),
+                        "amount/caret clipped:\n{out}"
+                    );
+                    assert!(!out.contains("fee ≈ 0.0000 SOL"));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn regression_import_phrase_keeps_every_word_and_caret_at_narrow_sizes() {
+    let mut app = test_app();
+    app.route = Route::Setup;
+    app.setup.stage = SetupStage::ImportEntry;
+    for phrase in [
+        String::new(),
+        "legal winner thank year wave sausage worth useful legal winner thank yellow".to_string(),
+        // Exactly fills the 56 cells after indentation at the minimum width.
+        "abstract abandon abandon abandon abandon abandon ability".to_string(),
+        ["abstract"; 24].join(" "),
+    ] {
+        app.input.import_phrase = phrase.clone().into();
+        for width in 60..=72 {
+            for height in [16, 28] {
+                let out = render_sized(&mut app, width, height);
+                let expected: Vec<_> = phrase.split_whitespace().collect();
+                let shown: Vec<_> = out
+                    .split(|c: char| !c.is_ascii_lowercase())
+                    .filter(|word| expected.contains(word))
+                    .collect();
+                assert_eq!(
+                    shown, expected,
+                    "phrase clipped at {width}x{height}:\n{out}"
+                );
+                assert!(
+                    out.contains('▏'),
+                    "caret missing at {width}x{height}:\n{out}"
+                );
+                let target = if expected.len() > 12 { 24 } else { 12 };
+                assert!(
+                    out.contains(&format!("words: {}/{target}", expected.len())),
+                    "counter missing:\n{out}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn regression_profile_selection_stays_visible_through_wrap_and_resize() {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    let mut app = test_app();
+    app.route = Route::ProfileSelect;
+    app.profiles = (0..30)
+        .map(|i| ProfileMeta {
+            id: format!("{i:032x}"),
+            name: format!("Profile {i:02}"),
+            created_at: 0,
+        })
+        .collect();
+    for selected in [0, 15, 29] {
+        app.profile_sel = selected;
+        for (width, height) in [(96, 28), (60, 16), (72, 20), (96, 28)] {
+            let out = render_sized(&mut app, width, height);
+            assert!(
+                out.contains(&format!("▌ Profile {selected:02}")),
+                "selection missing at {width}x{height}:\n{out}"
+            );
+        }
+    }
+    app.profile_sel = 0;
+    for (key, selected) in [
+        (KeyCode::Up, 29),
+        (KeyCode::Down, 0),
+        (KeyCode::Char('k'), 29),
+        (KeyCode::Char('j'), 0),
+    ] {
+        crate::input::handle_event(&mut app, Event::Key(KeyEvent::new(key, KeyModifiers::NONE)));
+        assert_eq!(app.profile_sel, selected);
+        let out = render_sized(&mut app, 60, 16);
+        assert!(
+            out.contains(&format!("▌ Profile {selected:02}")),
+            "wrapped selection missing:\n{out}"
+        );
+    }
+    for selected in 1..30 {
+        crate::input::handle_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+        );
+        let out = render_sized(&mut app, 60, 16);
+        assert_eq!(app.profile_sel, selected);
+        assert!(
+            out.contains(&format!("▌ Profile {selected:02}")),
+            "selection missing:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn regression_profile_height_clamps_before_narrowing_large_counts() {
+    let mut app = test_app();
+    app.route = Route::ProfileSelect;
+    for count in [usize::from(u16::MAX), usize::from(u16::MAX) + 1] {
+        app.profiles
+            .extend((app.profiles.len()..count).map(|i| ProfileMeta {
+                id: format!("{i:032x}"),
+                name: format!("Profile {i}"),
+                created_at: 0,
+            }));
+        app.profile_sel = count - 1;
+        let out = render_sized(&mut app, 60, 16);
+        assert!(
+            out.contains(&format!("▌ Profile {}", count - 1)),
+            "selection missing:\n{out}"
         );
     }
 }
