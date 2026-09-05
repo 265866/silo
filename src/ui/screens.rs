@@ -54,8 +54,15 @@ fn passphrase_box(
 
 pub(super) fn profile_select(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
-    let h = (app.profiles.len() as u16 + 8).clamp(11, area.height.max(11));
+    let h = app
+        .profiles
+        .len()
+        .saturating_add(8)
+        .clamp(11, usize::from(area.height.max(11))) as u16;
     let rect = super::centered_rect(72, h, area);
+    let block = panel("silo — profiles", true, theme);
+    let visible = block.inner(rect).height.saturating_sub(4) as usize;
+    let start = app.profile_sel.saturating_sub(visible.saturating_sub(1));
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -74,7 +81,7 @@ pub(super) fn profile_select(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(theme.text_muted),
         )));
     } else {
-        for (i, p) in app.profiles.iter().enumerate() {
+        for (i, p) in app.profiles.iter().enumerate().skip(start).take(visible) {
             let selected = i == app.profile_sel;
             let marker = if selected { "▌ " } else { "  " };
             let style = if selected {
@@ -90,10 +97,7 @@ pub(super) fn profile_select(f: &mut Frame, app: &App, area: Rect) {
             ]));
         }
     }
-    f.render_widget(
-        Paragraph::new(lines).block(panel("silo — profiles", true, theme)),
-        rect,
-    );
+    f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
 pub(super) fn unlock(f: &mut Frame, app: &App, area: Rect) {
@@ -328,7 +332,7 @@ pub(super) fn setup(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 Style::default().fg(theme.text_muted)
             };
-            let inner_w = super::SETUP_WIDTH.saturating_sub(2) as usize;
+            let inner_w = block.inner(super::setup_panel(area, area.height)).width as usize;
             let phrase_lines =
                 import_phrase_lines(app.input.import_phrase.as_str(), inner_w, theme);
             let mut lines = vec![
@@ -446,7 +450,8 @@ fn import_phrase_lines<'a>(
     theme: &super::theme::Theme,
 ) -> Vec<Line<'a>> {
     const INDENT: &str = "  ";
-    let avail = inner_w.saturating_sub(INDENT.chars().count()).max(1);
+    // Keep a cell free for the caret even when the final word fills a line.
+    let avail = inner_w.saturating_sub(INDENT.chars().count() + 1).max(1);
     let cursor = Span::styled("▏", Style::default().fg(theme.accent));
 
     let words: Vec<&str> = phrase.split_whitespace().collect();
@@ -891,14 +896,12 @@ pub(super) fn send(f: &mut Frame, app: &App, area: Rect) {
         _ => None,
     };
 
-    let avail_fee = match avail {
-        Some(a) => format!(
-            "available {} SOL · fee ≈ {} SOL",
-            format::fmt_sol(a),
-            format::fmt_sol(fee)
-        ),
-        None => format!("available … · fee ≈ {} SOL", format::fmt_sol(fee)),
+    let available = match avail {
+        Some(a) => format!("available {} SOL", format::fmt_sol(a)),
+        None => "available …".to_string(),
     };
+    let fee_hint = format!("fee ≈ {} SOL", format::fmt_sol_exact(fee));
+    let avail_fee = format!("{available} · {fee_hint}");
 
     let mut lines = vec![
         Line::from(""),
@@ -945,11 +948,21 @@ pub(super) fn send(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(theme.danger),
         )));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        format!("{:>w$}{avail_fee}", "", w = LABEL_W),
-        Style::default().fg(theme.text_muted),
-    )));
+    if avail_fee.chars().count() > note_w {
+        // Use the spacer row for the balance so an exact fee still fits at 60x16.
+        for hint in [available, fee_hint] {
+            lines.push(Line::from(Span::styled(
+                format!("{:>w$}{hint}", "", w = LABEL_W),
+                Style::default().fg(theme.text_muted),
+            )));
+        }
+    } else {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("{:>w$}{avail_fee}", "", w = LABEL_W),
+            Style::default().fg(theme.text_muted),
+        )));
+    }
     if let Some(after) = after {
         lines.push(Line::from(Span::styled(
             format!("{:>w$}{after}", "", w = LABEL_W),

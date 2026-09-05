@@ -1548,6 +1548,36 @@ mod tests {
     }
 
     #[test]
+    fn regression_cny_toggle_preserves_sub_yuan_lamports() {
+        use crate::types::Currency;
+        let mut h = harness(true);
+        h.app.modal = None;
+        h.app.input.focus = 1;
+        h.app.currency = Currency::Cny;
+        h.app.price.set(SolPrice {
+            value: 1000.0,
+            currency: Currency::Cny,
+            fetched_at: crate::db::now_ms() as u64 / 1000,
+            source: PriceSource::CoinGecko,
+        });
+        for (sol, fiat, lamports) in [("0.0004", "0.40", 400_000), ("0.0006", "0.60", 600_000)] {
+            h.app.input.send_amount = sol.into();
+            h.app.input.send_in_fiat = false;
+            for in_fiat in [true, false] {
+                handle_key(
+                    &mut h.app,
+                    KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+                );
+                assert_eq!(h.app.input.send_in_fiat, in_fiat);
+                assert_eq!(h.app.input.send_amount, if in_fiat { fiat } else { sol });
+                assert_eq!(h.app.compose_lamports().unwrap(), lamports);
+            }
+        }
+        assert!(h.app.toasts.is_empty());
+        assert!(h.rx.try_recv().is_err());
+    }
+
+    #[test]
     fn toggle_send_denom_preserves_amount_and_unit_without_fresh_price() {
         for stale in [false, true] {
             for in_fiat in [false, true] {
