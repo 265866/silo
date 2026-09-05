@@ -145,12 +145,9 @@ async fn main() -> Result<()> {
         prev_hook(info);
     }));
 
-    let mut terminal = ratatui::init();
+    let terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
-    let result = run(&mut terminal, app, evt_rx, workers).await;
-    disable_bracketed_paste(&mut std::io::stdout());
-    ratatui::restore();
-    result
+    run(terminal, app, evt_rx, workers).await
 }
 
 fn disable_bracketed_paste(w: &mut impl std::io::Write) {
@@ -236,7 +233,7 @@ impl Shutdown {
 }
 
 async fn run(
-    terminal: &mut ratatui::DefaultTerminal,
+    mut terminal: ratatui::DefaultTerminal,
     mut app: App,
     mut evt_rx: mpsc::Receiver<AppEvent>,
     mut workers: tokio::task::JoinHandle<()>,
@@ -303,6 +300,13 @@ async fn run(
         }
     };
 
+    // Release terminal ownership before waiting for in-flight work. Workers still
+    // drain normally so transaction persistence is not interrupted.
+    drop(events);
+    drop(terminal);
+    disable_bracketed_paste(&mut std::io::stdout());
+    ratatui::restore();
+
     app.scrub_for_exit();
     drop(app);
     if !worker_done && let Err(e) = workers.await {
@@ -322,6 +326,131 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         disable_bracketed_paste(&mut buf);
         assert_eq!(buf, b"\x1b[?2004l");
+    }
+
+    fn console_test_app(config_dir: &std::path::Path) -> super::App {
+        let db = super::Storage::new(super::Db::open_memory().unwrap());
+        let client = super::worker::build_client().unwrap();
+        let rpc_url = "http://127.0.0.1:9".to_string();
+        let rpc = std::sync::Arc::new(std::sync::Mutex::new(super::Rpc::new(
+            client.clone(),
+            rpc_url.clone(),
+        )));
+        let (cmd_tx, _) = super::mpsc::channel(1);
+        super::App::new(
+            db,
+            std::sync::Arc::new(super::PriceCache::new()),
+            cmd_tx,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            rpc,
+            client,
+            config_dir.to_path_buf(),
+            rpc_url,
+            config_dir.join("vault.json"),
+        )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an exclusive real console; run with --ignored --exact --nocapture"]
+    async fn teardown_restores_terminal_before_delayed_worker_completion() {
+        use ratatui::crossterm::terminal::is_raw_mode_enabled;
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = console_test_app(dir.path());
+        let db = app.db.clone();
+        let worker_db = db.clone();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let workers = tokio::spawn(async move {
+            if release_rx.await.is_ok() {
+                worker_db
+                    .call(|d| d.set_meta("teardown_worker_finished", "yes"))
+                    .await
+                    .unwrap();
+            }
+        });
+        let (evt_tx, evt_rx) = super::mpsc::channel(1);
+        // End the real event loop without waiting for keyboard input or a timer.
+        drop(evt_tx);
+
+        println!("ORIGINAL SCREEN: before terminal initialization");
+        let mut terminal = ratatui::init();
+        let _ = super::execute!(std::io::stdout(), super::EnableBracketedPaste);
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new("ALTERNATE SCREEN: terminal owned by silo"),
+                    frame.area(),
+                );
+            })
+            .unwrap();
+        assert!(is_raw_mode_enabled().unwrap());
+        // These pauses only make the real-console recording readable. Ordering
+        // assertions below depend on the held channel, not elapsed wall time.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let run = super::run(terminal, app, evt_rx, workers);
+        tokio::pin!(run);
+        let first_poll = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(run.as_mut(), cx))
+        })
+        .await;
+        assert!(first_poll.is_pending());
+        let raw_mode = is_raw_mode_enabled().unwrap();
+        if raw_mode {
+            // Keep the console usable even when reproducing the old ordering.
+            disable_bracketed_paste(&mut std::io::stdout());
+        }
+        assert!(
+            !raw_mode,
+            "terminal must be restored while the worker is still held"
+        );
+        assert!(
+            db.call(|d| d.get_meta("teardown_worker_finished"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        println!("RESTORED SCREEN: raw mode disabled; worker still held");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut run)
+            .await
+            .expect("released worker must drain")
+            .unwrap();
+        assert_eq!(
+            db.call(|d| d.get_meta("teardown_worker_finished"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("yes")
+        );
+        println!("WORKER DRAINED: persistence completed after restoration");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an exclusive real console; run with --ignored --exact --nocapture"]
+    async fn teardown_restores_terminal_after_worker_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = console_test_app(dir.path());
+        let (_evt_tx, evt_rx) = super::mpsc::channel(1);
+        let workers = tokio::spawn(std::future::pending::<()>());
+        workers.abort();
+        let terminal = ratatui::init();
+        let _ = super::execute!(std::io::stdout(), super::EnableBracketedPaste);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::run(terminal, app, evt_rx, workers),
+        )
+        .await
+        .expect("worker failure must end the event loop");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("background worker task failed")
+        );
+        assert!(!ratatui::crossterm::terminal::is_raw_mode_enabled().unwrap());
+        println!("RESTORED SCREEN: worker error returned with raw mode disabled");
     }
 
     #[cfg(target_os = "linux")]

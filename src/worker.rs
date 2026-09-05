@@ -324,7 +324,7 @@ fn next_wallet_name(profiles: &[crate::profiles::ProfileMeta]) -> String {
         .filter_map(|n| n.trim().parse::<u32>().ok())
         .max()
         .unwrap_or(0);
-    format!("Wallet {}", max + 1)
+    format!("Wallet {}", max.saturating_add(1))
 }
 
 enum WalletCheckError {
@@ -2151,6 +2151,83 @@ mod tests {
             assert!(d.verify_audit_chain().is_err());
             assert!(d.audit(AuditEvent::VaultUnlocked, &json!({})).is_err());
         });
+    }
+
+    #[test]
+    fn next_wallet_name_handles_user_chosen_names() {
+        for (names, expected) in [
+            (vec![], "Wallet 1"),
+            (
+                vec!["Treasury", "Wallet nope", "Wallet -1", "Wallet 4294967296"],
+                "Wallet 1",
+            ),
+            (vec!["Wallet 2", "Wallet 9", "Wallet 3"], "Wallet 10"),
+            (vec!["Wallet 4294967295"], "Wallet 4294967295"),
+        ] {
+            let profiles: Vec<_> = names
+                .into_iter()
+                .map(|name| crate::profiles::ProfileMeta {
+                    id: "0000000000000017".into(),
+                    name: name.into(),
+                    created_at: 42,
+                })
+                .collect();
+            assert_eq!(next_wallet_name(&profiles), expected);
+        }
+    }
+
+    #[test]
+    fn setup_with_max_wallet_name_registers_valid_vault_and_master() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = crate::profiles::ProfileMeta {
+            id: "0000000000000017".into(),
+            name: "Wallet 4294967295".into(),
+            created_at: 42,
+        };
+        crate::profiles::save(dir.path(), std::slice::from_ref(&existing)).unwrap();
+        let id = "0000000000000018";
+        let profile = crate::profiles::dir_for(dir.path(), id).unwrap();
+        crate::profiles::ensure_private_dir(&profile).unwrap();
+        let vault_path = profile.join("vault.json");
+        let db = Storage::new(crate::db::Db::open(&profile.join("silo.db")).unwrap());
+
+        for _ in 0..2 {
+            let result = finish_setup_blocking(
+                db.clone(),
+                vault_path.clone(),
+                dir.path().to_path_buf(),
+                Some(id.into()),
+                true,
+                zeroize::Zeroizing::new(TEST_MNEMONIC.into()),
+                zeroize::Zeroizing::new("test passphrase".into()),
+            );
+            let SetupResult::Finished {
+                seed,
+                wallets,
+                profiles,
+            } = result
+            else {
+                panic!("setup with a maximum-numbered profile failed");
+            };
+            assert_eq!(profiles.len(), 2);
+            assert_eq!(profiles[0].id, existing.id);
+            assert_eq!(profiles[0].name, existing.name);
+            assert_eq!(profiles[0].created_at, existing.created_at);
+            assert_eq!(profiles[1].id, id);
+            assert_eq!(profiles[1].name, "Wallet 4294967295");
+            assert_eq!(crate::profiles::load(dir.path()).unwrap()[1].id, id);
+            assert_eq!(wallets.len(), 1);
+            assert_eq!(wallets[0].account_index, 0);
+            assert_eq!(wallets[0].role, crate::types::Role::Master);
+            assert_eq!(wallets[0].pubkey, crate::crypto::derive_address(&seed, 0));
+            let stored = db.call_blocking(|d| d.list_wallets()).unwrap();
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].pubkey, wallets[0].pubkey);
+            assert!(db.call_blocking(|d| d.verify_audit_chain()).unwrap());
+            let (mnemonic, _) =
+                crate::vault::unlock_vault_keyed(&vault_path, "test passphrase").unwrap();
+            assert_eq!(mnemonic.to_string(), TEST_MNEMONIC);
+        }
     }
 
     #[test]
