@@ -373,9 +373,7 @@ impl Db {
     }
 
     pub fn audit(&mut self, event: AuditEvent, details: &serde_json::Value) -> Result<()> {
-        let Some(key) = self.audit_key.as_deref() else {
-            return Ok(());
-        };
+        let key = require_audit_key(&self.audit_key)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1127,20 +1125,24 @@ mod tests {
             assert_eq!(unchanged.note.as_deref(), Some("original note"));
             assert!(!unchanged.archived);
             assert_eq!(d.get_meta("currency").unwrap().as_deref(), Some("usd"));
-            // Preserve the bare audit call's locked no-op policy for this change.
-            d.audit(
-                AuditEvent::SettingsChanged,
-                &serde_json::json!({"locked":true}),
-            )
-            .unwrap();
+            assert!(
+                d.audit(
+                    AuditEvent::SettingsChanged,
+                    &serde_json::json!({"locked":true}),
+                )
+                .is_err()
+            );
             assert_eq!(d.list_audit(100).unwrap().len(), audit_count);
             assert_eq!(d.get_meta("audit_head_hash").unwrap(), audit_head);
         }
 
         d.unlock_audit_key(&vk).unwrap();
         assert!(d.verify_audit_chain().unwrap());
-        d.set_label(wallet.id, Some("unlocked")).unwrap();
+        d.audit(AuditEvent::VaultUnlocked, &serde_json::json!({}))
+            .unwrap();
         assert_eq!(d.list_audit(100).unwrap().len(), audit_count + 1);
+        d.set_label(wallet.id, Some("unlocked")).unwrap();
+        assert_eq!(d.list_audit(100).unwrap().len(), audit_count + 2);
         assert!(d.verify_audit_chain().unwrap());
     }
 

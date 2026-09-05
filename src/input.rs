@@ -1260,7 +1260,7 @@ mod tests {
         h.app.input.passphrase = Zeroizing::new("typed-while-waiting".to_string());
 
         h.app.apply_app_event(AppEvent::UnlockComplete {
-            result: crate::app::UnlockResult::WrongPassphrase,
+            result: crate::app::UnlockResult::AuthenticationFailed,
             generation: h.app.generation.load(Ordering::SeqCst),
         });
         assert!(h.app.unlock_failed, "failed unlock must set the flag");
@@ -1278,6 +1278,69 @@ mod tests {
             "the next keystroke must clear the failed-unlock flag"
         );
         assert_eq!(h.app.input.passphrase.as_str(), "x");
+    }
+
+    #[test]
+    fn vault_diagnostic_opens_modal_without_passphrase_failure_state() {
+        let mut h = harness(false);
+        h.app.route = Route::Unlock;
+        h.app.modal = None;
+        h.app.unlock_failed = true;
+        h.app.blocking_input = true;
+        h.app.input.passphrase = Zeroizing::new("typed-while-waiting".into());
+        h.app.apply_app_event(AppEvent::UnlockComplete {
+            result: crate::app::UnlockResult::VaultRead(
+                "vault file is not valid: EOF while parsing a value".into(),
+            ),
+            generation: h.app.generation.load(Ordering::SeqCst),
+        });
+        assert!(!h.app.unlock_failed);
+        assert!(!h.app.blocking_input);
+        assert!(h.app.seed.is_none());
+        assert_eq!(h.app.route, Route::Unlock);
+        assert_eq!(h.app.input.passphrase.as_str(), "typed-while-waiting");
+        let Some(Modal::Error { title, body }) = &h.app.modal else {
+            panic!("vault read failure did not open diagnostic modal");
+        };
+        assert_eq!(title, "Cannot open vault");
+        assert!(body.contains("EOF while parsing a value"));
+        assert!(h.app.toasts.is_empty());
+    }
+
+    #[test]
+    fn authentication_failure_message_keeps_corruption_ambiguity() {
+        let mut h = harness(false);
+        h.app.route = Route::Unlock;
+        h.app.modal = None;
+        h.app.apply_app_event(AppEvent::UnlockComplete {
+            result: crate::app::UnlockResult::AuthenticationFailed,
+            generation: h.app.generation.load(Ordering::SeqCst),
+        });
+        assert!(h.app.unlock_failed);
+        assert!(h.app.modal.is_none());
+        assert!(h.app.seed.is_none());
+        assert_eq!(
+            h.app.toasts.last().unwrap().text,
+            "Incorrect passphrase or corrupted vault"
+        );
+    }
+
+    #[test]
+    fn audit_write_failure_opens_diagnostic_without_authentication_flag() {
+        let mut h = harness(false);
+        h.app.route = Route::Unlock;
+        h.app.unlock_failed = true;
+        h.app.apply_app_event(AppEvent::UnlockComplete {
+            result: crate::app::UnlockResult::AuditWrite("database is read-only".into()),
+            generation: h.app.generation.load(Ordering::SeqCst),
+        });
+        assert!(!h.app.unlock_failed);
+        assert!(h.app.seed.is_none());
+        let Some(Modal::Error { title, body }) = &h.app.modal else {
+            panic!("audit write failure did not open diagnostic modal");
+        };
+        assert_eq!(title, "Cannot write audit log");
+        assert!(body.contains("database is read-only"));
     }
 
     #[test]

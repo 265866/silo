@@ -1392,7 +1392,7 @@ fn unlock_shows_inline_error_and_clears_field_on_failure() {
 
     let out = render(&mut app);
     assert!(
-        out.contains("Incorrect passphrase"),
+        out.contains("Incorrect passphrase or corrupted vault"),
         "failed unlock must render a persistent inline error:\n{out}"
     );
     assert!(
