@@ -56,7 +56,7 @@ solana-derivation-path = "3.0.0"
 solana-hash = "4.4.0"
 solana-keypair = { version = "3.1.2", features = ["seed-derivable"] }
 solana-message = { version = "4.2.0", features = ["wincode"] }
-solana-system-interface = { version = "3.2.0", features = ["bincode"] }
+solana-system-interface = { version = "3.2.0", features = ["wincode"] }
 tempfile = "3.27.0"
 tokio = { version = "1", features = ["test-util"] }
 
