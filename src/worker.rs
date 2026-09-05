@@ -324,7 +324,7 @@ fn unlock_vault_blocking(
     if !key_ok {
         return UnlockResult::AuditKey;
     }
-    let wallets = match wallet_consistency(&db, &seed) {
+    let mut wallets = match wallet_consistency(&db, &seed) {
         Ok(wallets) => wallets,
         Err(WalletCheckError::Mismatch) => {
             db.call_blocking(|d| {
@@ -336,6 +336,19 @@ fn unlock_vault_blocking(
     };
     match db.call_blocking(|d| d.verify_audit_chain()) {
         Ok(true) => {
+            if wallets.is_empty() {
+                let address = crate::crypto::derive_address(&seed, 0);
+                match db.call_blocking(move |d| {
+                    d.insert_wallet(0, crate::types::Role::Master, &address, None)
+                }) {
+                    Ok(master) => wallets.push(master),
+                    Err(e) => {
+                        return UnlockResult::WalletRead(format!(
+                            "initializing recovered master wallet: {e}"
+                        ));
+                    }
+                }
+            }
             db.call_blocking(|d| {
                 let _ = d.audit(AuditEvent::VaultUnlocked, &serde_json::json!({}));
             });
@@ -1692,6 +1705,84 @@ mod tests {
     }
 
     const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    #[test]
+    fn recovered_vault_initializes_master_only_after_unlock() {
+        for audit_created in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let id = "0000000000000018";
+            let profile = crate::profiles::dir_for(dir.path(), id).unwrap();
+            crate::profiles::ensure_private_dir(&profile).unwrap();
+            crate::profiles::save(dir.path(), &[]).unwrap();
+            let vault_path = profile.join("vault.json");
+            let mnemonic = crate::crypto::parse_mnemonic(TEST_MNEMONIC).unwrap();
+            let key =
+                crate::vault::create_vault(&vault_path, &mnemonic, "test passphrase").unwrap();
+            assert_eq!(crate::profiles::load(dir.path()).unwrap()[0].id, id);
+            let db = Storage::new(crate::db::Db::open(&profile.join("silo.db")).unwrap());
+            if audit_created {
+                db.call_blocking(move |d| {
+                    d.unlock_audit_key(key.as_bytes()).unwrap();
+                    d.audit(AuditEvent::VaultCreated, &json!({})).unwrap();
+                    d.lock_audit_key();
+                });
+            }
+
+            assert!(matches!(
+                unlock_vault_blocking(
+                    db.clone(),
+                    vault_path.clone(),
+                    zeroize::Zeroizing::new("wrong".into())
+                ),
+                UnlockResult::WrongPassphrase
+            ));
+            assert!(db.call_blocking(|d| d.list_wallets()).unwrap().is_empty());
+            for _ in 0..2 {
+                let result = unlock_vault_blocking(
+                    db.clone(),
+                    vault_path.clone(),
+                    zeroize::Zeroizing::new("test passphrase".into()),
+                );
+                let UnlockResult::Unlocked { seed, wallets } = result else {
+                    panic!("recovered vault did not unlock");
+                };
+                assert_eq!(wallets.len(), 1);
+                assert_eq!(wallets[0].account_index, 0);
+                assert_eq!(wallets[0].role, crate::types::Role::Master);
+                assert_eq!(wallets[0].pubkey, crate::crypto::derive_address(&seed, 0));
+                assert!(db.call_blocking(|d| d.verify_audit_chain()).unwrap());
+                db.call_blocking(|d| d.lock_audit_key());
+            }
+        }
+    }
+
+    #[test]
+    fn recovered_vault_rejects_tampered_audit_before_master_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault_path = dir.path().join("vault.json");
+        let db_path = dir.path().join("silo.db");
+        let mnemonic = crate::crypto::parse_mnemonic(TEST_MNEMONIC).unwrap();
+        let key = crate::vault::create_vault(&vault_path, &mnemonic, "test passphrase").unwrap();
+        let mut database = crate::db::Db::open(&db_path).unwrap();
+        database.unlock_audit_key(key.as_bytes()).unwrap();
+        database
+            .audit(AuditEvent::VaultCreated, &json!({}))
+            .unwrap();
+        database.lock_audit_key();
+        let db = Storage::new(database);
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute("UPDATE audit_log SET details='tampered'", [])
+            .unwrap();
+
+        let result = unlock_vault_blocking(
+            db.clone(),
+            vault_path,
+            zeroize::Zeroizing::new("test passphrase".into()),
+        );
+        assert!(matches!(result, UnlockResult::AuditChainFailed));
+        assert!(db.call_blocking(|d| d.list_wallets()).unwrap().is_empty());
+    }
 
     #[test]
     fn setup_preserves_profile_metadata_on_creation_and_retry() {

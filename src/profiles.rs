@@ -56,6 +56,8 @@ pub fn new_id() -> String {
     s
 }
 
+/// Recover sealed profiles while preserving registered metadata. Callers hold the
+/// config directory's instance lock and serialize registry operations.
 pub fn load(config_dir: &Path) -> Result<Vec<ProfileMeta>> {
     match std::fs::read(registry_path(config_dir)) {
         Ok(bytes) => match parse_registry(&bytes) {
@@ -125,6 +127,7 @@ pub fn save(config_dir: &Path, list: &[ProfileMeta]) -> Result<()> {
     crate::vault::write_atomic(&registry_path(config_dir), &json)
 }
 
+/// Persist setup metadata, replacing any entry recovered while sealing the vault.
 pub fn register(config_dir: &Path, meta: ProfileMeta) -> Result<()> {
     validate_id(&meta.id)?;
     let mut list = load(config_dir)?;
