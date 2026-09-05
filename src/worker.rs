@@ -30,19 +30,47 @@ const CONFIRM_POLL_ATTEMPTS: usize = 45;
 const CONFIRM_MAX_ROUNDS: usize = 3;
 const REBROADCAST_INTERVAL: Duration = Duration::from_secs(12);
 
-async fn persist_last_price(db: &Storage, p: &SolPrice) {
-    let json = p.to_meta_json();
-    db.call(move |d| {
-        let _ = d.set_meta("last_price", &json);
-    })
-    .await;
+async fn publish_price(
+    db: &Storage,
+    price: Arc<PriceCache>,
+    evt: &mpsc::Sender<AppEvent>,
+    generation: Arc<AtomicU64>,
+    event_generation: u64,
+    p: SolPrice,
+) -> anyhow::Result<bool> {
+    let accepted = db
+        .call_current(
+            generation,
+            event_generation,
+            move |d| -> anyhow::Result<bool> {
+                if current_currency(d)? != p.currency {
+                    return Ok(false);
+                }
+                // Serialize acceptance with settings writes and database replacement.
+                // A failed persistence must leave the live cache untouched.
+                d.set_meta("last_price", &p.to_meta_json())?;
+                price.set(p);
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap_or(Ok(false))?;
+    if accepted {
+        let _ = evt
+            .send(AppEvent::Price {
+                price: p,
+                generation: event_generation,
+            })
+            .await;
+    }
+    Ok(accepted)
 }
 
-async fn current_currency(db: &Storage) -> crate::types::Currency {
-    db.call(|d| d.get_meta("currency").ok().flatten())
-        .await
+fn current_currency(db: &crate::db::Db) -> anyhow::Result<crate::types::Currency> {
+    Ok(db
+        .get_meta("currency")?
         .and_then(|s| crate::types::Currency::from_code(&s))
-        .unwrap_or(crate::types::Currency::Usd)
+        .unwrap_or(crate::types::Currency::Usd))
 }
 
 async fn send_error(evt: &mpsc::Sender<AppEvent>, generation: u64, message: impl Into<String>) {
@@ -138,7 +166,18 @@ pub fn spawn_workers(
                     }
 
                     let event_generation = generation.load(Ordering::SeqCst);
-                    let currency = current_currency(&db).await;
+                    let currency = match db.call(|d| current_currency(d)).await {
+                        Ok(currency) => currency,
+                        Err(e) => {
+                            send_error(
+                                &evt,
+                                event_generation,
+                                format!("price currency lookup failed: {e:#}"),
+                            )
+                            .await;
+                            continue;
+                        }
+                    };
                     let skip_cg = cg_backoff_until.is_some_and(|u| Instant::now() < u);
                     let (result, rate_limited) =
                         fetch_price_backoff_aware(&client, currency, skip_cg).await;
@@ -151,15 +190,23 @@ pub fn spawn_workers(
                     } else if !skip_cg {
                         cg_backoff_until = None;
                     }
-                    if let Ok(p) = result {
-                        price.set(p);
-                        persist_last_price(&db, &p).await;
-                        let _ = evt
-                            .send(AppEvent::Price {
-                                price: p,
-                                generation: event_generation,
-                            })
-                            .await;
+                    if let Ok(p) = result
+                        && let Err(e) = publish_price(
+                            &db,
+                            price.clone(),
+                            &evt,
+                            generation.clone(),
+                            event_generation,
+                            p,
+                        )
+                        .await
+                    {
+                        send_error(
+                            &evt,
+                            event_generation,
+                            format!("price publication failed: {e:#}"),
+                        )
+                        .await;
                     }
                 }
             })
@@ -897,20 +944,23 @@ async fn handle_command(
         },
 
         Command::FetchPrice => {
-            let currency = current_currency(&db).await;
+            let currency = match db.call(|d| current_currency(d)).await {
+                Ok(currency) => currency,
+                Err(e) => {
+                    send_error(
+                        &evt,
+                        cmd_gen,
+                        format!("price currency lookup failed: {e:#}"),
+                    )
+                    .await;
+                    return;
+                }
+            };
             match fetch_price(&client, currency).await {
                 Ok(p) => {
-                    if generation.load(Ordering::SeqCst) != cmd_gen {
-                        return;
+                    if let Err(e) = publish_price(&db, price, &evt, generation, cmd_gen, p).await {
+                        send_error(&evt, cmd_gen, format!("price publication failed: {e:#}")).await;
                     }
-                    price.set(p);
-                    persist_last_price(&db, &p).await;
-                    let _ = evt
-                        .send(AppEvent::Price {
-                            price: p,
-                            generation: cmd_gen,
-                        })
-                        .await;
                 }
                 Err(e) => {
                     send_error(&evt, cmd_gen, format!("price fetch failed: {e}")).await;
@@ -1941,6 +1991,283 @@ mod tests {
             Arc::new(PriceCache::default()),
             client,
         )
+    }
+
+    fn publication_price(currency: crate::types::Currency, value: f64) -> SolPrice {
+        SolPrice {
+            value,
+            currency,
+            fetched_at: unix_now_secs(),
+            source: crate::price::PriceSource::CoinGecko,
+        }
+    }
+
+    #[tokio::test]
+    async fn price_publication_accepts_matching_and_default_currency() {
+        use crate::types::Currency;
+        for stored in [
+            None,
+            Some("unknown"),
+            Some(Currency::Usd.code()),
+            Some(Currency::Jpy.code()),
+        ] {
+            let db = Storage::new(crate::db::Db::open_memory().unwrap());
+            if let Some(code) = stored {
+                db.call(move |d| d.set_meta("currency", code))
+                    .await
+                    .unwrap();
+            }
+            let currency = if stored == Some(Currency::Jpy.code()) {
+                Currency::Jpy
+            } else {
+                Currency::Usd
+            };
+            let p = publication_price(currency, 150.0);
+            let price = Arc::new(PriceCache::default());
+            let (tx, mut rx) = mpsc::channel(8);
+            assert!(
+                publish_price(&db, price.clone(), &tx, Arc::new(AtomicU64::new(7)), 7, p)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(price.get().unwrap().to_meta_json(), p.to_meta_json());
+            assert_eq!(
+                db.call(|d| d.get_meta("last_price")).await.unwrap(),
+                Some(p.to_meta_json())
+            );
+            match rx.try_recv().unwrap() {
+                AppEvent::Price { price, generation } => {
+                    assert_eq!(price.to_meta_json(), p.to_meta_json());
+                    assert_eq!(generation, 7);
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn price_publication_rejects_late_usd_after_persist_setting_jpy() {
+        use crate::types::Currency;
+        let (db, _) = storage_with_wallets();
+        db.call(|d| d.set_meta("currency", Currency::Usd.code()))
+            .await
+            .unwrap();
+        let (rpc, price, client) = worker_deps();
+        let (tx, mut rx) = mpsc::channel(8);
+        let generation = Arc::new(AtomicU64::new(0));
+        let usd = publication_price(Currency::Usd, 150.0);
+        assert!(
+            publish_price(&db, price.clone(), &tx, generation.clone(), 0, usd)
+                .await
+                .unwrap()
+        );
+        assert!(matches!(rx.try_recv().unwrap(), AppEvent::Price { .. }));
+        handle_command(
+            0,
+            Command::PersistSetting {
+                change: SettingChange::Currency(Currency::Jpy),
+            },
+            db.clone(),
+            rpc,
+            tx.clone(),
+            price.clone(),
+            client,
+            generation.clone(),
+        )
+        .await;
+        match rx.try_recv().unwrap() {
+            AppEvent::SettingPersisted {
+                change,
+                result,
+                generation,
+            } => {
+                assert_eq!(change, SettingChange::Currency(Currency::Jpy));
+                result.unwrap();
+                assert_eq!(generation, 0);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert_eq!(generation.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            db.call(|d| d.get_meta("currency"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(Currency::Jpy.code())
+        );
+        let jpy = publication_price(Currency::Jpy, 22_500.0);
+        assert!(
+            publish_price(&db, price.clone(), &tx, generation.clone(), 0, jpy)
+                .await
+                .unwrap()
+        );
+        assert!(
+            matches!(rx.try_recv().unwrap(), AppEvent::Price { price, generation: 0 } if price.currency == Currency::Jpy)
+        );
+        let accepted = publish_price(&db, price.clone(), &tx, generation.clone(), 0, usd)
+            .await
+            .unwrap();
+        assert_eq!(
+            price.get().unwrap().to_meta_json(),
+            jpy.to_meta_json(),
+            "late USD must not replace JPY cache"
+        );
+        assert_eq!(
+            db.call(|d| d.get_meta("last_price")).await.unwrap(),
+            Some(jpy.to_meta_json())
+        );
+        assert!(!accepted);
+        assert!(rx.try_recv().is_err(), "rejected USD must not emit");
+        assert_eq!(generation.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn price_publication_checks_generation_at_actor_execution_after_replace() {
+        use crate::types::Currency;
+        let db = Storage::new(crate::db::Db::open_memory().unwrap());
+        let replacement = crate::db::Db::open_memory().unwrap();
+        replacement
+            .set_meta("currency", Currency::Usd.code())
+            .unwrap();
+        let previous = publication_price(Currency::Usd, 100.0);
+        replacement
+            .set_meta("last_price", &previous.to_meta_json())
+            .unwrap();
+        db.replace(replacement);
+        let price = Arc::new(PriceCache::default());
+        price.set(previous);
+        let generation = Arc::new(AtomicU64::new(0));
+        let (tx, mut rx) = mpsc::channel(8);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocked_db = db.clone();
+        let blocker = std::thread::spawn(move || {
+            blocked_db.call_blocking(move |_| {
+                ready_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            })
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let publication = publish_price(
+            &db,
+            price.clone(),
+            &tx,
+            generation.clone(),
+            0,
+            publication_price(Currency::Usd, 150.0),
+        );
+        tokio::pin!(publication);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(publication.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        generation.store(1, Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        let accepted = publication.await.unwrap();
+        blocker.join().unwrap();
+        assert_eq!(price.get().unwrap().to_meta_json(), previous.to_meta_json());
+        assert_eq!(
+            db.call(|d| d.get_meta("last_price")).await.unwrap(),
+            Some(previous.to_meta_json())
+        );
+        assert!(!accepted);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn price_publication_sqlite_read_failure_does_not_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("silo.db");
+        let db = Storage::new(crate::db::Db::open(&path).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("ALTER TABLE meta RENAME TO unavailable_meta;")
+            .unwrap();
+        let price = Arc::new(PriceCache::default());
+        let (tx, mut rx) = mpsc::channel(8);
+        let result = publish_price(
+            &db,
+            price.clone(),
+            &tx,
+            Arc::new(AtomicU64::new(0)),
+            0,
+            publication_price(crate::types::Currency::Usd, 150.0),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "SQLite read errors must not become default USD"
+        );
+        assert!(price.get().is_none());
+        assert!(rx.try_recv().is_err());
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM unavailable_meta WHERE key='last_price'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        let (rpc, _, client) = worker_deps();
+        handle_command(
+            0,
+            Command::FetchPrice,
+            db,
+            rpc,
+            tx,
+            price.clone(),
+            client,
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
+        match rx.try_recv().unwrap() {
+            AppEvent::Error {
+                message,
+                generation: 0,
+            } => {
+                assert!(
+                    message.contains("price currency lookup failed"),
+                    "{message}"
+                );
+                assert!(message.contains("no such table: meta"), "{message}");
+            }
+            other => panic!("expected database error, got {other:?}"),
+        }
+        assert!(price.get().is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn price_publication_sqlite_write_failure_preserves_previous_price() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("silo.db");
+        let db = Storage::new(crate::db::Db::open(&path).unwrap());
+        let previous = publication_price(crate::types::Currency::Usd, 100.0);
+        db.call(move |d| d.set_meta("last_price", &previous.to_meta_json()))
+            .await
+            .unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TRIGGER block_price BEFORE INSERT ON meta WHEN NEW.key='last_price' BEGIN SELECT RAISE(ABORT, 'price writes blocked'); END;").unwrap();
+        let price = Arc::new(PriceCache::default());
+        price.set(previous);
+        let (tx, mut rx) = mpsc::channel(8);
+        let result = publish_price(
+            &db,
+            price.clone(),
+            &tx,
+            Arc::new(AtomicU64::new(0)),
+            0,
+            publication_price(crate::types::Currency::Usd, 150.0),
+        )
+        .await;
+        assert!(result.is_err(), "SQLite write failure must propagate");
+        assert_eq!(price.get().unwrap().to_meta_json(), previous.to_meta_json());
+        assert_eq!(
+            db.call(|d| d.get_meta("last_price")).await.unwrap(),
+            Some(previous.to_meta_json())
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     struct RawMockServer {
